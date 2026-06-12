@@ -1,0 +1,535 @@
+from __future__ import annotations
+
+import json
+import re
+import sqlite3
+from datetime import datetime, timezone
+from pathlib import Path
+from typing import Any
+
+
+EMAIL_RE = re.compile(r"^[^@\s]+@[^@\s]+\.[^@\s]+$")
+
+
+class ClosingConnection(sqlite3.Connection):
+    def __exit__(self, exc_type, exc, tb) -> bool:
+        result = super().__exit__(exc_type, exc, tb)
+        self.close()
+        return result
+
+
+def utcnow() -> str:
+    return datetime.now(timezone.utc).replace(microsecond=0).isoformat()
+
+
+def connect(database_path: Path | str) -> sqlite3.Connection:
+    conn = sqlite3.connect(str(database_path), factory=ClosingConnection)
+    conn.row_factory = sqlite3.Row
+    conn.execute("PRAGMA foreign_keys = ON")
+    return conn
+
+
+def init_db(database_path: Path | str) -> None:
+    path = Path(database_path)
+    path.parent.mkdir(parents=True, exist_ok=True)
+    with connect(path) as conn:
+        migrate(conn)
+
+
+def migrate(conn: sqlite3.Connection) -> None:
+    conn.executescript(
+        """
+        CREATE TABLE IF NOT EXISTS subscribers (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            email TEXT NOT NULL UNIQUE,
+            whatsapp TEXT,
+            notify_email INTEGER NOT NULL DEFAULT 1,
+            notify_whatsapp INTEGER NOT NULL DEFAULT 0,
+            whatsapp_opt_in INTEGER NOT NULL DEFAULT 0,
+            consent INTEGER NOT NULL DEFAULT 0,
+            source_page TEXT,
+            status TEXT NOT NULL DEFAULT 'active',
+            premium_status TEXT NOT NULL DEFAULT 'free',
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
+        CREATE TABLE IF NOT EXISTS documents (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            dt_article_id TEXT NOT NULL UNIQUE,
+            canonical_url TEXT NOT NULL UNIQUE,
+            source_url TEXT NOT NULL,
+            category TEXT NOT NULL,
+            title TEXT NOT NULL,
+            publication_date TEXT,
+            abstract TEXT,
+            detail_text TEXT,
+            pdf_url TEXT,
+            content_hash TEXT,
+            status TEXT NOT NULL DEFAULT 'discovered',
+            detected_at TEXT NOT NULL,
+            processed_at TEXT,
+            last_error TEXT
+        );
+
+        CREATE TABLE IF NOT EXISTS alerts (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL UNIQUE,
+            summary TEXT NOT NULL,
+            key_points_json TEXT NOT NULL DEFAULT '[]',
+            practical_impacts_json TEXT NOT NULL DEFAULT '[]',
+            relevance TEXT NOT NULL DEFAULT 'medio',
+            status TEXT NOT NULL DEFAULT 'ready',
+            ai_error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL,
+            FOREIGN KEY(document_id) REFERENCES documents(id) ON DELETE CASCADE
+        );
+
+        CREATE TABLE IF NOT EXISTS deliveries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            alert_id INTEGER NOT NULL,
+            subscriber_id INTEGER NOT NULL,
+            channel TEXT NOT NULL,
+            status TEXT NOT NULL,
+            provider_message_id TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            sent_at TEXT,
+            FOREIGN KEY(alert_id) REFERENCES alerts(id) ON DELETE CASCADE,
+            FOREIGN KEY(subscriber_id) REFERENCES subscribers(id) ON DELETE CASCADE,
+            UNIQUE(alert_id, subscriber_id, channel)
+        );
+
+        CREATE TABLE IF NOT EXISTS job_runs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            job_type TEXT NOT NULL,
+            status TEXT NOT NULL,
+            started_at TEXT NOT NULL,
+            finished_at TEXT,
+            discovered_count INTEGER NOT NULL DEFAULT 0,
+            processed_count INTEGER NOT NULL DEFAULT 0,
+            sent_count INTEGER NOT NULL DEFAULT 0,
+            error TEXT
+        );
+
+        CREATE INDEX IF NOT EXISTS idx_subscribers_status ON subscribers(status);
+        CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
+        CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
+        CREATE INDEX IF NOT EXISTS idx_deliveries_alert ON deliveries(alert_id);
+        """
+    )
+
+
+def as_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
+    return dict(row) if row else None
+
+
+def normalize_email(email: str) -> str:
+    return (email or "").strip().lower()
+
+
+def validate_email(email: str) -> bool:
+    return bool(EMAIL_RE.match(normalize_email(email)))
+
+
+def normalize_whatsapp(value: str | None) -> str:
+    cleaned = re.sub(r"[^\d+]", "", value or "")
+    if cleaned.startswith("00"):
+        cleaned = "+" + cleaned[2:]
+    return cleaned
+
+
+def upsert_subscriber(
+    conn: sqlite3.Connection,
+    *,
+    email: str,
+    whatsapp: str | None,
+    notify_email: bool,
+    notify_whatsapp: bool,
+    source_page: str | None,
+    consent: bool,
+) -> dict[str, Any]:
+    email = normalize_email(email)
+    if not validate_email(email):
+        raise ValueError("Ingresa un correo electrónico válido.")
+    if not consent:
+        raise ValueError("Debes aceptar recibir alertas para suscribirte.")
+
+    phone = normalize_whatsapp(whatsapp)
+    wants_whatsapp = bool(notify_whatsapp and phone)
+    now = utcnow()
+    conn.execute(
+        """
+        INSERT INTO subscribers (
+            email, whatsapp, notify_email, notify_whatsapp, whatsapp_opt_in,
+            consent, source_page, status, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+        ON CONFLICT(email) DO UPDATE SET
+            whatsapp = excluded.whatsapp,
+            notify_email = excluded.notify_email,
+            notify_whatsapp = excluded.notify_whatsapp,
+            whatsapp_opt_in = excluded.whatsapp_opt_in,
+            consent = excluded.consent,
+            source_page = excluded.source_page,
+            status = 'active',
+            updated_at = excluded.updated_at
+        """,
+        (
+            email,
+            phone or None,
+            int(notify_email),
+            int(wants_whatsapp),
+            int(wants_whatsapp),
+            int(consent),
+            source_page,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    return as_dict(
+        conn.execute("SELECT * FROM subscribers WHERE email = ?", (email,)).fetchone()
+    )
+
+
+def list_subscribers(conn: sqlite3.Connection, limit: int = 200) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM subscribers ORDER BY updated_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def active_subscribers(conn: sqlite3.Connection) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM subscribers WHERE status = 'active' ORDER BY created_at ASC"
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def set_subscriber_status(conn: sqlite3.Connection, subscriber_id: int, status: str) -> None:
+    if status not in {"active", "paused"}:
+        raise ValueError("Estado de suscriptor inválido.")
+    conn.execute(
+        "UPDATE subscribers SET status = ?, updated_at = ? WHERE id = ?",
+        (status, utcnow(), subscriber_id),
+    )
+    conn.commit()
+
+
+def count_documents(conn: sqlite3.Connection) -> int:
+    row = conn.execute("SELECT COUNT(*) AS total FROM documents").fetchone()
+    return int(row["total"])
+
+
+def upsert_document(
+    conn: sqlite3.Connection, doc: dict[str, Any], *, baseline: bool = False
+) -> tuple[int, bool]:
+    now = utcnow()
+    status = "baseline" if baseline else doc.get("status", "discovered")
+    values = (
+        doc["dt_article_id"],
+        doc["canonical_url"],
+        doc["source_url"],
+        doc["category"],
+        doc["title"],
+        doc.get("publication_date"),
+        doc.get("abstract"),
+        doc.get("detail_text"),
+        doc.get("pdf_url"),
+        doc.get("content_hash"),
+        status,
+        now,
+        doc.get("processed_at"),
+        doc.get("last_error"),
+    )
+    try:
+        cur = conn.execute(
+            """
+            INSERT INTO documents (
+                dt_article_id, canonical_url, source_url, category, title,
+                publication_date, abstract, detail_text, pdf_url, content_hash,
+                status, detected_at, processed_at, last_error
+            )
+            VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+            """,
+            values,
+        )
+        conn.commit()
+        return int(cur.lastrowid), True
+    except sqlite3.IntegrityError:
+        row = conn.execute(
+            "SELECT id, status FROM documents WHERE dt_article_id = ? OR canonical_url = ?",
+            (doc["dt_article_id"], doc["canonical_url"]),
+        ).fetchone()
+        if not row:
+            raise
+        if row["status"] != "ignored":
+            conn.execute(
+                """
+                UPDATE documents SET
+                    source_url = ?, category = ?, title = ?, publication_date = ?,
+                    abstract = COALESCE(?, abstract),
+                    detail_text = COALESCE(?, detail_text),
+                    pdf_url = COALESCE(?, pdf_url),
+                    content_hash = COALESCE(?, content_hash)
+                WHERE id = ?
+                """,
+                (
+                    doc["source_url"],
+                    doc["category"],
+                    doc["title"],
+                    doc.get("publication_date"),
+                    doc.get("abstract"),
+                    doc.get("detail_text"),
+                    doc.get("pdf_url"),
+                    doc.get("content_hash"),
+                    row["id"],
+                ),
+            )
+            conn.commit()
+        return int(row["id"]), False
+
+
+def update_document_processed(
+    conn: sqlite3.Connection,
+    document_id: int,
+    *,
+    status: str,
+    detail_text: str | None = None,
+    pdf_url: str | None = None,
+    content_hash: str | None = None,
+    last_error: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE documents SET
+            status = ?,
+            detail_text = COALESCE(?, detail_text),
+            pdf_url = COALESCE(?, pdf_url),
+            content_hash = COALESCE(?, content_hash),
+            processed_at = ?,
+            last_error = ?
+        WHERE id = ?
+        """,
+        (status, detail_text, pdf_url, content_hash, utcnow(), last_error, document_id),
+    )
+    conn.commit()
+
+
+def set_document_status(conn: sqlite3.Connection, document_id: int, status: str) -> None:
+    if status not in {"discovered", "processed", "baseline", "ignored", "error"}:
+        raise ValueError("Estado de documento inválido.")
+    conn.execute(
+        "UPDATE documents SET status = ?, processed_at = ? WHERE id = ?",
+        (status, utcnow(), document_id),
+    )
+    conn.commit()
+
+
+def list_documents(conn: sqlite3.Connection, limit: int = 200) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM documents ORDER BY detected_at DESC, id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def create_or_update_alert(
+    conn: sqlite3.Connection,
+    document_id: int,
+    *,
+    summary: str,
+    key_points: list[str],
+    practical_impacts: list[str],
+    relevance: str,
+    status: str,
+    ai_error: str | None,
+) -> int:
+    now = utcnow()
+    conn.execute(
+        """
+        INSERT INTO alerts (
+            document_id, summary, key_points_json, practical_impacts_json,
+            relevance, status, ai_error, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(document_id) DO UPDATE SET
+            summary = excluded.summary,
+            key_points_json = excluded.key_points_json,
+            practical_impacts_json = excluded.practical_impacts_json,
+            relevance = excluded.relevance,
+            status = excluded.status,
+            ai_error = excluded.ai_error,
+            updated_at = excluded.updated_at
+        """,
+        (
+            document_id,
+            summary,
+            json.dumps(key_points, ensure_ascii=False),
+            json.dumps(practical_impacts, ensure_ascii=False),
+            relevance,
+            status,
+            ai_error,
+            now,
+            now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT id FROM alerts WHERE document_id = ?", (document_id,)
+    ).fetchone()
+    return int(row["id"])
+
+
+def set_alert_status(conn: sqlite3.Connection, alert_id: int, status: str) -> None:
+    conn.execute(
+        "UPDATE alerts SET status = ?, updated_at = ? WHERE id = ?",
+        (status, utcnow(), alert_id),
+    )
+    conn.commit()
+
+
+def list_alerts(conn: sqlite3.Connection, limit: int = 200) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT
+            alerts.*,
+            documents.title,
+            documents.category,
+            documents.canonical_url,
+            documents.publication_date
+        FROM alerts
+        JOIN documents ON documents.id = alerts.document_id
+        ORDER BY alerts.created_at DESC, alerts.id DESC
+        LIMIT ?
+        """,
+        (limit,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def get_alert_with_document(
+    conn: sqlite3.Connection, alert_id: int
+) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT
+            alerts.*,
+            documents.dt_article_id,
+            documents.canonical_url,
+            documents.category,
+            documents.title,
+            documents.publication_date,
+            documents.abstract,
+            documents.pdf_url
+        FROM alerts
+        JOIN documents ON documents.id = alerts.document_id
+        WHERE alerts.id = ?
+        """,
+        (alert_id,),
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def record_delivery(
+    conn: sqlite3.Connection,
+    *,
+    alert_id: int,
+    subscriber_id: int,
+    channel: str,
+    status: str,
+    provider_message_id: str | None = None,
+    error: str | None = None,
+) -> None:
+    now = utcnow()
+    sent_at = now if status in {"sent", "simulated"} else None
+    conn.execute(
+        """
+        INSERT INTO deliveries (
+            alert_id, subscriber_id, channel, status, provider_message_id,
+            error, created_at, sent_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(alert_id, subscriber_id, channel) DO UPDATE SET
+            status = excluded.status,
+            provider_message_id = excluded.provider_message_id,
+            error = excluded.error,
+            sent_at = excluded.sent_at
+        """,
+        (
+            alert_id,
+            subscriber_id,
+            channel,
+            status,
+            provider_message_id,
+            error,
+            now,
+            sent_at,
+        ),
+    )
+    conn.commit()
+
+
+def delivery_stats(conn: sqlite3.Connection, alert_id: int) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        """
+        SELECT channel, status, COUNT(*) AS total
+        FROM deliveries
+        WHERE alert_id = ?
+        GROUP BY channel, status
+        ORDER BY channel, status
+        """,
+        (alert_id,),
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
+def start_job(conn: sqlite3.Connection, job_type: str) -> int:
+    cur = conn.execute(
+        "INSERT INTO job_runs (job_type, status, started_at) VALUES (?, 'running', ?)",
+        (job_type, utcnow()),
+    )
+    conn.commit()
+    return int(cur.lastrowid)
+
+
+def finish_job(
+    conn: sqlite3.Connection,
+    job_id: int,
+    *,
+    status: str,
+    discovered_count: int = 0,
+    processed_count: int = 0,
+    sent_count: int = 0,
+    error: str | None = None,
+) -> None:
+    conn.execute(
+        """
+        UPDATE job_runs SET
+            status = ?,
+            finished_at = ?,
+            discovered_count = ?,
+            processed_count = ?,
+            sent_count = ?,
+            error = ?
+        WHERE id = ?
+        """,
+        (
+            status,
+            utcnow(),
+            discovered_count,
+            processed_count,
+            sent_count,
+            error,
+            job_id,
+        ),
+    )
+    conn.commit()
+
+
+def latest_jobs(conn: sqlite3.Connection, limit: int = 10) -> list[dict[str, Any]]:
+    rows = conn.execute(
+        "SELECT * FROM job_runs ORDER BY started_at DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [dict(row) for row in rows]
