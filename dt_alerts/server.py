@@ -28,6 +28,11 @@ def bool_from_form(value: Any) -> bool:
     return str(value).lower() in {"1", "true", "on", "yes", "si", "sí"}
 
 
+# TEMPORAL: desactiva el login por token del panel admin para esta ocasión.
+# Volver a False (o eliminar el bypass en is_admin) para reactivar la autenticación.
+DISABLE_ADMIN_AUTH = True
+
+
 class AppHandler(BaseHTTPRequestHandler):
     settings: Settings
 
@@ -57,6 +62,9 @@ class AppHandler(BaseHTTPRequestHandler):
         elif path == "/healthz":
             self.respond_json({"ok": True, "service": "dt-alertas"})
         elif path == "/admin/login":
+            if DISABLE_ADMIN_AUTH:
+                self.redirect("/admin")
+                return
             token = query.get("token", [""])[0]
             if token and token == self.settings.admin_token:
                 self.redirect("/admin", set_admin_cookie=True)
@@ -144,6 +152,8 @@ class AppHandler(BaseHTTPRequestHandler):
         return "application/json" in accept
 
     def is_admin(self) -> bool:
+        if DISABLE_ADMIN_AUTH:
+            return True
         cookie_header = self.headers.get("Cookie", "")
         cookie = SimpleCookie(cookie_header)
         token = cookie.get("dt_admin_token")
@@ -900,6 +910,31 @@ body.eg {
   .eg-admin-header { flex-direction: column; align-items: stretch; }
   .eg-admin-header form, .eg-admin-header .eg-btn { width: 100%; }
   .eg-metric strong { font-size: 22px; }
+}
+
+/* ---------- Ajustes finales (overrides de proyecto) ---------- */
+html body img.eg-logo {
+    height: 35px;
+}
+
+html body main.eg-app {
+    background: #f6f6f6;
+}
+
+html body .eg h1 {
+    font-size: clamp(1.35rem, 2.4vw, 1.85rem);
+}
+main.eg-app>.eg-hero {
+    /* padding: 0; */
+    min-height: calc(100vh - 318px);
+}
+
+html body footer.eg-footer {
+    margin: 0;
+}
+
+html body main.eg-app {
+    padding: 0;
 }
 """
 
