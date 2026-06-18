@@ -1,12 +1,32 @@
-# Alertas DT para Contadores
+# Alertas DT
 
-SaaS externo (Python estándar + SQLite) que monitorea normativa de la Dirección del
-Trabajo, genera resúmenes orientados a contadores y empresas, y prepara alertas por
-email. Se integra a WordPress mediante formulario embebible o iframe. Diseño visual
-basado en el sistema **External Group**.
+App Python (estándar + SQLite) que monitorea normativa de la Dirección del Trabajo,
+genera resúmenes orientados a contadores y empresas, y envía alertas por email.
+Se integra con WordPress mediante un **plugin bridge** que captura suscriptores en el
+sitio público y los sincroniza a la app local por API REST privada. Diseño visual basado
+en el sistema **External Group**.
 
 > **Estado:** MVP funcional para revisión interna. No vender como 100% productivo.
 > WhatsApp, pagos y planes comerciales quedan reservados para fases futuras.
+
+## Arquitectura recomendada
+
+```
+WordPress público
+  └─ Plugin [alertas_dt_form] → wp_alertas_dt_subscribers
+       └─ REST API privada (Bearer token)
+              ↓
+App Python local (computador del cliente)
+  ├─ Sincroniza suscriptores ← WordPress
+  ├─ Monitorea Dirección del Trabajo
+  ├─ Genera alertas (IA opcional + fallback)
+  └─ Envía emails con SendGrid
+```
+
+La app Python **no se expone a internet**. El computador del cliente queda detrás del
+router. Solo WordPress es público.
+
+---
 
 ---
 
@@ -177,6 +197,13 @@ RUN_WORKER=True
 RUN_ON_STARTUP=False
 CHECK_INTERVAL_HOURS=6
 ALERT_ON_FIRST_RUN=False
+
+# WordPress Bridge (sincronización de suscriptores)
+WORDPRESS_SYNC_ENABLED=false   # true para activar sincronización
+WORDPRESS_API_URL=             # https://tu-sitio.cl/wp-json/alertas-dt/v1
+WORDPRESS_API_TOKEN=           # Token generado en el admin de WordPress (no hardcodear)
+WORDPRESS_SYNC_INTERVAL_MINUTES=15
+WORDPRESS_SYNC_LIMIT=100
 ```
 
 ### Seguridad del admin (`DISABLE_ADMIN_AUTH`)
@@ -250,14 +277,49 @@ curl -X POST http://localhost:8000/api/jobs/check-dt -H "X-Job-Token: <JOB_TOKEN
 
 ---
 
-## WordPress
+## Plugin WordPress (integración recomendada)
 
-Usa el shortcode/snippet de `wordpress/shortcode-snippet.php` o un iframe:
+El plugin `alertas-dt-bridge` reemplaza el iframe. Captura suscriptores en WordPress
+sin exponer la app local y permite sincronizarlos al computador del cliente.
 
-```html
-<iframe src="https://alertas-dt.onrender.com/embed"
-        width="100%" height="460" style="border:0;" loading="lazy"></iframe>
+### Instalación
+
+1. Sube `wordpress/alertas-dt-bridge/` a `wp-content/plugins/`.
+2. Activa el plugin en WordPress → Plugins.
+3. Ve a **Alertas DT** en el menú lateral de WordPress.
+4. Copia el shortcode y pégalo en una página:
+
+   ```
+   [alertas_dt_form]
+   ```
+
+5. Copia el **token API** mostrado en la página de ajustes.
+
+### Configurar la app local para sincronizar
+
+Agrega estas variables de entorno en el computador donde corre la app:
+
+```env
+WORDPRESS_SYNC_ENABLED=true
+WORDPRESS_API_URL=https://tu-sitio.cl/wp-json/alertas-dt/v1
+WORDPRESS_API_TOKEN=              # Token generado en el admin de WordPress
+WORDPRESS_SYNC_INTERVAL_MINUTES=15
+WORDPRESS_SYNC_LIMIT=100
 ```
+
+La sincronización se puede disparar manualmente desde el admin de la app
+(`/admin/subscribers` → "Sincronizar ahora") o automáticamente cada N minutos
+si integras el scheduler.
+
+### Endpoints REST del plugin
+
+```
+GET  /wp-json/alertas-dt/v1/health             (público)
+GET  /wp-json/alertas-dt/v1/subscribers        (Bearer token)
+POST /wp-json/alertas-dt/v1/subscribers/synced (Bearer token)
+```
+
+Autenticación: `Authorization: Bearer TOKEN`
 
 ---
 
