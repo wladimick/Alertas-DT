@@ -512,6 +512,15 @@ def fmt_dt(value: Any) -> str:
     return text.replace("T", " ")[:16] if text else "—"
 
 
+def empty_row(colspan: int, title: str, hint: str) -> str:
+    """Fila de tabla con estado vacío amigable (en vez de 'Sin datos')."""
+    return (
+        f'<tr class="eg-empty-row"><td colspan="{colspan}">'
+        f'<div class="eg-empty"><strong>{h(title)}</strong><span>{h(hint)}</span></div>'
+        "</td></tr>"
+    )
+
+
 def pill(value: Any, label: Any = None) -> str:
     """
     Pill de estado con color semántico via data-status (ver CSS).
@@ -550,33 +559,56 @@ def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
     if flash:
         banner += f'<div class="eg-flash" role="status">{h(flash)}</div>'
 
-    last_job_html = "Sin ejecuciones"
+    last_job_html = "Sin ejecuciones aún"
     if last_job:
-        last_job_html = f"{fmt_dt(last_job['started_at'])} · {h(last_job['status'])}"
+        last_job_html = f"{fmt_dt(last_job['started_at'])} · {status_label(last_job['status'])}"
+
+    # Estado del sistema (honesto para la demo): proveedor de email y modo real/simulado.
+    provider = settings.email_provider
+    if provider == "sendgrid" and settings.sendgrid_api_key:
+        email_status = ("SendGrid · envío real", "active")
+    elif provider == "sendgrid":
+        email_status = ("SendGrid sin credenciales · simulado", "pending_review")
+    elif provider in {"resend", "smtp"} and (settings.resend_api_key or settings.smtp_host):
+        email_status = (f"{provider.upper()} · envío real", "active")
+    else:
+        email_status = ("Modo simulado (console)", "simulated")
+    auth_status = (
+        ("Autenticación desactivada (dev)", "error")
+        if settings.disable_admin_auth
+        else ("Login por token activo", "active")
+    )
+    sysstatus = (
+        '<div class="eg-sysstatus">'
+        f'<span class="eg-sysstatus__item"><b>Email:</b> {pill(email_status[1], email_status[0])}</span>'
+        f'<span class="eg-sysstatus__item"><b>Acceso:</b> {pill(auth_status[1], auth_status[0])}</span>'
+        f'<span class="eg-sysstatus__item"><b>Último monitoreo:</b> {h(last_job_html)}</span>'
+        "</div>"
+    )
 
     body = f"""
 {banner}
 <header class="eg-admin-header">
   <div>
-    <p class="eg-eyebrow">Alertas DT</p>
-    <h1>Panel de administración</h1>
+    <p class="eg-eyebrow">External Group · Alertas DT</p>
+    <h1>Panel Alertas DT</h1>
+    <p class="eg-admin-header__sub">Monitoreo de publicaciones DT y alertas por email</p>
   </div>
   <form method="post" action="/api/jobs/check-dt">
     <input type="hidden" name="manual" value="1">
     <button class="eg-btn eg-btn--primary" type="submit" formmethod="post" formaction="/api/jobs/check-dt" data-job-token>Ejecutar monitoreo</button>
   </form>
 </header>
+{sysstatus}
 <section class="eg-metrics">
-  <div class="eg-metric"><strong>{total_subs}</strong><span>Suscriptores</span></div>
-  <div class="eg-metric"><strong>{active_count}</strong><span>Activos</span></div>
+  <div class="eg-metric"><strong>{active_count}</strong><span>Suscriptores activos</span></div>
   <div class="eg-metric"><strong>{paused_count}</strong><span>Pausados</span></div>
-  <div class="eg-metric"><strong>{len(documents)}</strong><span>Documentos</span></div>
-  <div class="eg-metric"><strong>{pending_count}</strong><span>Por revisar</span></div>
-  <div class="eg-metric"><strong>{ready_count}</strong><span>Listas</span></div>
-  <div class="eg-metric"><strong>{sent_count}</strong><span>Enviadas</span></div>
-  <div class="eg-metric"><strong>{sent_deliveries}</strong><span>Envíos totales</span></div>
+  <div class="eg-metric"><strong>{len(documents)}</strong><span>Documentos detectados</span></div>
+  <div class="eg-metric"><strong>{pending_count}</strong><span>Pendientes de revisión</span></div>
+  <div class="eg-metric"><strong>{ready_count}</strong><span>Listas para enviar</span></div>
+  <div class="eg-metric"><strong>{sent_count}</strong><span>Alertas enviadas</span></div>
+  <div class="eg-metric"><strong>{sent_deliveries}</strong><span>Envíos registrados</span></div>
 </section>
-<p class="eg-muted eg-lastjob">Último job: {last_job_html}</p>
 {render_nav(path)}
 {render_admin_section(path, subscribers, alerts, documents, jobs)}
 """
@@ -636,7 +668,11 @@ def render_admin_section(
 
 def render_jobs(jobs: list[dict[str, Any]]) -> str:
     if not jobs:
-        return '<section class="eg-card eg-panel"><h2>Últimos jobs</h2><p class="eg-muted">Sin ejecuciones todavía.</p></section>'
+        return (
+            '<section class="eg-card eg-panel"><h2>Historial de monitoreo</h2>'
+            '<div class="eg-empty"><strong>Aún no se ha ejecutado el monitoreo.</strong>'
+            '<span>Usa "Ejecutar monitoreo" para buscar nuevas publicaciones de la DT.</span></div></section>'
+        )
     rows = "".join(
         f"""
 <tr>
@@ -687,7 +723,7 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
   <div class="eg-table-wrap">
     <table class="eg-table">
       <thead><tr><th>Email</th><th>Estado</th><th>Registro</th><th>Actualización</th><th>Fuente</th><th></th></tr></thead>
-      <tbody>{rows or '<tr><td colspan="6">Sin suscriptores.</td></tr>'}</tbody>
+      <tbody>{rows or empty_row(6, "Aún no hay suscriptores.", "Puedes probar el formulario público usando un correo interno.")}</tbody>
     </table>
   </div>
   <p class="eg-muted">WhatsApp reservado para fase futura: el MVP notifica solo por email.</p>
@@ -744,7 +780,7 @@ def render_alerts(alerts: list[dict[str, Any]]) -> str:
   <div class="eg-table-wrap">
     <table class="eg-table">
       <thead><tr><th>Documento</th><th>Categoría</th><th>Relevancia</th><th>Estado</th><th>Generada</th><th>Acciones</th></tr></thead>
-      <tbody>{rows or '<tr><td colspan="6">Sin alertas.</td></tr>'}</tbody>
+      <tbody>{rows or empty_row(6, "Aún no hay alertas generadas.", "Las alertas aparecerán cuando se detecten documentos nuevos.")}</tbody>
     </table>
   </div>
 </section>
@@ -760,7 +796,7 @@ def render_documents(documents: list[dict[str, Any]]) -> str:
   <td class="eg-muted">{h(item.get('publication_date') or '—')}</td>
   <td class="eg-muted">{h(item.get('dt_article_id'))}</td>
   <td>{pill(item['status'])}</td>
-  <td><a href="{h(item['canonical_url'])}" target="_blank" rel="noreferrer">DT</a></td>
+  <td><a class="eg-link" href="{h(item['canonical_url'])}" target="_blank" rel="noreferrer">Ver en DT ↗</a></td>
   <td>
     <div class="eg-actions">
       <form method="post" action="/admin/documents/{item['id']}/regenerate">
@@ -781,7 +817,7 @@ def render_documents(documents: list[dict[str, Any]]) -> str:
   <div class="eg-table-wrap">
     <table class="eg-table">
       <thead><tr><th>Documento</th><th>Categoría</th><th>Fecha</th><th>ID DT</th><th>Estado</th><th>Link</th><th>Acciones</th></tr></thead>
-      <tbody>{rows or '<tr><td colspan="7">Sin documentos.</td></tr>'}</tbody>
+      <tbody>{rows or empty_row(7, "Aún no hay documentos detectados.", "Ejecuta el monitoreo para buscar nuevas publicaciones de la Dirección del Trabajo.")}</tbody>
     </table>
   </div>
 </section>
@@ -804,27 +840,48 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
     email_text = render_alert_email_text(alert)
     # El HTML del email se aísla en un iframe srcdoc (escapado) para no afectar el admin.
     srcdoc = h(email_html)
+
+    real_send = (
+        (settings.email_provider == "sendgrid" and settings.sendgrid_api_key)
+        or (settings.email_provider == "resend" and settings.resend_api_key)
+        or (settings.email_provider == "smtp" and settings.smtp_host)
+    )
+    if real_send:
+        send_note = (
+            '<div class="eg-flash" style="margin:0 0 16px;">Envío real habilitado '
+            f"({h(settings.email_provider)}). El botón \"Enviar prueba\" envía un correo de verdad.</div>"
+        )
+    else:
+        send_note = (
+            '<div class="eg-flash" style="margin:0 0 16px;">El envío está en modo simulado. '
+            "Configura SendGrid en Render para habilitar correos reales.</div>"
+        )
     body = f"""
 <section class="eg-container eg-preview">
-  <p class="eg-eyebrow">Vista previa de email</p>
+  <p class="eg-eyebrow">Vista previa del email que recibirá el suscriptor</p>
   <h1>{h(alert['title'])}</h1>
+  {send_note}
   <dl class="eg-kv">
     <div><dt>Estado</dt><dd>{pill(alert['status'])}</dd></div>
     <div><dt>Categoría</dt><dd>{h(alert['category'])}</dd></div>
     <div><dt>Relevancia</dt><dd>{pill(alert['relevance'])}</dd></div>
     <div><dt>Fecha doc.</dt><dd>{h(alert.get('publication_date') or '—')}</dd></div>
-    <div><dt>Asunto</dt><dd>{h(subject)}</dd></div>
-    <div><dt>Documento</dt><dd><a href="{h(alert['canonical_url'])}" target="_blank" rel="noreferrer">Ver en DT</a></dd></div>
+    <div><dt>Asunto del email</dt><dd>{h(subject)}</dd></div>
+    <div><dt>Documento</dt><dd><a class="eg-link" href="{h(alert['canonical_url'])}" target="_blank" rel="noreferrer">Ver en DT ↗</a></dd></div>
   </dl>
   <div class="eg-actions">
-    <a class="eg-btn eg-btn--secondary" href="/admin/alerts">Volver al admin</a>
+    <a class="eg-btn eg-btn--secondary" href="/admin/alerts">← Volver al admin</a>
+    <form method="post" action="/admin/alerts/{alert_id}/test" class="eg-inline-form">
+      <input class="eg-input eg-input--sm" type="email" name="to" placeholder="correo de prueba (opcional)" aria-label="Correo de prueba">
+      <button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">Enviar prueba</button>
+    </form>
   </div>
-  <h2 style="margin-top:24px;">Render HTML</h2>
+  <h2 style="margin-top:24px;">Versión HTML</h2>
   <div class="eg-preview__frame">
-    <iframe title="Vista previa email" srcdoc="{srcdoc}"></iframe>
+    <iframe title="Vista previa del email (HTML)" srcdoc="{srcdoc}"></iframe>
   </div>
   <details style="margin-top:18px;">
-    <summary>Ver versión texto plano</summary>
+    <summary>Ver versión en texto plano</summary>
     <pre>{h(email_text)}</pre>
   </details>
 </section>
@@ -1270,12 +1327,35 @@ html body main.eg-app {
     padding: 0;
 }
 
-/* ---------- Admin operativo (etapas 4/8/10/11) ---------- */
+/* ---------- Admin operativo (etapas 4/8/10/11) + pulido UX/UI ---------- */
 .eg-devbanner {
   width: min(1180px, calc(100% - 40px)); margin: 0 auto 18px;
   background: #FEF3C7; color: #92400E; border: 1px solid #FCD34D;
   border-radius: 12px; padding: 12px 16px; font-size: 14px; font-weight: 700;
 }
+.eg-admin-header__sub { color: var(--eg-text-muted); margin: 4px 0 0; font-size: 14px; }
+
+/* Estado del sistema (proveedor email / auth / último job) */
+.eg-sysstatus {
+  width: min(1180px, calc(100% - 40px)); margin: 0 auto 20px;
+  display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center;
+  background: var(--eg-surface); border: 1px solid var(--eg-border);
+  border-radius: var(--eg-radius); padding: 12px 18px;
+}
+.eg-sysstatus__item { display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--eg-text-muted); }
+.eg-sysstatus__item b { color: var(--eg-text); font-weight: 700; }
+
+/* Estados vacíos amigables */
+.eg-empty { display: grid; gap: 4px; padding: 24px 8px; text-align: center; }
+.eg-empty strong { color: var(--eg-text); font-size: 15px; }
+.eg-empty span { color: var(--eg-text-subtle); font-size: 13.5px; }
+.eg-empty-row td { background: transparent; }
+.eg-empty-row:hover td { background: transparent; }
+
+/* Link tabular destacado */
+.eg-link { color: var(--eg-support); font-weight: 600; white-space: nowrap; }
+.eg-link:hover { color: var(--eg-accent); }
+
 .eg-lastjob { width: min(1180px, calc(100% - 40px)); margin: 0 auto 18px; }
 .eg-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .eg-actions form { margin: 0; }
@@ -1318,6 +1398,23 @@ html body main.eg-app {
   border-radius: 12px; padding: 12px 16px; font-size: 14px; font-weight: 600;
   background: color-mix(in srgb, var(--eg-support) 12%, transparent); color: var(--eg-support);
   border: 1px solid var(--eg-border-accent);
+}
+/* eg-flash dentro de una card (preview/login) ocupa el ancho del contenedor */
+.eg-preview .eg-flash, .eg-auth__card .eg-flash, .eg-form .eg-flash { width: 100%; }
+
+/* ---------- Accesibilidad (etapa 14): foco visible y no depender solo del color ---------- */
+.eg a:focus-visible, .eg-link:focus-visible, .eg-tab:focus-visible,
+.eg-nav__link:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--eg-focus); outline-offset: 2px; border-radius: 6px;
+}
+.eg-check input:focus-visible { outline: 2px solid var(--eg-focus); outline-offset: 2px; }
+.eg-pill { border: 1px solid color-mix(in srgb, currentColor 30%, transparent); }
+
+/* ---------- Responsive del estado del sistema ---------- */
+@media (max-width: 600px) {
+  .eg-sysstatus { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .eg-inline-form { flex-wrap: wrap; }
+  .eg-input--sm { max-width: 100%; flex: 1 1 160px; }
 }
 """
 
