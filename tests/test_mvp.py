@@ -128,6 +128,84 @@ class MvpTestCase(unittest.TestCase):
                         consent=False,
                     )
 
+    # --- Persistencia / listado de suscriptores ---
+    def _subscribe(self, conn, email, *, source_page="test"):
+        return db.upsert_subscriber(
+            conn, email=email, whatsapp=None, notify_email=True,
+            notify_whatsapp=False, source_page=source_page, consent=True,
+        )
+
+    def test_subscriber_appears_in_listing_and_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                self._subscribe(conn, "nuevo@empresa.cl")
+                subs = db.list_subscribers(conn)
+                active = sum(1 for s in subs if s["status"] == "active")
+        emails = [s["email"] for s in subs]
+        self.assertIn("nuevo@empresa.cl", emails)
+        self.assertEqual(active, 1)
+
+    def test_paused_subscriber_still_listed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                sub = self._subscribe(conn, "pausado@empresa.cl")
+                db.set_subscriber_status(conn, sub["id"], "paused")
+                subs = db.list_subscribers(conn)
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0]["status"], "paused")
+
+    def test_source_page_is_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                self._subscribe(conn, "src@empresa.cl", source_page="embed")
+                subs = db.list_subscribers(conn)
+        self.assertEqual(subs[0]["source_page"], "embed")
+
+    def test_resubscribe_without_source_keeps_original(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                self._subscribe(conn, "keep@empresa.cl", source_page="landing")
+                # Re-suscripción sin source_page no debe borrar el origen original.
+                db.upsert_subscriber(
+                    conn, email="keep@empresa.cl", whatsapp=None, notify_email=True,
+                    notify_whatsapp=False, source_page=None, consent=True,
+                )
+                subs = db.list_subscribers(conn)
+        self.assertEqual(subs[0]["source_page"], "landing")
+
+    def test_email_normalization_avoids_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                self._subscribe(conn, "TEST@MAIL.COM")
+                self._subscribe(conn, "test@mail.com")
+                subs = db.list_subscribers(conn)
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0]["email"], "test@mail.com")
+
+    def test_existing_email_is_reactivated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                sub = self._subscribe(conn, "vuelve@empresa.cl")
+                db.set_subscriber_status(conn, sub["id"], "paused")
+                # Volver a suscribirse debe reactivar el registro existente.
+                again = self._subscribe(conn, "vuelve@empresa.cl")
+                subs = db.list_subscribers(conn)
+        self.assertEqual(sub["id"], again["id"])
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0]["status"], "active")
+
     # --- Auth admin (etapa 2) ---
     def test_admin_auth_enabled_by_default(self) -> None:
         # Sin DISABLE_ADMIN_AUTH en entorno, el bypass debe estar apagado.
