@@ -103,11 +103,13 @@ ALERT_ON_FIRST_RUN=False
 
 ### Seguridad del admin (`DISABLE_ADMIN_AUTH`)
 
-- **Por defecto `False`**: el admin exige `ADMIN_TOKEN` (login en `/admin/login`).
-- `DISABLE_ADMIN_AUTH=True` es **solo modo desarrollo**: omite el login y muestra un
-  banner de advertencia "Modo desarrollo: autenticación admin desactivada".
-- **No usar `True` en producción.** Render debe quedar con `DISABLE_ADMIN_AUTH=False`
-  (o sin la variable) y un `ADMIN_TOKEN` largo.
+- **Por defecto `False`** (y también `False` si la variable no existe): el admin exige
+  `ADMIN_TOKEN` (login en `/admin/login`).
+- `DISABLE_ADMIN_AUTH=True` es **solo para desarrollo local o una demo controlada**:
+  omite el login y muestra un banner "Modo desarrollo: autenticación admin desactivada".
+- **No usar `DISABLE_ADMIN_AUTH=True` en Render producción.** Producción debe quedar con
+  `DISABLE_ADMIN_AUTH=False` (o sin la variable) y un `ADMIN_TOKEN` largo.
+- Para la demo con César se usa **login con `ADMIN_TOKEN`** (admin no abierto).
 
 ---
 
