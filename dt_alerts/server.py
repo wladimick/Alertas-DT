@@ -627,6 +627,56 @@ EMAIL_SETTINGS_DEFAULTS: dict[str, str] = {
 }
 
 
+# --------------------------------------------------------------------------
+# Sistema de badges (diseño editorial prototype)
+# --------------------------------------------------------------------------
+_STATUS_BADGE_CLASS: dict[str, str] = {
+    "active": "eg-badge--active", "sent": "eg-badge--sent",
+    "ready_to_send": "eg-badge--ready", "ready": "eg-badge--ready",
+    "processed": "eg-badge--active", "success": "eg-badge--active",
+    "alto": "eg-badge--active", "paused": "eg-badge--paused",
+    "pending_review": "eg-badge--pending", "discovered": "eg-badge--pending",
+    "running": "eg-badge--pending", "partial": "eg-badge--pending",
+    "medio": "eg-badge--pending", "baseline": "eg-badge--baseline",
+    "ignored": "eg-badge--paused", "error": "eg-badge--danger",
+    "failed": "eg-badge--danger", "bajo": "eg-badge--danger",
+    "simulated": "eg-badge--paused", "skipped_missing_credentials": "eg-badge--paused",
+}
+_RELEVANCE_CLASS: dict[str, str] = {
+    "alto": "eg-rel--high", "medio": "eg-rel--mid", "bajo": "eg-rel--low",
+}
+_TONE_ICO: dict[str, str] = {
+    "accent": "eg-ico-green", "info": "eg-ico-blue",
+    "warning": "eg-ico-warn", "success": "eg-ico-green", "muted": "eg-ico-slate",
+}
+
+
+def badge(value: Any, label: Any = None, *, no_dot: bool = False) -> str:
+    v = str(value or "")
+    text = label if label is not None else status_label(v)
+    cls = _STATUS_BADGE_CLASS.get(v, "eg-badge--baseline")
+    nd = " eg-badge--no-dot" if no_dot else ""
+    return f'<span class="eg-badge {cls}{nd}">{h(text)}</span>'
+
+
+def rel_badge(value: Any) -> str:
+    v = str(value or "")
+    cls = _RELEVANCE_CLASS.get(v, "eg-rel--mid")
+    return f'<span class="eg-rel {cls}">{h(status_label(v))}</span>'
+
+
+_EG_LOGO_SVG = (
+    '<svg width="38" height="38" style="color:#fff" aria-hidden="true">'
+    '<use href="#eg-logo"/></svg>'
+)
+_EG_LOGO_SYMBOL = """<svg width="0" height="0" style="position:absolute" aria-hidden="true">
+  <symbol id="eg-logo" viewBox="0 0 44 44">
+    <path d="M30 6H14a8 8 0 0 0-8 8v6h9v-4a3 3 0 0 1 3-3h12a3 3 0 0 1 3 3v1h6v-4a8 8 0 0 0-8-8Z" fill="currentColor" opacity=".55"/>
+    <path d="M14 38h16a8 8 0 0 0 8-8v-6h-9v4a3 3 0 0 1-3 3H14a3 3 0 0 1-3-3v-1H5v4a8 8 0 0 0 8 8Z" fill="currentColor"/>
+  </symbol>
+</svg>"""
+
+
 def empty_row(colspan: int, title: str, hint: str) -> str:
     """Fila de tabla con estado vacío amigable (en vez de 'Sin datos')."""
     return (
@@ -727,24 +777,28 @@ def render_sidebar(path: str, settings: Settings) -> str:
     parts = []
     for href, label, ic in SIDEBAR_NAV:
         active = path == href
-        cls = " is-active" if active else ""
+        cls = ' class="active"' if active else ""
         aria = ' aria-current="page"' if active else ""
-        parts.append(
-            f'<a class="eg-side__link{cls}" href="{href}"{aria}>'
-            f'<span class="eg-side__ic">{icon(ic)}</span><span>{label}</span></a>'
-        )
+        parts.append(f'<a href="{href}"{cls}{aria}>{icon(ic, 19)}<span>{label}</span></a>')
     items = "".join(parts)
     return f"""
-<div class="eg-side__brand">
-  <img class="eg-logo eg-logo--sm" src="{EG_LOGO_LIGHT}" alt="External Group" />
-  <span class="eg-side__product">Alertas DT</span>
+<div class="eg-brand">
+  {_EG_LOGO_SVG}
+  <div class="eg-brand-text">
+    <div class="eg-brand-name">EXTERNAL GROUP</div>
+    <div class="eg-brand-sub">ALERTAS DT</div>
+  </div>
 </div>
-<nav class="eg-side__nav" aria-label="Navegación del panel">{items}</nav>
-<div class="eg-side__status">
-  <span class="eg-side__dot" data-status="{h(email_key)}"></span>
-  <span>{h(email_label)}</span>
+<div class="eg-hairline"></div>
+<nav class="eg-nav" aria-label="Navegación del panel">{items}</nav>
+<div class="eg-side-foot">
+  <div class="eg-hairline" style="margin:0 0 16px"></div>
+  <div class="eg-side-status">
+    <span class="eg-dot" data-status="{h(email_key)}"></span>
+    <span>{h(email_label)}</span>
+  </div>
+  <div class="eg-side-tag">MVP interno · External Group</div>
 </div>
-<p class="eg-side__foot">MVP interno · External Group</p>
 """
 
 
@@ -777,21 +831,23 @@ def render_topbar(title: str, subtitle: str, settings: Settings, *, show_action:
     action = ""
     if show_action:
         action = (
-            '<form method="post" action="/api/jobs/check-dt" class="eg-topbar__action">'
+            '<form method="post" action="/api/jobs/check-dt">'
             '<input type="hidden" name="manual" value="1">'
             '<button class="eg-btn eg-btn--primary eg-btn--sm" type="submit" '
             'formaction="/api/jobs/check-dt" data-job-token>'
             f'{icon("refresh", 18)}<span>Ejecutar monitoreo</span></button></form>'
         )
+    neutral_email = " is-neutral" if email_key not in {"active"} else ""
+    neutral_auth = " is-neutral" if auth_key not in {"active"} else ""
     return f"""
 <header class="eg-topbar">
-  <div class="eg-topbar__titles">
+  <div class="eg-topbar-titles">
     <h1>{h(title)}</h1>
     <p>{h(subtitle)}</p>
   </div>
-  <div class="eg-topbar__right">
-    <span class="eg-topbar__status">{icon("mail", 16)} {pill(email_key, email_label)}</span>
-    <span class="eg-topbar__status">{pill(auth_key, auth_label)}</span>
+  <div class="eg-topbar-meta">
+    <span class="eg-status-pill{neutral_email}">{h(email_label)}</span>
+    <span class="eg-status-pill{neutral_auth}">{h(auth_label)}</span>
     {action}
   </div>
 </header>
@@ -799,13 +855,14 @@ def render_topbar(title: str, subtitle: str, settings: Settings, *, show_action:
 
 
 def metric_card(ic: str, value: Any, label: str, sub: str, tone: str = "muted") -> str:
+    ico_cls = _TONE_ICO.get(tone, "eg-ico-slate")
     return (
-        f'<article class="eg-stat" data-tone="{h(tone)}">'
-        f'<span class="eg-stat__ic">{icon(ic, 18)}</span>'
-        f'<strong class="eg-stat__num">{h(value)}</strong>'
-        f'<span class="eg-stat__label">{h(label)}</span>'
-        f'<span class="eg-stat__sub">{h(sub)}</span>'
-        "</article>"
+        f'<div class="eg-metric">'
+        f'<div class="eg-metric-ico {ico_cls}">{icon(ic, 19)}</div>'
+        f'<div class="eg-metric-num">{h(value)}</div>'
+        f'<div class="eg-metric-label">{h(label)}</div>'
+        f'<div class="eg-metric-sub">{h(sub)}</div>'
+        f'</div>'
     )
 
 
@@ -819,16 +876,17 @@ def render_system_status(settings: Settings, last_job: dict[str, Any] | None) ->
         last_job_html = f"{fmt_dt(last_job['started_at'])} · {status_label(last_job['status'])}"
         if last_job.get("error"):
             last_error = (
-                f'<div><dt>Último error</dt><dd class="eg-muted">{h(last_job["error"])}</dd></div>'
+                f'<dt>Último error</dt><dd class="eg-muted mono">{h(last_job["error"])}</dd>'
             )
     return f"""
 <section class="eg-card eg-panel">
+  <p class="eg-eyebrow">Sistema</p>
   <h2>Estado del sistema</h2>
-  <dl class="eg-kv">
-    <div><dt>Email</dt><dd>{pill(email_key, email_label)}</dd></div>
-    <div><dt>Modo de envío</dt><dd>{'Correos reales' if real else 'Simulado (no se envían correos)'}</dd></div>
-    <div><dt>Acceso admin</dt><dd>{pill(auth_key, auth_label)}</dd></div>
-    <div><dt>Último monitoreo</dt><dd>{h(last_job_html)}</dd></div>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Email</dt><dd>{badge(email_key, email_label, no_dot=True)}</dd>
+    <dt>Modo de envío</dt><dd>{'Correos reales' if real else 'Simulado'}</dd>
+    <dt>Acceso admin</dt><dd>{badge(auth_key, auth_label, no_dot=True)}</dd>
+    <dt>Último monitoreo</dt><dd class="mono">{h(last_job_html)}</dd>
     {last_error}
   </dl>
 </section>
@@ -888,7 +946,7 @@ def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
             + metric_card("mail", sent_deliveries, "Envíos registrados", "incluye simulados", "muted")
         )
         section = (
-            f'<section class="eg-stats">{cards}</section>'
+            f'<div class="eg-metric-grid">{cards}</div>'
             + render_system_status(settings, last_job)
             + render_jobs(jobs[:5])
             + render_alerts(alerts[:6])
@@ -904,26 +962,27 @@ def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
 def render_jobs(jobs: list[dict[str, Any]]) -> str:
     if not jobs:
         return (
-            '<section class="eg-card eg-panel"><h2>Historial de monitoreo</h2>'
+            '<section class="eg-card eg-panel">'
+            '<div class="eg-card-head"><h2>Historial de monitoreo</h2></div>'
             '<div class="eg-empty"><strong>Aún no se ha ejecutado el monitoreo.</strong>'
             '<span>Usa "Ejecutar monitoreo" para buscar nuevas publicaciones de la DT.</span></div></section>'
         )
     rows = "".join(
         f"""
 <tr>
-  <td>{fmt_dt(job['started_at'])}</td>
-  <td>{pill(job['status'])}</td>
-  <td>{h(job['discovered_count'])}</td>
-  <td>{h(job['processed_count'])}</td>
-  <td>{h(job['sent_count'])}</td>
-  <td class="eg-muted">{h(job.get('error'))}</td>
+  <td class="mono">{fmt_dt(job['started_at'])}</td>
+  <td>{badge(job['status'])}</td>
+  <td class="mono">{h(job['discovered_count'])}</td>
+  <td class="mono">{h(job['processed_count'])}</td>
+  <td class="mono">{h(job['sent_count'])}</td>
+  <td class="eg-muted mono">{h(job.get('error') or '—')}</td>
 </tr>
 """
         for job in jobs
     )
     return f"""
 <section class="eg-card eg-panel">
-  <h2>Historial de jobs</h2>
+  <div class="eg-card-head"><h2>Historial de jobs</h2></div>
   <div class="eg-table-wrap">
     <table class="eg-table">
       <thead><tr><th>Inicio</th><th>Estado</th><th>Nuevos</th><th>Procesados</th><th>Envíos</th><th>Error</th></tr></thead>
@@ -944,15 +1003,12 @@ def render_db_info(settings: Settings, subscribers: list[dict[str, Any]]) -> str
 
     # WordPress sync status card
     if settings.wordpress_sync_enabled:
-        wp_status = '<span class="pill pill--active">Activo</span>'
-        wp_url = h(settings.wordpress_api_url) if settings.wordpress_api_url else "—"
         wp_section = f"""
 <section class="eg-card eg-panel">
-  <h2>Sincronización WordPress</h2>
-  <dl class="eg-kv">
-    <div><dt>Estado</dt><dd>{wp_status}</dd></div>
-    <div><dt>API URL</dt><dd class="eg-muted">{wp_url}</dd></div>
-    <div><dt>Intervalo</dt><dd>{h(settings.wordpress_sync_interval_minutes)} min</dd></div>
+  <div class="eg-card-head"><h2>WordPress Sync</h2>{badge("active", "Activo")}</div>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>API URL</dt><dd class="mono">{h(settings.wordpress_api_url) if settings.wordpress_api_url else '—'}</dd>
+    <dt>Intervalo</dt><dd class="mono">{h(settings.wordpress_sync_interval_minutes)} min</dd>
   </dl>
   <form method="post" action="/admin/wordpress/sync" style="margin-top:12px">
     <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
@@ -962,25 +1018,27 @@ def render_db_info(settings: Settings, subscribers: list[dict[str, Any]]) -> str
 </section>
 """
     else:
-        wp_section = """
+        wp_section = f"""
 <section class="eg-card eg-panel">
-  <h2>Sincronización WordPress</h2>
-  <p class="eg-muted">Desactivada. Configura <code>WORDPRESS_SYNC_ENABLED=true</code> y <code>WORDPRESS_API_URL</code> para importar suscriptores desde WordPress.</p>
+  <div class="eg-card-head"><h2>WordPress Sync</h2>{badge("paused", "Desactivado")}</div>
+  <p class="eg-muted">Configura <code>WORDPRESS_SYNC_ENABLED=true</code> y <code>WORDPRESS_API_URL</code> para importar suscriptores desde WordPress.</p>
 </section>
 """
 
     return f"""
+<div class="eg-grid-2">
 <section class="eg-card eg-panel">
-  <h2>Base de datos</h2>
-  <dl class="eg-kv">
-    <div><dt>Motor</dt><dd>SQLite</dd></div>
-    <div><dt>Ruta</dt><dd class="eg-muted">…/{h(partial)}</dd></div>
-    <div><dt>Suscriptores</dt><dd>{len(subscribers)}</dd></div>
-    <div><dt>Última actualización</dt><dd>{fmt_dt(last_update) if last_update else '—'}</dd></div>
+  <div class="eg-card-head"><h2>Base de datos</h2></div>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Motor</dt><dd>SQLite</dd>
+    <dt>Ruta</dt><dd class="mono eg-muted">…/{h(partial)}</dd>
+    <dt>Suscriptores</dt><dd class="mono">{len(subscribers)}</dd>
+    <dt>Última actualización</dt><dd class="mono">{fmt_dt(last_update) if last_update else '—'}</dd>
   </dl>
-  <p class="eg-muted">En operación local productiva, apunta DATABASE_PATH a una ruta fuera del repo. Ver README.</p>
+  <p class="eg-note">Para operación local productiva, apunta DATABASE_PATH a una ruta fuera del repo.</p>
 </section>
-{wp_section}"""
+{wp_section}
+</div>"""
 
 
 def _test_wordpress_connection(settings: Settings) -> str:
@@ -1268,13 +1326,13 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
         f"""
 <tr>
   <td><strong>{h(item['email'])}</strong></td>
-  <td>{pill(item['status'])}</td>
-  <td class="eg-muted">{fmt_dt(item.get('created_at'))}</td>
-  <td class="eg-muted">{fmt_dt(item.get('updated_at'))}</td>
-  <td class="eg-muted">{h(item.get('source_page') or '—')}</td>
+  <td class="mono">{h(item.get('source_page') or '—')}</td>
+  <td>{badge(item['status'])}</td>
+  <td class="mono">{fmt_dt(item.get('created_at'))}</td>
+  <td class="mono">{fmt_dt(item.get('updated_at'))}</td>
   <td>
     <form method="post" action="/admin/subscribers/{item['id']}/{'pause' if item['status'] == 'active' else 'reactivate'}">
-      <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
+      <button class="eg-btn eg-ghost eg-btn--sm" type="submit">
         {icon('pause', 14) if item['status'] == 'active' else icon('play', 14)}<span>{'Pausar' if item['status'] == 'active' else 'Reactivar'}</span>
       </button>
     </form>
@@ -1285,14 +1343,14 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
     )
     return f"""
 <section class="eg-card eg-panel">
-  <h2>Suscriptores</h2>
+  <div class="eg-card-head"><h2>Suscriptores</h2></div>
   <div class="eg-table-wrap">
     <table class="eg-table">
-      <thead><tr><th>Email</th><th>Estado</th><th>Registro</th><th>Actualización</th><th>Fuente</th><th></th></tr></thead>
+      <thead><tr><th>Email</th><th>Fuente</th><th>Estado</th><th>Registro</th><th>Actualización</th><th></th></tr></thead>
       <tbody>{rows or empty_row(6, "Aún no hay suscriptores.", "Puedes probar el formulario público usando un correo interno.")}</tbody>
     </table>
   </div>
-  <p class="eg-muted">WhatsApp reservado para fase futura: el MVP notifica solo por email.</p>
+  <p class="eg-note">WhatsApp reservado para fase futura: el MVP notifica solo por email.</p>
 </section>
 """
 
@@ -1300,45 +1358,50 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
 def alert_actions(item: dict[str, Any]) -> str:
     alert_id = item["id"]
     status = item["status"]
-    actions = [
+    main_btns = [
         f'<a class="eg-btn eg-btn--primary eg-btn--sm" href="/admin/alerts/{alert_id}/preview-email">'
         f'{icon("eye", 14)}<span>Vista previa</span></a>'
     ]
     if status == "pending_review":
-        actions.append(
+        main_btns.append(
             f'<form method="post" action="/admin/alerts/{alert_id}/ready">'
-            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">'
+            f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
             f'{icon("check", 14)}<span>Marcar lista</span></button></form>'
         )
     if status in {"ready_to_send", "ready"}:
-        actions.append(
+        main_btns.append(
             f'<form method="post" action="/admin/alerts/{alert_id}/send" '
             f'onsubmit="return confirm(\'¿Enviar esta alerta a los suscriptores activos?\');">'
-            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">'
+            f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
             f'{icon("send", 14)}<span>Enviar</span></button></form>'
         )
-    actions.append(
-        f'<form method="post" action="/admin/alerts/{alert_id}/test" class="eg-inline-form">'
+    test_form = (
+        f'<form method="post" action="/admin/alerts/{alert_id}/test" class="eg-test-row">'
         f'<input class="eg-input eg-input--sm" type="email" name="to" placeholder="correo de prueba" aria-label="Correo de prueba">'
-        f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">'
+        f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
         f'{icon("mail", 14)}<span>Enviar prueba</span></button></form>'
     )
-    return '<div class="eg-actions">' + "".join(actions) + "</div>"
+    action_row = '<div class="eg-action-row">' + "".join(main_btns) + "</div>"
+    return f'<div class="eg-alert-actions">{action_row}{test_form}</div>'
 
 
 def alert_card(item: dict[str, Any]) -> str:
     return f"""
-<article class="eg-alert">
-  <div class="eg-alert__head">
-    <span class="eg-alert__cat">{h(item['category'])}</span>
-    <span class="eg-alert__meta">{pill(item['relevance'])} {pill(item['status'])}</span>
+<article class="eg-alert-card">
+  <div class="accent"></div>
+  <div class="eg-alert-body">
+    <div class="eg-alert-meta-top">
+      <div class="eg-alert-cat">{h(item['category'])}</div>
+      <div class="eg-alert-chips">
+        {rel_badge(item['relevance'])}
+        {badge(item['status'])}
+      </div>
+    </div>
+    <h3 class="eg-alert-title">{h(item['title'])}</h3>
+    <p class="eg-alert-summary">{h(item['summary'])}</p>
+    <div class="eg-alert-date mono">{fmt_dt(item.get('created_at'))}</div>
   </div>
-  <h3 class="eg-alert__title">{h(item['title'])}</h3>
-  <p class="eg-alert__summary">{h(item['summary'])}</p>
-  <div class="eg-alert__foot">
-    <span class="eg-alert__date">{fmt_dt(item.get('created_at'))}</span>
-    {alert_actions(item)}
-  </div>
+  {alert_actions(item)}
 </article>
 """
 
@@ -1346,43 +1409,50 @@ def alert_card(item: dict[str, Any]) -> str:
 def render_alerts(alerts: list[dict[str, Any]]) -> str:
     if not alerts:
         return (
-            '<h2 class="eg-block-title">Alertas</h2>'
+            '<div class="eg-section-head"><span class="ghost">01</span><h2>Alertas</h2></div>'
             '<div class="eg-card eg-panel"><div class="eg-empty">'
             "<strong>Aún no hay alertas generadas.</strong>"
             "<span>Las alertas aparecerán cuando se detecten documentos nuevos.</span>"
             "</div></div>"
         )
     cards = "".join(alert_card(item) for item in alerts)
-    return f'<h2 class="eg-block-title">Alertas</h2><div class="eg-alert-grid">{cards}</div>'
+    return (
+        f'<div class="eg-section-head">'
+        f'<span class="ghost">01</span><h2>Alertas</h2>'
+        f'<p>{len(alerts)} alerta{"s" if len(alerts) != 1 else ""} generada{"s" if len(alerts) != 1 else ""}</p>'
+        f'</div>'
+        f'<div class="eg-alert-grid">{cards}</div>'
+    )
 
 
 def render_documents(documents: list[dict[str, Any]]) -> str:
     rows = "".join(
         f"""
 <tr>
-  <td><strong>{h(item['title'])}</strong><p class="eg-muted">{h(item.get('abstract'))}</p></td>
-  <td>{h(item['category'])}</td>
-  <td class="eg-muted">{h(item.get('publication_date') or '—')}</td>
-  <td class="eg-muted">{h(item.get('dt_article_id'))}</td>
-  <td>{pill(item['status'])}</td>
+  <td>
+    <div class="eg-doc-title">{h(item['title'])}</div>
+    <div class="eg-doc-desc eg-muted">{h(item.get('abstract') or '')}</div>
+  </td>
+  <td class="eg-cell-cat">{h(item['category'])}</td>
+  <td class="mono">{h(item.get('publication_date') or '—')}</td>
+  <td class="mono">{h(item.get('dt_article_id'))}</td>
+  <td>{badge(item['status'])}</td>
   <td>
     <a class="eg-btn eg-btn--primary eg-btn--sm" href="{h(item['canonical_url'])}" target="_blank" rel="noreferrer">
       {icon('external', 14)}<span>Ver en DT</span>
     </a>
   </td>
-  <td>
-    <div class="eg-actions">
-      <form method="post" action="/admin/documents/{item['id']}/regenerate">
-        <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
-          {icon('refresh', 14)}<span>Regenerar resumen</span>
-        </button>
-      </form>
-      <form method="post" action="/admin/documents/{item['id']}/ignore">
-        <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
-          {icon('x-circle', 14)}<span>Ignorar</span>
-        </button>
-      </form>
-    </div>
+  <td class="eg-cell-actions">
+    <form method="post" action="/admin/documents/{item['id']}/regenerate">
+      <button class="eg-btn eg-ghost eg-btn--sm" type="submit">
+        {icon('refresh', 14)}<span>Regenerar</span>
+      </button>
+    </form>
+    <form method="post" action="/admin/documents/{item['id']}/ignore">
+      <button class="eg-btn eg-ghost eg-btn--sm" type="submit">
+        {icon('x-circle', 14)}<span>Ignorar</span>
+      </button>
+    </form>
   </td>
 </tr>
 """
@@ -1449,22 +1519,29 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
         settings,
         show_action=False,
     )
+    real_send_note = (
+        '<div class="eg-banner">Envio real habilitado '
+        f"({h(settings.email_provider)}). El boton Enviar prueba envia un correo de verdad.</div>"
+        if real_send else
+        '<div class="eg-banner eg-banner--info">El envio esta en modo simulado. '
+        "Configura SendGrid para habilitar correos reales.</div>"
+    )
     body = f"""
-{send_note}
+{real_send_note}
 <div class="eg-preview-grid">
-  <section class="eg-card eg-panel">
+  <section class="eg-card eg-card-pad eg-review-panel">
+    <p class="eg-eyebrow">Revisión</p>
     <h2>Detalle de la alerta</h2>
-    <dl class="eg-kv">
-      <div><dt>Documento</dt><dd>{h(alert['title'])}</dd></div>
-      <div><dt>Estado</dt><dd>{pill(alert['status'])}</dd></div>
-      <div><dt>Categoría</dt><dd>{h(alert['category'])}</dd></div>
-      <div><dt>Relevancia</dt><dd>{pill(alert['relevance'])}</dd></div>
-      <div><dt>Fecha doc.</dt><dd>{h(alert.get('publication_date') or '—')}</dd></div>
-      <div><dt>Asunto</dt><dd>{h(subject)}</dd></div>
-      <div><dt>Fuente</dt><dd><a class="eg-btn eg-btn--primary eg-btn--sm" href="{h(alert['canonical_url'])}" target="_blank" rel="noreferrer">{icon('external', 14)}<span>Ver en DT</span></a></dd></div>
+    <dl class="eg-kv eg-kv--2col">
+      <dt>Estado</dt><dd>{badge(alert['status'])}</dd>
+      <dt>Relevancia</dt><dd>{rel_badge(alert['relevance'])}</dd>
+      <dt>Categoría</dt><dd>{h(alert['category'])}</dd>
+      <dt>Fecha doc.</dt><dd class="mono">{h(alert.get('publication_date') or '—')}</dd>
+      <dt>Asunto</dt><dd class="mono">{h(subject)}</dd>
+      <dt>Fuente</dt><dd><a class="eg-btn eg-btn--primary eg-btn--sm" href="{h(alert['canonical_url'])}" target="_blank" rel="noreferrer">{icon('external', 14)}<span>Ver en DT</span></a></dd>
     </dl>
-    <div class="eg-actions">
-      <a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/alerts">{icon("back", 16)}<span>Volver a Alertas</span></a>
+    <div class="eg-review-actions">
+      <a class="eg-btn eg-ghost eg-btn--sm" href="/admin/alerts">{icon("back", 16)}<span>Volver</span></a>
       {ready_btn}
       <form method="post" action="/admin/alerts/{alert_id}/test" class="eg-inline-form">
         <input class="eg-input eg-input--sm" type="email" name="to" placeholder="correo de prueba" aria-label="Correo de prueba">
@@ -1475,13 +1552,14 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
     </div>
   </section>
   <section class="eg-card eg-panel">
+    <p class="eg-eyebrow">Previsualización</p>
     <h2>Vista previa del email</h2>
-    <p class="eg-muted">Así se verá el correo en la bandeja del suscriptor.</p>
-    <div class="eg-preview__frame">
+    <p class="eg-muted">Asi se vera el correo en la bandeja del suscriptor.</p>
+    <div class="eg-email-preview">
       <iframe title="Vista previa del email (HTML)" srcdoc="{srcdoc}"></iframe>
     </div>
     <details style="margin-top:14px;">
-      <summary>Ver versión en texto plano</summary>
+      <summary>Ver version en texto plano</summary>
       <pre>{h(email_text)}</pre>
     </details>
   </section>
@@ -1539,25 +1617,44 @@ def render_page(
   <title>{h(title)}</title>
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700&family=Montserrat:wght@500;600;700&display=swap" rel="stylesheet">
+  <link href="https://fonts.googleapis.com/css2?family=Titillium+Web:wght@400;600;700&family=IBM+Plex+Mono:wght@400;500&display=swap" rel="stylesheet">
   <style>{CSS}</style>
 </head>
 """
     if sidebar is not None:
-        # Layout administrativo tipo SaaS: sidebar fijo + main con topbar + contenido.
-        # Sin header/footer público.
+        mobile_drawer_js = """
+<script>
+(function(){
+  var scrim=document.querySelector('.eg-scrim');
+  var sidebar=document.querySelector('.eg-sidebar');
+  var burger=document.querySelector('.eg-burger');
+  function open(){sidebar.classList.add('is-open');scrim.classList.add('is-visible');document.body.style.overflow='hidden';}
+  function close(){sidebar.classList.remove('is-open');scrim.classList.remove('is-visible');document.body.style.overflow='';}
+  if(burger)burger.addEventListener('click',open);
+  if(scrim)scrim.addEventListener('click',close);
+})();
+</script>"""
         return f"""
 <!doctype html>
 <html lang="es">
 {head}
 <body class="eg eg--admin" data-eg-theme="light" data-eg-density="compact">
-  <div class="eg-shell">
-    <aside class="eg-sidebar" data-eg-theme="dark">{sidebar}</aside>
-    <div class="eg-main">
-      {topbar}
-      <div class="eg-content">{body}</div>
-    </div>
+{_EG_LOGO_SYMBOL}
+<div class="eg-scrim" aria-hidden="true"></div>
+<div class="eg-mobilebar">
+  <button class="eg-burger" aria-label="Abrir menu" type="button">
+    <span></span><span></span><span></span>
+  </button>
+  <span class="eg-mobilebar-title">Alertas DT</span>
+</div>
+<div class="eg-shell">
+  <aside class="eg-sidebar">{sidebar}</aside>
+  <div class="eg-main">
+    {topbar}
+    <div class="eg-content">{body}</div>
   </div>
+</div>
+{mobile_drawer_js}
 </body>
 </html>
 """.strip()
@@ -1581,594 +1678,602 @@ def render_page(
 
 CSS = """
 /* =====================================================================
-   External Group · Sistema de diseño (capa de implementación .eg-*)
-   Un sistema, dos temas (data-eg-theme), theming por sección.
+   Alertas DT · Sistema de diseño editorial (prototipo v2)
    ===================================================================== */
 
-/* 3. Tokens oficiales de marca */
+/* ----- Tokens -------------------------------------------------------- */
 :root {
+  --eg-bg: #F4F7F8;
+  --eg-surface: #FFFFFF;
+  --eg-surface-soft: #EEF3F5;
+  --eg-sidebar: #0A2231;
+  --eg-sidebar-2: #071B27;
+  --eg-text: #0A2231;
+  --eg-muted: #5F6E76;
+  --eg-subtle: #8EA1AA;
+  --eg-border: rgba(36,55,67,0.12);
+  --eg-green: #29B78D;
+  --eg-green-hover: #24EBA1;
+  --eg-green-deep: #1E8E6C;
+  --eg-blue: #06A4F5;
+  --eg-warning: #C56A14;
+  --eg-danger: #B23B3B;
+  --sidebar-w: 248px;
+  --font-sans: 'Titillium Web', system-ui, sans-serif;
+  --font-mono: 'IBM Plex Mono', ui-monospace, monospace;
+  --radius-sm: 7px;
+  --radius: 12px;
+  --radius-lg: 18px;
+  /* public pages compat */
   --eg-brand-primary: #243743;
   --eg-brand-accent: #29B78D;
-  --eg-brand-text: #929090;
-  --eg-brand-secondary: #E9E9E9;
   --eg-brand-dark: #0E2230;
   --eg-brand-mint: #24EBA1;
   --eg-brand-blue: #06A4F5;
-  --eg-brand-deep: #0A2231;
-
-  --eg-font-heading: "Montserrat", system-ui, sans-serif;
-  --eg-font-body: "Lato", system-ui, sans-serif;
+  --eg-font-heading: 'Titillium Web', system-ui, sans-serif;
+  --eg-font-body: 'Titillium Web', system-ui, sans-serif;
   --eg-radius: 16px;
   --eg-radius-lg: 24px;
 }
 
-/* 4. Modo oscuro (institucional / alto impacto) */
-:root,
-[data-eg-theme="dark"] {
+/* ----- Dark theme (public hero, sidebar) ----------------------------- */
+:root, [data-eg-theme="dark"] {
   color-scheme: dark;
-  --eg-bg: #0A2231;
-  --eg-surface: #0E2230;
-  --eg-surface-2: #243743;
-  --eg-border: rgba(255, 255, 255, 0.10);
-  --eg-border-accent: rgba(41, 183, 141, 0.32);
+  --eg-bg-t: #0A2231;
+  --eg-surface-t: #0E2230;
+  --eg-border-t: rgba(255,255,255,.10);
   --eg-cta: #29B78D;
   --eg-cta-hover: #24EBA1;
   --eg-text-on-cta: #0A2231;
   --eg-support: #06A4F5;
   --eg-accent: #29B78D;
-  --eg-text: #F6FAFC;
+  --eg-text-t: #F6FAFC;
   --eg-text-muted: #C7D1D6;
   --eg-text-subtle: #8EA1AA;
   --eg-focus: #24EBA1;
 }
 
-/* 5. Modo claro (lectura / contenido denso) */
+/* ----- Light theme (public content, admin main) ---------------------- */
 [data-eg-theme="light"] {
   color-scheme: light;
-  --eg-bg: #F6F8F9;
-  --eg-surface: #FFFFFF;
-  --eg-surface-2: #E9E9E9;
-  --eg-border: rgba(36, 55, 67, 0.12);
-  --eg-border-accent: rgba(41, 183, 141, 0.32);
+  --eg-bg-t: #F6F8F9;
+  --eg-surface-t: #FFFFFF;
+  --eg-border-t: rgba(36,55,67,0.12);
+  --eg-border-accent: rgba(41,183,141,0.32);
   --eg-cta: #29B78D;
   --eg-cta-hover: #167A5F;
   --eg-text-on-cta: #0A2231;
   --eg-support: #0478B4;
   --eg-accent: #167A5F;
-  --eg-text: #0A2231;
+  --eg-text-t: #0A2231;
   --eg-text-muted: #3C4A52;
   --eg-text-subtle: #6D7478;
   --eg-focus: #0478B4;
 }
 
-/* 10.2 Acento de sección */
-[data-eg-accent="green"] { --eg-accent: #29B78D; --eg-border-accent: rgba(41,183,141,.35); }
-[data-eg-accent="mint"]  { --eg-accent: #24EBA1; --eg-border-accent: rgba(36,235,161,.35); }
-[data-eg-accent="blue"]  { --eg-accent: #06A4F5; --eg-border-accent: rgba(6,164,245,.35); }
-[data-eg-theme="light"][data-eg-accent="green"] { --eg-accent: #167A5F; }
-[data-eg-theme="light"][data-eg-accent="blue"]  { --eg-accent: #0478B4; }
+[data-eg-accent="green"] { --eg-accent: #29B78D; }
+[data-eg-accent="blue"]  { --eg-accent: #06A4F5; }
+[data-eg-density="editorial"] { --eg-section-pad: clamp(56px,9vw,120px); }
+[data-eg-density="compact"]   { --eg-section-pad: clamp(32px,5vw,56px); }
 
-/* 10.3 Densidad */
-[data-eg-density="editorial"] { --eg-section-pad: clamp(56px, 9vw, 120px); }
-[data-eg-density="compact"]   { --eg-section-pad: clamp(32px, 5vw, 56px); }
-
-/* ---------- Base ---------- */
+/* ----- Base ---------------------------------------------------------- */
 * { box-sizing: border-box; }
 html { -webkit-text-size-adjust: 100%; }
 body.eg {
   margin: 0;
   background: var(--eg-bg);
   color: var(--eg-text);
-  font-family: var(--eg-font-body);
+  font-family: var(--font-sans);
   font-size: 16px;
   line-height: 1.6;
   -webkit-font-smoothing: antialiased;
 }
 .eg h1, .eg h2, .eg h3, .eg h4 {
-  font-family: var(--eg-font-heading);
+  font-family: var(--font-sans);
   font-weight: 700;
   color: var(--eg-text);
   letter-spacing: -0.02em;
   margin: 0 0 .5em;
-  line-height: 1.1;
+  line-height: 1.15;
 }
-.eg h1 { font-size: clamp(1.9rem, 4vw, 2.8rem); }
-.eg h2 { font-size: clamp(1.35rem, 2.4vw, 1.85rem); }
-.eg p { margin: 0 0 1rem; color: var(--eg-text-muted); }
-.eg a { color: var(--eg-support); text-decoration: none; }
-.eg a:hover { color: var(--eg-accent); }
-.eg img { max-width: 100%; }
-.eg-app { min-height: 40vh; }
+.eg h1 { font-size: clamp(1.9rem,4vw,2.8rem); }
+.eg h2 { font-size: clamp(1.2rem,2vw,1.5rem); }
+.eg p { margin: 0 0 1rem; color: var(--eg-muted); }
+.eg a { color: var(--eg-blue); text-decoration: none; }
+.eg a:hover { color: var(--eg-green); }
+.mono { font-family: var(--font-mono); font-size: .85em; }
 
-/* 8. Contenedor */
-.eg-container { width: min(1180px, calc(100% - 40px)); margin-inline: auto; }
-
-/* ---------- Header (14) ---------- */
-.eg-header {
-  position: sticky; top: 0; z-index: 30;
-  background: rgba(255, 255, 255, .92);
-  backdrop-filter: blur(14px);
-  border-bottom: 1px solid rgba(36, 55, 67, .10);
+/* ----- Admin shell --------------------------------------------------- */
+body.eg--admin {
+  background: var(--eg-bg);
+  color: var(--eg-text);
 }
-.eg-header__inner { display: flex; align-items: center; justify-content: space-between; gap: 16px; min-height: 72px; }
-.eg-header__brand { display: inline-flex; align-items: center; }
-.eg-logo { height: 46px; width: auto; display: block; }
-.eg-logo--sm { height: 40px; }
-.eg-header__tag {
-  font-family: var(--eg-font-body); font-size: 12px; font-weight: 700;
-  letter-spacing: .14em; text-transform: uppercase; color: var(--eg-brand-primary);
-  border: 1px solid rgba(36,55,67,.12); border-radius: 999px; padding: 6px 12px;
+.eg-shell {
+  display: grid;
+  grid-template-columns: var(--sidebar-w) 1fr;
+  min-height: 100vh;
 }
 
-/* ---------- Hero (13) ---------- */
-.eg-hero {
-  position: relative; overflow: hidden;
-  padding: clamp(48px, 8vw, 96px) 0;
-  background:
-    radial-gradient(circle at 18% 20%, rgba(36,235,161,.16), transparent 32%),
-    radial-gradient(circle at 86% 28%, rgba(6,164,245,.13), transparent 30%),
-    linear-gradient(135deg, #0A2231 0%, #0E2230 54%, #243743 100%);
-  color: #F6FAFC;
+/* ----- Sidebar ------------------------------------------------------- */
+.eg-sidebar {
+  background: var(--eg-sidebar);
+  color: rgba(255,255,255,.82);
+  position: sticky;
+  top: 0;
+  height: 100vh;
+  display: flex;
+  flex-direction: column;
+  padding: 20px 16px;
+  overflow-y: auto;
+  transition: transform .22s cubic-bezier(.4,0,.2,1);
 }
-.eg-hero__grid {
-  position: relative; z-index: 2;
-  display: grid; grid-template-columns: minmax(0, 1fr) minmax(330px, 440px);
-  gap: clamp(28px, 5vw, 56px); align-items: center;
+.eg-brand {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 2px 4px 4px;
 }
-.eg-hero__copy { color: #F6FAFC; }
-.eg-hero__title {
-  font-family: var(--eg-font-heading); font-weight: 700;
-  font-size: clamp(2.1rem, 5vw, 3.4rem); line-height: 1.04;
-  letter-spacing: -0.03em; color: #F6FAFC; margin: 12px 0 16px;
+.eg-brand-text { display: flex; flex-direction: column; gap: 1px; }
+.eg-brand-name {
+  font-size: 10px;
+  font-weight: 700;
+  letter-spacing: .15em;
+  color: rgba(255,255,255,.5);
 }
-.eg-hero__title span { color: var(--eg-accent); }
-.eg-hero__lead { max-width: 560px; color: var(--eg-text-muted); font-size: clamp(1rem, 1.2vw, 1.12rem); }
-.eg-hero__points { list-style: none; display: flex; flex-wrap: wrap; gap: 10px; padding: 0; margin: 22px 0 0; }
+.eg-brand-sub {
+  font-size: 13px;
+  font-weight: 700;
+  letter-spacing: .06em;
+  color: #fff;
+}
+.eg-hairline {
+  height: 1px;
+  background: rgba(255,255,255,.08);
+  margin: 14px 0;
+}
+.eg-nav {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  flex: 1;
+}
+.eg-nav a {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  padding: 9px 12px;
+  border-radius: var(--radius-sm);
+  color: rgba(255,255,255,.70);
+  font-size: 14px;
+  font-weight: 600;
+  text-decoration: none;
+  transition: background .15s, color .15s;
+}
+.eg-nav a:hover {
+  background: rgba(255,255,255,.07);
+  color: #fff;
+}
+.eg-nav a.active {
+  background: var(--eg-green);
+  color: #0A2231;
+}
+.eg-nav a .eg-ic { flex-shrink: 0; }
+.eg-side-foot { margin-top: auto; }
+.eg-side-status {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  font-size: 12px;
+  color: rgba(255,255,255,.5);
+  padding: 4px 4px;
+}
+.eg-dot {
+  width: 8px;
+  height: 8px;
+  border-radius: 50%;
+  background: #8EA1AA;
+  flex-shrink: 0;
+}
+.eg-dot[data-status="active"] { background: var(--eg-green); }
+.eg-dot[data-status="pending_review"],
+.eg-dot[data-status="simulated"] { background: var(--eg-warning); }
+.eg-dot[data-status="error"] { background: var(--eg-danger); }
+.eg-side-tag {
+  font-size: 11px;
+  color: rgba(255,255,255,.3);
+  padding: 4px 4px 2px;
+  letter-spacing: .04em;
+}
 
-/* Glow de marca (16) */
-.eg-glow {
-  position: absolute; pointer-events: none; border-radius: 999px; z-index: 1;
-  width: 420px; height: 420px; filter: blur(10px);
-  background: radial-gradient(circle, rgba(36,235,161,.18), transparent 66%);
+/* Mobile bar */
+.eg-mobilebar {
+  display: none;
+  align-items: center;
+  gap: 12px;
+  padding: 12px 16px;
+  background: var(--eg-sidebar);
+  color: #fff;
+  position: sticky;
+  top: 0;
+  z-index: 200;
 }
-.eg-glow--a { top: -120px; left: -80px; }
-.eg-glow--b { bottom: -160px; right: -60px; background: radial-gradient(circle, rgba(6,164,245,.16), transparent 66%); }
+.eg-mobilebar-title { font-size: 14px; font-weight: 700; }
+.eg-burger {
+  display: flex;
+  flex-direction: column;
+  justify-content: center;
+  gap: 5px;
+  width: 32px;
+  height: 32px;
+  background: transparent;
+  border: none;
+  cursor: pointer;
+  padding: 4px;
+}
+.eg-burger span {
+  display: block;
+  height: 2px;
+  background: rgba(255,255,255,.85);
+  border-radius: 2px;
+  transition: opacity .2s;
+}
+.eg-scrim {
+  display: none;
+  position: fixed;
+  inset: 0;
+  background: rgba(0,0,0,.5);
+  z-index: 299;
+  opacity: 0;
+  transition: opacity .22s;
+}
+.eg-scrim.is-visible { opacity: 1; }
 
-/* ---------- Eyebrow / Chip (9.4 / 9.5) ---------- */
-.eg-eyebrow {
-  display: inline-flex; align-items: center; gap: 8px; margin: 0 0 6px;
-  font-size: .72rem; font-weight: 700; letter-spacing: .16em;
-  text-transform: uppercase; color: var(--eg-accent);
+/* ----- Topbar -------------------------------------------------------- */
+.eg-main { display: flex; flex-direction: column; min-width: 0; }
+.eg-topbar {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 16px;
+  padding: 20px 28px 16px;
+  border-bottom: 1px solid var(--eg-border);
+  background: var(--eg-surface);
+  position: sticky;
+  top: 0;
+  z-index: 100;
 }
-.eg-chip {
-  display: inline-flex; align-items: center; gap: 8px; border-radius: 999px;
-  padding: 8px 13px; font-size: 14px; font-weight: 500; color: var(--eg-accent);
-  background: color-mix(in srgb, var(--eg-accent) 12%, transparent);
-  border: 1px solid var(--eg-border-accent);
+.eg-topbar-titles h1 {
+  font-size: 1.15rem;
+  font-weight: 700;
+  margin: 0;
+  color: var(--eg-text);
 }
-
-/* ---------- Botones (9.1 - 9.3) ---------- */
-.eg-btn {
-  display: inline-flex; align-items: center; justify-content: center; gap: 10px;
-  min-height: 48px; padding: 13px 24px; border-radius: 999px;
-  font-family: var(--eg-font-body); font-size: 16px; font-weight: 700; line-height: 1;
-  text-decoration: none; border: 1px solid transparent; cursor: pointer;
-  transition: transform .22s ease, box-shadow .22s ease, background .22s ease, border-color .22s ease, color .22s ease;
+.eg-topbar-titles p {
+  font-size: 13px;
+  color: var(--eg-muted);
+  margin: 2px 0 0;
 }
-.eg-btn:focus-visible { outline: none; box-shadow: 0 0 0 4px color-mix(in srgb, var(--eg-focus) 26%, transparent); }
-.eg-btn--primary { background: var(--eg-cta); color: var(--eg-text-on-cta); border-color: var(--eg-cta); }
-.eg-btn--primary:hover {
-  background: var(--eg-cta-hover); border-color: var(--eg-cta-hover);
-  transform: translateY(-2px); box-shadow: 0 16px 34px rgba(41,183,141,.26);
+.eg-topbar-meta {
+  display: flex;
+  align-items: center;
+  gap: 10px;
+  flex-shrink: 0;
 }
-.eg-btn--secondary { background: transparent; color: var(--eg-text); border-color: var(--eg-border); }
-.eg-btn--secondary:hover { color: var(--eg-accent); border-color: var(--eg-border-accent); transform: translateY(-2px); }
-.eg-btn--sm { min-height: 38px; padding: 8px 16px; font-size: 14px; }
-.eg-btn--block { width: 100%; }
-button.eg-btn.eg-btn--secondary.eg-btn--sm { min-width: 150px; }
-a.eg-btn.eg-btn--primary.eg-btn--sm { color: white; }
-
-/* ---------- Card / Panel (9.6 / 8) ---------- */
-.eg-card {
-  background: var(--eg-surface); border: 1px solid var(--eg-border);
-  border-radius: var(--eg-radius-lg); padding: clamp(22px, 3vw, 32px);
-  box-shadow: 0 18px 50px rgba(10, 34, 49, .10);
-}
-.eg-panel { margin-bottom: 18px; }
-.eg-panel > h2 { margin-bottom: 14px; }
-
-/* ---------- Formularios (19) ---------- */
-.eg-form { display: grid; gap: 16px; align-content: start; }
-.eg-form__title { margin: 0; }
-.eg-field { display: grid; gap: 8px; }
-.eg-label { font-size: 14px; font-weight: 700; color: var(--eg-text); }
-.eg-label__hint { font-weight: 400; color: var(--eg-text-subtle); }
-.eg-input, .eg-textarea, .eg-select {
-  width: 100%; min-height: 48px; border-radius: 14px;
-  border: 1px solid var(--eg-border); background: var(--eg-surface);
-  color: var(--eg-text); padding: 12px 14px; font-family: var(--eg-font-body); font-size: 16px; outline: none;
-  transition: border-color .18s ease, box-shadow .18s ease;
-}
-.eg-input:focus, .eg-textarea:focus, .eg-select:focus {
-  border-color: var(--eg-focus);
-  box-shadow: 0 0 0 4px color-mix(in srgb, var(--eg-focus) 18%, transparent);
-}
-.eg-checks { display: flex; flex-wrap: wrap; gap: 16px; }
-.eg-check { display: flex; align-items: center; gap: 8px; font-size: 14px; font-weight: 600; color: var(--eg-text); }
-.eg-check input { width: 18px; height: 18px; accent-color: var(--eg-cta); }
-.eg-check--consent { align-items: flex-start; line-height: 1.45; font-weight: 500; color: var(--eg-text-muted); }
-.eg-check--consent input { margin-top: 2px; }
-.eg-fineprint { color: var(--eg-text-subtle); font-size: 13px; line-height: 1.45; margin: 0; }
-.eg-embed { padding: 18px; }
-.eg-embed .eg-card { box-shadow: none; }
-
-/* ---------- Secciones landing (beneficios / cómo funciona) ---------- */
-.eg-section--light { background: var(--eg-bg); }
-.eg-section--soft { background: var(--eg-surface-2); }
-.eg-section__title { margin: 6px 0 26px; }
-.eg-benefits { margin-top: 8px; }
-.eg-benefit { text-align: left; }
-.eg-benefit__icon {
-  display: inline-grid; place-items: center; width: 46px; height: 46px; margin-bottom: 12px;
-  border-radius: 14px; background: color-mix(in srgb, var(--eg-accent) 14%, transparent);
-  font-size: 22px; line-height: 1;
-}
-.eg-benefit h3 { font-size: 1.05rem; margin: 0 0 6px; }
-.eg-benefit p { margin: 0; font-size: 14px; color: var(--eg-text-muted); }
-.eg-steps {
-  list-style: none; margin: 0; padding: 0;
-  display: grid; gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr));
-}
-.eg-step {
-  display: flex; gap: 16px; align-items: flex-start;
-  background: var(--eg-surface); border: 1px solid var(--eg-border);
-  border-radius: var(--eg-radius); padding: 18px 20px;
-}
-.eg-step__num {
-  flex: none; display: inline-grid; place-items: center; width: 36px; height: 36px;
-  border-radius: 999px; background: var(--eg-cta); color: var(--eg-text-on-cta);
-  font-family: var(--eg-font-heading); font-weight: 700; font-size: 16px;
-}
-.eg-step h3 { font-size: 1rem; margin: 4px 0 4px; }
-.eg-step p { margin: 0; font-size: 14px; color: var(--eg-text-muted); }
-@media (max-width: 720px) { .eg-steps { grid-template-columns: 1fr; } }
-
-/* ---------- Feedback / Auth ---------- */
-.eg-feedback, .eg-auth { padding: clamp(40px, 8vw, 90px) 20px; display: grid; justify-items: center; }
-.eg-feedback__card, .eg-auth__card { max-width: 560px; width: 100%; text-align: center; }
-.eg-auth__card { text-align: left; max-width: 440px; }
-.eg-auth__help { color: var(--eg-text-muted); font-size: 14px; margin: 0 0 16px; }
-.eg-feedback__lead { color: var(--eg-text-muted); }
-.eg-feedback__icon {
-  display: inline-grid; place-items: center; width: 56px; height: 56px; margin: 0 auto 14px;
-  border-radius: 999px; background: color-mix(in srgb, var(--eg-cta) 16%, transparent);
-  color: var(--eg-cta); font-size: 26px; font-weight: 700;
-}
-.eg-feedback__card .eg-btn, .eg-auth__card .eg-btn { margin-top: 10px; }
-.eg-error { color: #B42318; font-weight: 700; margin: 0 0 6px; }
-[data-eg-theme="dark"] .eg-error { color: #FF8A7A; }
-
-/* ---------- Admin ---------- */
-.eg-app { padding: clamp(28px, 4vw, 44px) 0 56px; }
-.eg-admin-header,
-.eg-metrics, .eg-tabs, .eg-panel, .eg-feedback, .eg-auth { width: min(1180px, calc(100% - 40px)); margin-inline: auto; }
-.eg-admin-header {
-  display: flex; align-items: center; justify-content: space-between; gap: 16px; margin-bottom: 22px;
-}
-.eg-admin-header h1 { margin: 0; }
-.eg-metrics {
-  display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 14px; margin-bottom: 16px;
-}
-.eg-metric {
-  background: var(--eg-surface); border: 1px solid var(--eg-border);
-  border-radius: var(--eg-radius); padding: 16px 18px;
-  box-shadow: 0 10px 30px rgba(10,34,49,.06);
-}
-.eg-metric strong { display: block; font-family: var(--eg-font-heading); font-size: 26px; line-height: 1.1; color: var(--eg-text); }
-.eg-metric span { color: var(--eg-text-subtle); font-size: 13px; }
-
-/* Tabs (10.x interacción) */
-.eg-tabs { display: flex; flex-wrap: wrap; gap: 8px; margin-bottom: 20px; }
-.eg-tab {
-  border: 1px solid var(--eg-border); border-radius: 999px; color: var(--eg-text);
-  padding: 9px 16px; font-size: 14px; font-weight: 600; background: var(--eg-surface);
-  transition: all .18s ease;
-}
-.eg-tab:hover { border-color: var(--eg-border-accent); color: var(--eg-accent); }
-.eg-tab.is-active { background: var(--eg-brand-primary); color: #fff; border-color: var(--eg-brand-primary); }
-
-/* 18. Tablas */
-.eg-table-wrap { overflow-x: auto; border-radius: var(--eg-radius); }
-.eg-table { width: 100%; border-collapse: collapse; background: var(--eg-surface); }
-.eg-table th, .eg-table td {
-  padding: 13px 16px; border-bottom: 1px solid var(--eg-border); text-align: left; vertical-align: top; font-size: 14px;
-}
-.eg-table th {
-  font-size: 12px; letter-spacing: .08em; text-transform: uppercase;
-  color: var(--eg-text); background: var(--eg-surface-2); font-weight: 700; white-space: nowrap;
-}
-.eg-table td { color: var(--eg-text-muted); }
-.eg-table tbody tr:last-child td { border-bottom: 0; }
-.eg-table tbody tr:hover td { background: color-mix(in srgb, var(--eg-accent) 5%, transparent); }
-.eg-table td strong { color: var(--eg-text); font-weight: 700; }
-.eg-table td form { margin: 0; }
-.eg-muted { color: var(--eg-text-subtle); font-size: 13px; line-height: 1.45; margin: 4px 0 0; }
-p.eg-muted { max-height: 75px; overflow: hidden; }
-
-/* Pills de estado */
-.eg-pill {
-  display: inline-block; border-radius: 999px; padding: 4px 10px; font-size: 12px; font-weight: 700;
-  background: color-mix(in srgb, var(--eg-support) 14%, transparent); color: var(--eg-support);
+.eg-status-pill {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 5px 12px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--eg-green) 12%, transparent);
+  color: var(--eg-green-deep);
+  border: 1px solid color-mix(in srgb, var(--eg-green) 28%, transparent);
   white-space: nowrap;
 }
-
-/* 15. Footer */
-.eg-footer { background: var(--eg-brand-deep); color: rgba(255,255,255,.72); padding: 56px 0 28px; margin-top: 48px; }
-.eg-footer__inner { display: grid; gap: 14px; }
-.eg-footer__note { color: rgba(255,255,255,.62); font-size: 13.5px; max-width: 620px; margin: 0; }
-.eg-footer__copy { color: rgba(255,255,255,.5); font-size: 12.5px; margin: 0; border-top: 1px solid rgba(255,255,255,.08); padding-top: 16px; }
-.eg-footer a { color: rgba(255,255,255,.78); }
-.eg-footer a:hover { color: #24EBA1; }
-
-/* 16. Animaciones sutiles */
-.eg-fade-up { opacity: 0; transform: translateY(18px); animation: egFadeUp .7s ease forwards; }
-@keyframes egFadeUp { to { opacity: 1; transform: translateY(0); } }
-@media (prefers-reduced-motion: reduce) {
-  .eg-fade-up { animation: none; opacity: 1; transform: none; }
-  .eg-btn, .eg-card { transition: none; }
+.eg-status-pill.is-neutral {
+  background: color-mix(in srgb, var(--eg-muted) 10%, transparent);
+  color: var(--eg-muted);
+  border-color: var(--eg-border);
 }
 
-/* ---------- Responsive ---------- */
-@media (max-width: 900px) {
-  .eg-hero__grid { grid-template-columns: 1fr; }
-  .eg-metrics { grid-template-columns: repeat(2, minmax(0, 1fr)); }
-}
-@media (max-width: 600px) {
-  .eg-header__tag { display: none; }
-  .eg-admin-header { flex-direction: column; align-items: stretch; }
-  .eg-admin-header form, .eg-admin-header .eg-btn { width: 100%; }
-  .eg-metric strong { font-size: 22px; }
+/* ----- Content area -------------------------------------------------- */
+.eg-content {
+  padding: 24px 28px;
+  display: flex;
+  flex-direction: column;
+  gap: 20px;
 }
 
-/* ---------- Ajustes finales (overrides de proyecto) ---------- */
-html body img.eg-logo {
-    height: 35px;
+/* ----- Cards --------------------------------------------------------- */
+.eg-card {
+  background: var(--eg-surface);
+  border: 1px solid var(--eg-border);
+  border-radius: var(--radius-lg);
 }
-
-html body main.eg-app {
-    background: #f6f6f6;
+.eg-panel { padding: 22px 24px; }
+.eg-card-pad { padding: 24px; }
+.eg-card-head {
+  display: flex;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
 }
+.eg-card-head h2 { margin: 0; font-size: 1rem; }
 
-html body .eg h1 {
-    font-size: clamp(1.35rem, 2.4vw, 1.85rem);
+/* ----- Metric grid --------------------------------------------------- */
+.eg-metric-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(160px, 1fr));
+  gap: 14px;
 }
-main.eg-app>.eg-hero {
-    /* padding: 0; */
-    min-height: calc(100vh - 318px);
+.eg-metric {
+  background: var(--eg-surface);
+  border: 1px solid var(--eg-border);
+  border-radius: var(--radius);
+  padding: 18px 18px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 4px;
 }
-
-html body footer.eg-footer {
-    margin: 0;
+.eg-metric-ico {
+  width: 36px;
+  height: 36px;
+  border-radius: 8px;
+  display: flex;
+  align-items: center;
+  justify-content: center;
+  margin-bottom: 8px;
 }
+.eg-ico-green { background: color-mix(in srgb, var(--eg-green) 14%, transparent); color: var(--eg-green-deep); }
+.eg-ico-blue  { background: color-mix(in srgb, var(--eg-blue) 14%, transparent);  color: #0478B4; }
+.eg-ico-warn  { background: color-mix(in srgb, var(--eg-warning) 14%, transparent); color: var(--eg-warning); }
+.eg-ico-slate { background: color-mix(in srgb, var(--eg-muted) 14%, transparent);  color: var(--eg-muted); }
+.eg-metric-num  { font-size: 1.7rem; font-weight: 700; color: var(--eg-text); line-height: 1; }
+.eg-metric-label { font-size: 13px; font-weight: 600; color: var(--eg-text); }
+.eg-metric-sub   { font-size: 12px; color: var(--eg-subtle); }
 
-html body main.eg-app {
-    padding: 0;
+/* ----- Badges -------------------------------------------------------- */
+.eg-badge {
+  display: inline-flex;
+  align-items: center;
+  gap: 5px;
+  padding: 3px 10px 3px 8px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  white-space: nowrap;
 }
-
-/* ---------- Admin operativo (etapas 4/8/10/11) + pulido UX/UI ---------- */
-.eg-devbanner {
-  width: min(1180px, calc(100% - 40px)); margin: 0 auto 18px;
-  background: #FEF3C7; color: #92400E; border: 1px solid #FCD34D;
-  border-radius: 12px; padding: 12px 16px; font-size: 14px; font-weight: 700;
+.eg-badge::before {
+  content: "";
+  width: 6px;
+  height: 6px;
+  border-radius: 50%;
+  flex-shrink: 0;
 }
-.eg-admin-header__sub { color: var(--eg-text-muted); margin: 4px 0 0; font-size: 14px; }
+.eg-badge--no-dot::before { display: none; }
+.eg-badge--active   { background: color-mix(in srgb,#29B78D 14%,#fff); color: #1E8E6C; }
+.eg-badge--active::before { background: #29B78D; }
+.eg-badge--sent     { background: color-mix(in srgb,#06A4F5 14%,#fff); color: #0478B4; }
+.eg-badge--sent::before   { background: #06A4F5; }
+.eg-badge--ready    { background: color-mix(in srgb,#06A4F5 14%,#fff); color: #0478B4; }
+.eg-badge--ready::before  { background: #06A4F5; }
+.eg-badge--pending  { background: color-mix(in srgb,#C56A14 12%,#fff); color: #A05010; }
+.eg-badge--pending::before { background: #C56A14; }
+.eg-badge--baseline { background: color-mix(in srgb,#8EA1AA 14%,#fff); color: #5F6E76; }
+.eg-badge--baseline::before { background: #8EA1AA; }
+.eg-badge--paused   { background: color-mix(in srgb,#8EA1AA 12%,#fff); color: #5F6E76; }
+.eg-badge--paused::before  { background: #8EA1AA; }
+.eg-badge--danger   { background: color-mix(in srgb,#B23B3B 12%,#fff); color: #B23B3B; }
+.eg-badge--danger::before  { background: #B23B3B; }
 
-/* Estado del sistema (proveedor email / auth / último job) */
-.eg-sysstatus {
-  width: min(1180px, calc(100% - 40px)); margin: 0 auto 20px;
-  display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center;
-  background: var(--eg-surface); border: 1px solid var(--eg-border);
-  border-radius: var(--eg-radius); padding: 12px 18px;
+/* Relevance chips */
+.eg-rel {
+  display: inline-flex;
+  align-items: center;
+  padding: 3px 9px;
+  border-radius: var(--radius-sm);
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .04em;
+  text-transform: uppercase;
+  white-space: nowrap;
 }
-.eg-sysstatus__item { display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--eg-text-muted); }
-.eg-sysstatus__item b { color: var(--eg-text); font-weight: 700; }
+.eg-rel--high { background: #DCF8EE; color: #1E8E6C; }
+.eg-rel--mid  { background: #FEF0DC; color: #A05010; }
+.eg-rel--low  { background: #FDE8E8; color: #B23B3B; }
 
-/* Estados vacíos amigables */
-.eg-empty { display: grid; gap: 4px; padding: 24px 8px; text-align: center; }
-.eg-empty strong { color: var(--eg-text); font-size: 15px; }
-.eg-empty span { color: var(--eg-text-subtle); font-size: 13.5px; }
-.eg-empty-row td { background: transparent; }
-.eg-empty-row:hover td { background: transparent; }
-
-/* Link tabular destacado */
-.eg-link { color: var(--eg-support); font-weight: 600; white-space: nowrap; }
-.eg-link:hover { color: var(--eg-accent); }
-
-.eg-lastjob { width: min(1180px, calc(100% - 40px)); margin: 0 auto 18px; }
-.eg-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
-.eg-actions form { margin: 0; }
-.eg-alert__foot .eg-actions .eg-btn { font-size: 12px; }
-span.eg-alert__meta > span { font-size: 9px; padding: 1px 10px; }
-.eg-inline-form { display: flex; gap: 6px; align-items: center; }
-.eg-input--sm { min-height: 36px; padding: 6px 10px; font-size: 13px; max-width: 200px; border-radius: 10px; }
-
-/* Pills con color semántico por estado */
-.eg-pill[data-status="active"], .eg-pill[data-status="sent"], .eg-pill[data-status="ready_to_send"],
-.eg-pill[data-status="ready"], .eg-pill[data-status="processed"], .eg-pill[data-status="success"],
+/* Legacy pill (public pages, login) */
+.eg-pill {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 999px;
+  font-size: 12px;
+  font-weight: 600;
+  border: 1px solid color-mix(in srgb, currentColor 30%, transparent);
+  background: color-mix(in srgb, var(--eg-muted) 10%, transparent);
+  color: var(--eg-muted);
+}
+.eg-pill[data-status="active"], .eg-pill[data-status="sent"],
+.eg-pill[data-status="ready_to_send"], .eg-pill[data-status="ready"],
+.eg-pill[data-status="processed"], .eg-pill[data-status="success"],
 .eg-pill[data-status="alto"] {
-  background: color-mix(in srgb, #167A5F 16%, transparent); color: #0F5E51;
+  background: color-mix(in srgb,#167A5F 16%,transparent); color: #0F5E51;
 }
-.eg-pill[data-status="paused"], .eg-pill[data-status="pending_review"], .eg-pill[data-status="partial"],
-.eg-pill[data-status="baseline"], .eg-pill[data-status="discovered"], .eg-pill[data-status="medio"],
+.eg-pill[data-status="paused"], .eg-pill[data-status="pending_review"],
+.eg-pill[data-status="partial"], .eg-pill[data-status="baseline"],
+.eg-pill[data-status="discovered"], .eg-pill[data-status="medio"],
 .eg-pill[data-status="running"], .eg-pill[data-status="skipped"] {
-  background: color-mix(in srgb, #B45309 16%, transparent); color: #92400E;
+  background: color-mix(in srgb,#B45309 16%,transparent); color: #92400E;
 }
-.eg-pill[data-status="error"], .eg-pill[data-status="failed"], .eg-pill[data-status="ignored"],
-.eg-pill[data-status="bajo"] {
-  background: color-mix(in srgb, #B42318 14%, transparent); color: #B42318;
+.eg-pill[data-status="error"], .eg-pill[data-status="failed"],
+.eg-pill[data-status="ignored"], .eg-pill[data-status="bajo"] {
+  background: color-mix(in srgb,#B42318 14%,transparent); color: #B42318;
 }
 
-/* Vista previa de email (etapa 8) */
-.eg-preview { width: min(1180px, calc(100% - 40px)); margin-inline: auto; }
-.eg-preview__frame {
-  border: 1px solid var(--eg-border); border-radius: var(--eg-radius);
-  background: #fff; overflow: hidden; margin-top: 12px;
+/* ----- Section heads ------------------------------------------------- */
+.eg-section-head {
+  display: flex;
+  align-items: baseline;
+  gap: 14px;
+  margin-bottom: 16px;
 }
-.eg-preview__frame iframe { width: 100%; min-height: 640px; border: 0; display: block; }
-.eg-preview pre {
-  white-space: pre-wrap; word-break: break-word; background: var(--eg-surface-2);
-  border-radius: 12px; padding: 16px; font-size: 13px; line-height: 1.5; overflow-x: auto;
+.eg-section-head .ghost {
+  font-size: 2.8rem;
+  font-weight: 700;
+  color: var(--eg-border);
+  line-height: 1;
+  letter-spacing: -.04em;
+  user-select: none;
 }
+.eg-section-head h2 { margin: 0; }
+.eg-section-head p  { margin: 0; font-size: 13px; color: var(--eg-subtle); }
+.eg-eyebrow {
+  font-size: 11px;
+  font-weight: 700;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--eg-subtle);
+  margin: 0 0 6px;
+}
+
+/* ----- Buttons ------------------------------------------------------- */
+.eg-btn {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  padding: 9px 18px;
+  border-radius: var(--radius-sm);
+  font-family: var(--font-sans);
+  font-size: 14px;
+  font-weight: 700;
+  cursor: pointer;
+  border: none;
+  text-decoration: none;
+  transition: background .15s, color .15s, opacity .15s;
+  white-space: nowrap;
+}
+.eg-btn--primary {
+  background: var(--eg-green);
+  color: #fff;
+}
+.eg-btn--primary:hover { background: var(--eg-green-deep); color: #fff; }
+.eg-btn--secondary {
+  background: var(--eg-surface-soft);
+  color: var(--eg-text);
+  border: 1px solid var(--eg-border);
+}
+.eg-btn--secondary:hover { background: var(--eg-border); }
+.eg-ghost {
+  background: transparent;
+  color: var(--eg-muted);
+  border: 1px solid var(--eg-border);
+}
+.eg-ghost:hover { color: var(--eg-text); border-color: var(--eg-text); }
+.eg-btn--sm { padding: 6px 12px; font-size: 13px; }
+.eg-btn--block { width: 100%; justify-content: center; }
+.eg-btn:disabled { opacity: .45; cursor: not-allowed; }
+
+/* ----- Tables -------------------------------------------------------- */
+.eg-table-wrap { overflow-x: auto; border-radius: var(--radius); }
+.eg-table { width: 100%; border-collapse: collapse; background: var(--eg-surface); }
+.eg-table th, .eg-table td {
+  padding: 11px 14px;
+  border-bottom: 1px solid var(--eg-border);
+  text-align: left;
+  vertical-align: top;
+  font-size: 13.5px;
+}
+.eg-table th {
+  font-size: 11px;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--eg-muted);
+  background: var(--eg-surface-soft);
+  font-weight: 700;
+  white-space: nowrap;
+}
+.eg-table td { color: var(--eg-muted); }
+.eg-table tbody tr:last-child td { border-bottom: 0; }
+.eg-table tbody tr:hover td { background: color-mix(in srgb, var(--eg-green) 4%, transparent); }
+.eg-table td strong { color: var(--eg-text); font-weight: 700; }
+.eg-table td form { margin: 0; }
+.eg-table td.mono { font-family: var(--font-mono); font-size: 12.5px; }
+.eg-doc-title { font-weight: 700; color: var(--eg-text); font-size: 13.5px; }
+.eg-doc-desc  { font-size: 12px; color: var(--eg-subtle); margin-top: 3px; }
+.eg-cell-cat  { font-size: 12.5px; color: var(--eg-muted); white-space: nowrap; }
+.eg-cell-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
+.eg-cell-actions form { margin: 0; }
+
+/* ----- Alert grid ---------------------------------------------------- */
+.eg-alert-grid {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  gap: 16px;
+}
+.eg-alert-card {
+  background: var(--eg-surface);
+  border: 1px solid var(--eg-border);
+  border-radius: var(--radius-lg);
+  display: flex;
+  overflow: hidden;
+}
+.eg-alert-card .accent {
+  width: 4px;
+  flex-shrink: 0;
+  background: var(--eg-green);
+  border-radius: 0;
+}
+.eg-alert-body {
+  padding: 16px 16px 14px;
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  flex: 1;
+  min-width: 0;
+}
+.eg-alert-meta-top {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 8px;
+  flex-wrap: wrap;
+}
+.eg-alert-cat { font-size: 11px; font-weight: 700; letter-spacing: .06em; text-transform: uppercase; color: var(--eg-subtle); }
+.eg-alert-chips { display: flex; gap: 5px; align-items: center; flex-wrap: wrap; }
+.eg-alert-title { font-size: .95rem; font-weight: 700; color: var(--eg-text); margin: 0; line-height: 1.3; }
+.eg-alert-summary {
+  font-size: 13px;
+  color: var(--eg-muted);
+  line-height: 1.5;
+  display: -webkit-box;
+  -webkit-line-clamp: 3;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  margin: 0;
+}
+.eg-alert-date { font-family: var(--font-mono); font-size: 11.5px; color: var(--eg-subtle); }
+.eg-alert-actions {
+  padding: 12px 14px 12px 12px;
+  display: flex;
+  flex-direction: column;
+  gap: 8px;
+  justify-content: flex-end;
+  border-left: 1px solid var(--eg-border);
+  background: var(--eg-surface-soft);
+  min-width: 150px;
+  flex-shrink: 0;
+}
+.eg-action-row { display: flex; flex-direction: column; gap: 6px; }
+.eg-test-row { display: flex; flex-direction: column; gap: 5px; }
+.eg-test-row input { width: 100%; }
+
+/* ----- KV (key-value) lists ----------------------------------------- */
 .eg-kv { display: grid; gap: 6px; margin: 0 0 16px; }
 .eg-kv div { display: grid; grid-template-columns: 140px 1fr; gap: 12px; font-size: 14px; }
 .eg-kv dt { font-weight: 700; color: var(--eg-text); }
-.eg-kv dd { margin: 0; color: var(--eg-text-muted); }
-.eg-flash {
-  width: min(1180px, calc(100% - 40px)); margin: 0 auto 16px;
-  border-radius: 12px; padding: 12px 16px; font-size: 14px; font-weight: 600;
-  background: color-mix(in srgb, var(--eg-support) 12%, transparent); color: var(--eg-support);
-  border: 1px solid var(--eg-border-accent);
-}
-/* eg-flash dentro de una card (preview/login) ocupa el ancho del contenedor */
-.eg-preview .eg-flash, .eg-auth__card .eg-flash, .eg-form .eg-flash { width: 100%; }
-
-/* ---------- Accesibilidad (etapa 14): foco visible y no depender solo del color ---------- */
-.eg a:focus-visible, .eg-link:focus-visible, .eg-tab:focus-visible,
-.eg-nav__link:focus-visible, summary:focus-visible {
-  outline: 2px solid var(--eg-focus); outline-offset: 2px; border-radius: 6px;
-}
-.eg-check input:focus-visible { outline: 2px solid var(--eg-focus); outline-offset: 2px; }
-.eg-pill { border: 1px solid color-mix(in srgb, currentColor 30%, transparent); }
-
-/* ---------- Responsive del estado del sistema ---------- */
-@media (max-width: 600px) {
-  .eg-sysstatus { flex-direction: column; align-items: flex-start; gap: 8px; }
-  .eg-inline-form { flex-wrap: wrap; }
-  .eg-input--sm { max-width: 100%; flex: 1 1 160px; }
-}
-
-/* =====================================================================
-   Panel administrativo SaaS con sidebar (rediseño)
-   ===================================================================== */
-.eg--admin { background: var(--eg-bg); }
-.eg-shell { display: grid; grid-template-columns: 264px 1fr; min-height: 100vh; }
-
-/* Sidebar */
-.eg-sidebar {
-  background: #0E2230; color: rgba(255,255,255,.82);
-  position: sticky; top: 0; align-self: start; height: 100vh;
-  display: flex; flex-direction: column; gap: 16px; padding: 22px 16px;
-}
-.eg-side__brand {
-  display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
-  padding: 2px 8px 16px; border-bottom: 1px solid rgba(255,255,255,.08);
-}
-.eg-side__brand .eg-logo { height: 30px; width: auto; max-width: 160px; }
-.eg-side__product {
-  font-family: var(--eg-font-body); font-weight: 700; color: rgba(255,255,255,.7);
-  font-size: 11px; letter-spacing: .16em; text-transform: uppercase;
-}
-.eg-side__nav { display: flex; flex-direction: column; gap: 4px; }
-.eg-side__link {
-  display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px;
-  color: rgba(255,255,255,.74); font-weight: 600; font-size: 14px; text-decoration: none;
-  transition: background .16s ease, color .16s ease;
-}
-.eg-side__link:hover { background: rgba(255,255,255,.06); color: #fff; }
-.eg-side__link.is-active { background: var(--eg-cta); color: var(--eg-text-on-cta); }
-.eg-side__link:focus-visible { outline: 2px solid #24EBA1; outline-offset: 2px; }
-.eg-side__ic { display: inline-flex; }
-aside.eg-sidebar a { color: white; font-weight: 300; }
-aside.eg-sidebar a span.eg-side__ic { color: #31b78d; }
-aside.eg-sidebar a.eg-side__link.is-active span.eg-side__ic,
-aside.eg-sidebar a.eg-side__link.is-active { color: white; }
-.eg-side__status {
-  margin-top: auto; display: flex; align-items: center; gap: 8px; font-size: 12.5px;
-  color: rgba(255,255,255,.6); padding: 12px; border-top: 1px solid rgba(255,255,255,.08);
-}
-.eg-side__dot { width: 8px; height: 8px; border-radius: 999px; background: #24EBA1; flex: none; }
-.eg-side__dot[data-status="simulated"], .eg-side__dot[data-status="pending_review"] { background: #F79009; }
-.eg-side__dot[data-status="error"] { background: #F97066; }
-.eg-side__foot { font-size: 11.5px; color: rgba(255,255,255,.4); margin: 0; padding: 0 12px; }
-.eg-ic { flex: none; }
-
-/* Main + topbar */
-.eg-main { min-width: 0; display: flex; flex-direction: column; }
-.eg-topbar {
-  position: sticky; top: 0; z-index: 20;
-  background: rgba(245,247,250,.92); backdrop-filter: blur(8px);
-  border-bottom: 1px solid var(--eg-border);
-  display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 28px;
-}
-.eg-topbar__titles h1 { font-size: 1.4rem; margin: 0; }
-.eg-topbar__titles p { margin: 2px 0 0; color: var(--eg-text-muted); font-size: 13.5px; }
-.eg-topbar__right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }
-.eg-topbar__status { display: inline-flex; align-items: center; gap: 6px; color: var(--eg-text-muted); font-size: 13px; }
-.eg-content { padding: 24px 28px 48px; }
-.eg-content .eg-flash, .eg-content .eg-devbanner { width: 100%; margin: 0 0 14px; }
-
-/* Stats (cards de métricas) */
-.eg-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin-bottom: 18px; }
-.eg-stat {
-  background: var(--eg-surface); border: 1px solid var(--eg-border); border-radius: var(--eg-radius);
-  padding: 16px 18px; display: grid; gap: 2px; box-shadow: 0 8px 24px rgba(10,34,49,.05);
-}
-.eg-stat__ic {
-  width: 34px; height: 34px; border-radius: 10px; display: inline-grid; place-items: center;
-  color: #fff; background: var(--eg-text-subtle); margin-bottom: 6px;
-}
-.eg-stat[data-tone="accent"] .eg-stat__ic { background: #167A5F; }
-.eg-stat[data-tone="info"] .eg-stat__ic { background: #0478B4; }
-.eg-stat[data-tone="warning"] .eg-stat__ic { background: #B45309; }
-.eg-stat[data-tone="success"] .eg-stat__ic { background: #12B76A; }
-.eg-stat__num { font-family: var(--eg-font-heading); font-size: 1.9rem; line-height: 1; color: var(--eg-text); }
-.eg-stat__label { font-weight: 700; font-size: 13.5px; color: var(--eg-text); margin-top: 4px; }
-.eg-stat__sub { font-size: 12px; color: var(--eg-text-subtle); }
-
-.eg-block-title { margin: 18px 0 12px; font-size: 1.15rem; }
-.eg-section-note { color: var(--eg-text-muted); font-size: 14px; margin: 0 0 14px; }
-
-/* Alertas en cards */
-.eg-alert-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
-.eg-alert {
-  background: var(--eg-surface); border: 1px solid var(--eg-border); border-radius: var(--eg-radius);
-  padding: 18px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 8px 24px rgba(10,34,49,.05);
-}
-.eg-alert__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
-.eg-alert__cat { font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--eg-text-subtle); }
-.eg-alert__meta { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
-.eg-alert__title { font-size: 1rem; margin: 0; line-height: 1.3; }
-.eg-alert__summary {
-  margin: 0; color: var(--eg-text-muted); font-size: 13.5px; line-height: 1.5;
-  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
-}
-.eg-alert__foot { margin-top: auto; display: flex; flex-direction: column; gap: 10px; }
-.eg-alert__date { font-size: 12px; color: var(--eg-text-subtle); }
-
-/* Vista previa: dos columnas */
-.eg-preview-grid { display: grid; grid-template-columns: minmax(280px, 360px) 1fr; gap: 16px; align-items: start; }
-
-.eg-btn .eg-ic { margin-right: -2px; }
-
-/* Responsive del shell: sidebar pasa a barra superior */
-@media (max-width: 860px) {
-  .eg-shell { grid-template-columns: 1fr; }
-  .eg-sidebar {
-    position: static; height: auto; flex-direction: row; flex-wrap: wrap;
-    align-items: center; gap: 10px; padding: 12px 16px;
-  }
-  .eg-side__brand { border-bottom: 0; padding: 0; margin-right: auto; }
-  .eg-side__nav { flex-direction: row; flex-wrap: wrap; gap: 6px; width: 100%; overflow-x: auto; }
-  .eg-side__status, .eg-side__foot { display: none; }
-  .eg-topbar { position: static; flex-direction: column; align-items: flex-start; padding: 14px 16px; }
-  .eg-topbar__right { width: 100%; justify-content: flex-start; }
-  .eg-content { padding: 16px; }
-  .eg-preview-grid { grid-template-columns: 1fr; }
-}
-
-/* =====================================================================
-   Pagina de Configuracion (/admin/settings)
-   ===================================================================== */
+.eg-kv dd { margin: 0; color: var(--eg-muted); }
 .eg-kv--2col {
   display: grid;
   grid-template-columns: 1fr 1fr;
@@ -2181,46 +2286,220 @@ aside.eg-sidebar a.eg-side__link.is-active { color: white; }
   font-size: 13.5px;
   margin: 0;
 }
-.eg-kv--2col dt {
-  font-weight: 600;
-  color: var(--eg-text);
-  padding-right: 16px;
-}
-.eg-kv--2col dd {
-  color: var(--eg-text-muted);
-}
+.eg-kv--2col dt { font-weight: 600; color: var(--eg-text); padding-right: 16px; }
+.eg-kv--2col dd { color: var(--eg-muted); }
 .eg-kv--2col dt:last-of-type, .eg-kv--2col dd:last-of-type { border-bottom: 0; }
-.eg-kv--2col .mono { font-family: monospace; font-size: 13px; word-break: break-all; }
-.mono { font-family: monospace; font-size: 13px; }
 
+/* ----- Grids --------------------------------------------------------- */
+.eg-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+
+/* ----- Misc admin components ---------------------------------------- */
+.eg-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.eg-actions form { margin: 0; }
+.eg-inline-form { display: flex; gap: 6px; align-items: center; }
+.eg-input--sm { min-height: 36px; padding: 6px 10px; font-size: 13px; max-width: 200px; border-radius: var(--radius-sm); }
+.eg-preview-grid { display: grid; grid-template-columns: minmax(280px,360px) 1fr; gap: 16px; align-items: start; }
+.eg-review-panel {}
+.eg-review-actions { display: flex; flex-wrap: wrap; gap: 8px; margin-top: 16px; align-items: center; }
+.eg-email-preview { border: 1px solid var(--eg-border); border-radius: var(--radius); background: #fff; overflow: hidden; margin-top: 12px; }
+.eg-email-preview iframe { width: 100%; min-height: 640px; border: 0; display: block; }
+.eg-preview pre { white-space: pre-wrap; word-break: break-word; background: var(--eg-surface-soft); border-radius: 10px; padding: 14px; font-size: 12.5px; line-height: 1.5; overflow-x: auto; }
+.eg-banner {
+  border-radius: var(--radius-sm);
+  padding: 11px 16px;
+  font-size: 13.5px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--eg-green) 10%, transparent);
+  color: var(--eg-green-deep);
+  border: 1px solid color-mix(in srgb, var(--eg-green) 28%, transparent);
+}
+.eg-banner--info {
+  background: color-mix(in srgb, var(--eg-blue) 10%, transparent);
+  color: #0478B4;
+  border-color: color-mix(in srgb, var(--eg-blue) 28%, transparent);
+}
+.eg-flash {
+  border-radius: var(--radius-sm);
+  padding: 11px 16px;
+  font-size: 13.5px;
+  font-weight: 600;
+  background: color-mix(in srgb, var(--eg-blue) 12%, transparent);
+  color: #0478B4;
+  border: 1px solid color-mix(in srgb, var(--eg-blue) 28%, transparent);
+}
+.eg-devbanner {
+  border-radius: var(--radius-sm);
+  padding: 11px 16px;
+  font-size: 13.5px;
+  font-weight: 700;
+  background: color-mix(in srgb, var(--eg-warning) 12%, transparent);
+  color: var(--eg-warning);
+  border: 1px solid color-mix(in srgb, var(--eg-warning) 30%, transparent);
+}
+.eg-empty { display: grid; gap: 4px; padding: 28px 8px; text-align: center; }
+.eg-empty strong { color: var(--eg-text); font-size: 15px; }
+.eg-empty span { color: var(--eg-subtle); font-size: 13.5px; }
+.eg-empty-row td { background: transparent; }
+.eg-empty-row:hover td { background: transparent; }
+.eg-muted { color: var(--eg-subtle); font-size: 13px; line-height: 1.45; margin: 4px 0 0; }
+p.eg-muted { max-height: 75px; overflow: hidden; }
+.eg-note { font-size: 12.5px; color: var(--eg-subtle); margin-top: 12px; line-height: 1.5; }
+.eg-section-note { font-size: 13px; color: var(--eg-muted); margin: 0; }
+
+/* ----- Settings page specific --------------------------------------- */
 .eg-settings-warn {
   margin-top: 12px;
-  background: color-mix(in srgb, #C56A14 12%, transparent);
-  border: 1px solid color-mix(in srgb, #C56A14 35%, transparent);
-  border-radius: 10px;
+  background: color-mix(in srgb,#C56A14 10%,transparent);
+  border: 1px solid color-mix(in srgb,#C56A14 30%,transparent);
+  border-radius: var(--radius-sm);
   padding: 10px 14px;
   font-size: 13px;
   color: #7A3E06;
   line-height: 1.5;
 }
 .eg-settings-warn code {
-  font-family: monospace;
+  font-family: var(--font-mono);
   background: rgba(0,0,0,.07);
   padding: 1px 5px;
   border-radius: 4px;
 }
-
 .eg-label-hint {
   margin-left: 8px;
   font-size: 11px;
   font-weight: 400;
-  color: var(--eg-text-subtle);
+  color: var(--eg-subtle);
   text-transform: uppercase;
   letter-spacing: .04em;
 }
-.eg-input--mono { font-family: monospace; font-size: 13px; }
+.eg-input--mono { font-family: var(--font-mono); font-size: 13px; }
 textarea.eg-input { resize: vertical; min-height: 56px; }
+
+/* ----- Inputs -------------------------------------------------------- */
+.eg-input {
+  display: block;
+  width: 100%;
+  padding: 10px 14px;
+  border: 1px solid var(--eg-border);
+  border-radius: var(--radius-sm);
+  font-size: 14px;
+  font-family: var(--font-sans);
+  color: var(--eg-text);
+  background: var(--eg-surface);
+  transition: border-color .15s, box-shadow .15s;
+}
+.eg-input:focus { outline: none; border-color: var(--eg-green); box-shadow: 0 0 0 3px color-mix(in srgb,var(--eg-green) 18%,transparent); }
+.eg-label { display: block; font-size: 13px; font-weight: 700; color: var(--eg-text); margin-bottom: 6px; }
+.eg-field { display: grid; gap: 4px; margin-bottom: 16px; }
+
+/* ----- Public pages -------------------------------------------------- */
+.eg-container { width: min(1140px, calc(100% - 48px)); margin-inline: auto; }
+.eg-hero {
+  position: relative;
+  overflow: hidden;
+  background: var(--eg-sidebar);
+  padding: var(--eg-section-pad) 0;
+}
+.eg-glow {
+  position: absolute;
+  border-radius: 50%;
+  filter: blur(80px);
+  pointer-events: none;
+}
+.eg-glow--a { width: 560px; height: 560px; background: rgba(41,183,141,.18); top: -120px; right: -80px; }
+.eg-glow--b { width: 380px; height: 380px; background: rgba(6,164,245,.12); bottom: -60px; left: -60px; }
+.eg-hero__grid { display: grid; grid-template-columns: 1fr 420px; gap: 56px; align-items: center; position: relative; z-index: 1; }
+.eg-hero__copy { color: #F6FAFC; }
+.eg-hero__title { font-size: clamp(2.2rem,5vw,3.2rem); line-height: 1.08; color: #F6FAFC; margin-bottom: 18px; }
+.eg-hero__title span { color: var(--eg-green); }
+.eg-hero__lead { font-size: clamp(1rem,1.6vw,1.18rem); color: rgba(255,255,255,.78); margin-bottom: 24px; }
+.eg-hero__points { list-style: none; display: flex; flex-wrap: wrap; gap: 10px; padding: 0; margin: 0; }
+.eg-chip { background: rgba(255,255,255,.10); color: #fff; border: 1px solid rgba(255,255,255,.2); border-radius: 999px; font-size: 13px; font-weight: 600; padding: 5px 14px; }
+.eg-section { padding: var(--eg-section-pad) 0; }
+.eg-section--soft { background: var(--eg-surface-soft); }
+.eg-section__title { font-size: clamp(1.5rem,2.5vw,2rem); margin-bottom: 32px; }
+.eg-grid-4 { display: grid; grid-template-columns: repeat(auto-fill,minmax(220px,1fr)); gap: 20px; }
+.eg-benefit { padding: 24px; display: flex; flex-direction: column; gap: 8px; }
+.eg-benefit__icon { font-size: 2rem; }
+.eg-steps { list-style: none; padding: 0; margin: 0; display: grid; gap: 20px; grid-template-columns: repeat(auto-fill,minmax(240px,1fr)); }
+.eg-step { display: flex; align-items: flex-start; gap: 16px; }
+.eg-step__num { width: 40px; height: 40px; border-radius: 50%; background: var(--eg-green); color: #fff; display: flex; align-items: center; justify-content: center; font-weight: 700; font-size: 1.1rem; flex-shrink: 0; }
+.eg-feedback { padding: clamp(40px,8vw,100px) 0; }
+.eg-feedback__card { max-width: 480px; margin: 0 auto; padding: 40px; text-align: center; }
+.eg-feedback__icon { font-size: 3rem; display: block; margin-bottom: 12px; }
+.eg-feedback__lead { font-size: 1rem; color: var(--eg-text-muted,#3C4A52); }
+.eg-auth { padding: clamp(40px,8vw,100px) 0; }
+.eg-auth__card { max-width: 420px; margin: 0 auto; padding: 40px; }
+.eg-auth__help { font-size: 14px; color: var(--eg-text-muted,#3C4A52); margin-bottom: 20px; }
+.eg-form { display: flex; flex-direction: column; gap: 16px; }
+.eg-form__title { font-size: 1.4rem; margin-bottom: 4px; }
+.eg-check { display: flex; align-items: flex-start; gap: 10px; cursor: pointer; font-size: 14px; color: var(--eg-text-muted,#3C4A52); }
+.eg-check--consent { line-height: 1.4; }
+.eg-error { color: var(--eg-danger,#B23B3B); font-size: 14px; margin: 0; }
+.eg-fineprint { font-size: 12px; color: var(--eg-text-subtle,#6D7478); margin: 8px 0 0; text-align: center; }
+.eg-header { background: #fff; border-bottom: 1px solid rgba(36,55,67,.10); }
+.eg-header__inner { display: flex; align-items: center; justify-content: space-between; padding: 14px 0; }
+.eg-header__brand { display: flex; align-items: center; gap: 12px; text-decoration: none; }
+.eg-header__tag { font-size: 12px; font-weight: 700; letter-spacing: .12em; text-transform: uppercase; color: var(--eg-subtle,#8EA1AA); }
+.eg-logo { height: 36px; width: auto; display: block; }
+.eg-logo--sm { height: 26px; }
+.eg-footer { background: #0A2231; padding: 40px 0; }
+.eg-footer__inner { display: flex; flex-direction: column; gap: 14px; }
+.eg-footer__note { font-size: 13.5px; color: rgba(255,255,255,.55); margin: 0; }
+.eg-footer__copy { font-size: 12px; color: rgba(255,255,255,.35); margin: 0; }
+.eg-embed { padding: 24px; min-height: 100vh; background: var(--eg-bg); display: flex; align-items: flex-start; justify-content: center; }
+.eg-embed .eg-card { max-width: 480px; width: 100%; }
+
+/* ----- Responsive ---------------------------------------------------- */
+@media (max-width: 1280px) {
+  .eg-metric-grid { grid-template-columns: repeat(3, 1fr); }
+}
+@media (max-width: 1024px) {
+  .eg-metric-grid { grid-template-columns: repeat(2, 1fr); }
+  .eg-grid-2 { grid-template-columns: 1fr; }
+}
+@media (max-width: 900px) {
+  .eg-preview-grid { grid-template-columns: 1fr; }
+  .eg-alert-actions {
+    border-left: none;
+    border-top: 1px solid var(--eg-border);
+    flex-direction: row;
+    flex-wrap: wrap;
+    min-width: unset;
+    padding: 10px 12px;
+  }
+  .eg-alert-card { flex-direction: column; }
+}
+@media (max-width: 768px) {
+  .eg-shell { grid-template-columns: 1fr; }
+  .eg-sidebar {
+    position: fixed;
+    left: 0; top: 0; bottom: 0;
+    z-index: 300;
+    width: var(--sidebar-w);
+    transform: translateX(-100%);
+  }
+  .eg-sidebar.is-open { transform: translateX(0); }
+  .eg-mobilebar { display: flex; }
+  .eg-scrim { display: block; }
+  .eg-topbar { position: static; padding: 14px 16px; }
+  .eg-content { padding: 16px; }
+  .eg-hero__grid { grid-template-columns: 1fr; }
+  .eg-topbar-meta { flex-wrap: wrap; }
+}
+@media (max-width: 430px) {
+  .eg-metric-grid { grid-template-columns: 1fr; }
+  .eg-alert-grid { grid-template-columns: 1fr; }
+}
+
+/* ----- Focus accessible --------------------------------------------- */
+.eg a:focus-visible, .eg-btn:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--eg-green);
+  outline-offset: 2px;
+  border-radius: 4px;
+}
+.eg-check input:focus-visible { outline: 2px solid var(--eg-green); outline-offset: 2px; }
 """
+
 
 
 def run_server(settings: Settings | None = None) -> None:
