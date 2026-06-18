@@ -76,7 +76,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if token and token == self.settings.admin_token:
                 self.redirect("/admin", set_admin_cookie=True)
             else:
-                self.respond_html(render_login())
+                self.respond_html(render_login(settings=self.settings))
         elif path in {"/admin", "/admin/subscribers", "/admin/alerts", "/admin/documents"}:
             if not self.is_admin():
                 self.redirect("/admin/login")
@@ -102,7 +102,10 @@ class AppHandler(BaseHTTPRequestHandler):
             if payload.get("token") == self.settings.admin_token:
                 self.redirect("/admin", set_admin_cookie=True)
             else:
-                self.respond_html(render_login(error="Token inválido."), status=HTTPStatus.UNAUTHORIZED)
+                self.respond_html(
+                    render_login(error="Token inválido. Verifica e inténtalo de nuevo.", settings=self.settings),
+                    status=HTTPStatus.UNAUTHORIZED,
+                )
         elif path == "/api/jobs/check-dt":
             if not self.is_job_authorized():
                 self.respond_json({"error": "No autorizado."}, status=HTTPStatus.UNAUTHORIZED)
@@ -336,16 +339,39 @@ def render_public_form(
     </div>
     <label class="eg-check eg-check--consent">
       <input type="checkbox" name="consent" required>
-      <span>Acepto recibir alertas sobre normativa DT y comunicaciones asociadas a esta suscripción.</span>
+      <span>Acepto recibir alertas informativas por email sobre nuevas publicaciones de la Dirección del Trabajo.</span>
     </label>
-    <button class="eg-btn eg-btn--primary eg-btn--block" type="submit">Suscribirme</button>
-    <p class="eg-fineprint">Recibirás alertas por email cuando la DT publique normativa relevante. Puedes pausar tu suscripción cuando quieras.</p>
+    <button class="eg-btn eg-btn--primary eg-btn--block" type="submit">Suscribirme a las alertas</button>
+    <p class="eg-fineprint">Podrás solicitar la baja cuando quieras. Los resúmenes son informativos y no reemplazan la revisión del documento oficial.</p>
   </form>
 """
     if embed:
         # En el iframe no mostramos hero ni header: solo la tarjeta funcional.
         body = f'<div class="eg-embed">{form}</div>'
         return render_page("Alertas DT", body, compact=embed)
+
+    benefits = [
+        ("🔎", "Monitoreo periódico", "Revisamos las publicaciones de la Dirección del Trabajo por ti."),
+        ("📝", "Resumen práctico", "Un resumen claro, sin jerga, listo para tomar decisiones."),
+        ("⚖️", "Impacto laboral", "Qué significa para contadores, remuneraciones y empresas."),
+        ("🔗", "Documento oficial", "Enlace directo a la fuente original de la DT."),
+    ]
+    benefit_cards = "".join(
+        f'<article class="eg-card eg-benefit"><span class="eg-benefit__icon" aria-hidden="true">{ic}</span>'
+        f'<h3>{h(t)}</h3><p>{h(d)}</p></article>'
+        for ic, t, d in benefits
+    )
+    steps = [
+        ("1", "Te suscribes con tu email", "Sin instalar nada. Solo tu correo y aceptar recibir alertas."),
+        ("2", "Monitoreamos la DT", "El sistema revisa periódicamente las nuevas publicaciones oficiales."),
+        ("3", "Generamos un resumen", "Cada documento nuevo se resume con su impacto práctico."),
+        ("4", "Recibes la alerta por email", "Te llega un correo claro con el resumen y el enlace oficial."),
+    ]
+    step_cards = "".join(
+        f'<li class="eg-step"><span class="eg-step__num" aria-hidden="true">{n}</span>'
+        f'<div><h3>{h(t)}</h3><p>{h(d)}</p></div></li>'
+        for n, t, d in steps
+    )
 
     body = f"""
 <section class="eg-hero" data-eg-theme="dark" data-eg-accent="green">
@@ -354,8 +380,8 @@ def render_public_form(
   <div class="eg-container eg-hero__grid">
     <div class="eg-hero__copy eg-fade-up">
       <p class="eg-eyebrow">Alertas Dirección del Trabajo</p>
-      <h1 class="eg-hero__title">Novedades laborales <span>relevantes</span> para tu gestión contable</h1>
-      <p class="eg-hero__lead">Avisos automáticos cuando la DT publique dictámenes, ordinarios, circulares, resoluciones u otros documentos normativos.</p>
+      <h1 class="eg-hero__title">Alertas DT para <span>contadores y empresas</span></h1>
+      <p class="eg-hero__lead">Monitoreamos nuevas publicaciones de la Dirección del Trabajo y te enviamos un resumen práctico por email, pensado para gestión laboral, contabilidad y empresas.</p>
       <ul class="eg-hero__points">
         <li class="eg-chip">Monitoreo continuo</li>
         <li class="eg-chip">Resumen orientado a contadores</li>
@@ -365,6 +391,22 @@ def render_public_form(
     {form}
   </div>
 </section>
+
+<section class="eg-section eg-section--light" data-eg-theme="light" data-eg-density="compact">
+  <div class="eg-container">
+    <p class="eg-eyebrow">Beneficios</p>
+    <h2 class="eg-section__title">Normativa laboral, sin perderte nada</h2>
+    <div class="eg-grid-4 eg-benefits">{benefit_cards}</div>
+  </div>
+</section>
+
+<section class="eg-section eg-section--soft" data-eg-theme="light" data-eg-density="compact">
+  <div class="eg-container">
+    <p class="eg-eyebrow">Cómo funciona</p>
+    <h2 class="eg-section__title">De la publicación oficial a tu correo, en cuatro pasos</h2>
+    <ol class="eg-steps">{step_cards}</ol>
+  </div>
+</section>
 """
     return render_page("Alertas DT", body, compact=embed)
 
@@ -372,42 +414,96 @@ def render_public_form(
 def render_thanks(*, embed: bool, updated: bool = False) -> str:
     if updated:
         eyebrow = "Suscripción actualizada"
-        title = "Tu suscripción ya existía y fue actualizada correctamente."
+        title = "¡Listo! Actualizamos tu suscripción"
     else:
-        eyebrow = "Suscripción registrada"
-        title = "Listo, quedaste inscrito en Alertas DT."
+        eyebrow = "Suscripción recibida"
+        title = "¡Suscripción recibida!"
+    back_button = (
+        '<a class="eg-btn eg-btn--primary" href="/">Volver al inicio</a>'
+        if not embed
+        else ""
+    )
     body = f"""
 <section class="eg-container eg-feedback">
   <div class="eg-card eg-feedback__card" data-eg-theme="light" data-eg-accent="green">
     <span class="eg-feedback__icon" aria-hidden="true">&#10003;</span>
     <p class="eg-eyebrow">{h(eyebrow)}</p>
     <h1>{h(title)}</h1>
-    <p class="eg-feedback__lead">Cuando se detecte nueva normativa relevante, recibirás la alerta por email.</p>
+    <p class="eg-feedback__lead">Desde ahora recibirás alertas informativas cuando detectemos nuevas publicaciones relevantes de la Dirección del Trabajo.</p>
+    {back_button}
+    <p class="eg-fineprint" style="margin-top:18px;">Este servicio se encuentra en etapa de prueba interna.</p>
   </div>
 </section>
 """
-    return render_page("Suscripción registrada", body, compact=embed)
+    return render_page("Suscripción recibida", body, compact=embed)
 
 
-def render_login(error: str | None = None) -> str:
-    error_html = f'<p class="eg-error">{h(error)}</p>' if error else ""
+def render_login(error: str | None = None, settings: Settings | None = None) -> str:
+    error_html = f'<p class="eg-error" role="alert">{h(error)}</p>' if error else ""
+    dev_html = ""
+    if settings is not None and settings.disable_admin_auth:
+        dev_html = (
+            '<p class="eg-flash" style="margin:0 0 14px;">'
+            "Modo desarrollo activo: la autenticación admin está desactivada.</p>"
+        )
     body = f"""
 <section class="eg-container eg-auth">
   <div class="eg-card eg-auth__card" data-eg-theme="light">
-    <p class="eg-eyebrow">Panel admin</p>
-    <h1>Ingresar</h1>
+    <p class="eg-eyebrow">External Group · Alertas DT</p>
+    <h1>Acceso administrativo</h1>
+    <p class="eg-auth__help">Ingresa el token de administración para revisar suscriptores, documentos detectados y alertas.</p>
+    {dev_html}
     {error_html}
     <form class="eg-form" method="post" action="/admin/login">
       <div class="eg-field">
-        <label class="eg-label" for="eg-token">Token</label>
-        <input class="eg-input" id="eg-token" name="token" type="password" required autocomplete="current-password">
+        <label class="eg-label" for="eg-token">Token de administración</label>
+        <input class="eg-input" id="eg-token" name="token" type="password" required
+               autocomplete="current-password" placeholder="••••••••">
       </div>
-      <button class="eg-btn eg-btn--primary eg-btn--block" type="submit">Entrar</button>
+      <button class="eg-btn eg-btn--primary eg-btn--block" type="submit">Entrar al panel</button>
     </form>
   </div>
 </section>
 """
-    return render_page("Admin", body, theme="dark")
+    return render_page("Acceso administrativo", body, theme="dark")
+
+
+# Traducción de estados técnicos a microcopy ejecutivo (solo presentación;
+# los valores almacenados en la base NO cambian).
+STATUS_LABELS = {
+    # Suscriptores
+    "active": "Activo",
+    "paused": "Pausado",
+    # Documentos
+    "discovered": "Detectado",
+    "baseline": "Línea base",
+    "processed": "Procesado",
+    "ignored": "Ignorado",
+    "error": "Error",
+    # Alertas
+    "pending_review": "Pendiente de revisión",
+    "ready_to_send": "Lista para enviar",
+    "ready": "Lista para enviar",
+    "sent": "Enviada",
+    "failed": "Error",
+    # Jobs
+    "running": "En curso",
+    "success": "Éxito",
+    "partial": "Parcial",
+    # Envíos / deliveries
+    "simulated": "Simulada",
+    "skipped_missing_credentials": "No enviada: faltan credenciales",
+    # Relevancia
+    "alto": "Alta",
+    "medio": "Media",
+    "bajo": "Baja",
+}
+
+
+def status_label(value: Any) -> str:
+    """Etiqueta legible para un estado técnico; si no hay mapeo, devuelve el valor."""
+    v = str(value or "").strip()
+    return STATUS_LABELS.get(v, v or "—")
 
 
 def fmt_dt(value: Any) -> str:
@@ -416,10 +512,24 @@ def fmt_dt(value: Any) -> str:
     return text.replace("T", " ")[:16] if text else "—"
 
 
+def empty_row(colspan: int, title: str, hint: str) -> str:
+    """Fila de tabla con estado vacío amigable (en vez de 'Sin datos')."""
+    return (
+        f'<tr class="eg-empty-row"><td colspan="{colspan}">'
+        f'<div class="eg-empty"><strong>{h(title)}</strong><span>{h(hint)}</span></div>'
+        "</td></tr>"
+    )
+
+
 def pill(value: Any, label: Any = None) -> str:
-    """Pill de estado con color semántico via data-status (ver CSS)."""
+    """
+    Pill de estado con color semántico via data-status (ver CSS).
+    El texto se traduce con status_label; el data-status conserva el valor técnico
+    para el color, de modo que la lógica de estados no se ve afectada.
+    """
     v = str(value or "")
-    return f'<span class="eg-pill" data-status="{h(v)}">{h(label if label is not None else v)}</span>'
+    text = label if label is not None else status_label(v)
+    return f'<span class="eg-pill" data-status="{h(v)}">{h(text)}</span>'
 
 
 def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
@@ -449,33 +559,56 @@ def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
     if flash:
         banner += f'<div class="eg-flash" role="status">{h(flash)}</div>'
 
-    last_job_html = "Sin ejecuciones"
+    last_job_html = "Sin ejecuciones aún"
     if last_job:
-        last_job_html = f"{fmt_dt(last_job['started_at'])} · {h(last_job['status'])}"
+        last_job_html = f"{fmt_dt(last_job['started_at'])} · {status_label(last_job['status'])}"
+
+    # Estado del sistema (honesto para la demo): proveedor de email y modo real/simulado.
+    provider = settings.email_provider
+    if provider == "sendgrid" and settings.sendgrid_api_key:
+        email_status = ("SendGrid · envío real", "active")
+    elif provider == "sendgrid":
+        email_status = ("SendGrid sin credenciales · simulado", "pending_review")
+    elif provider in {"resend", "smtp"} and (settings.resend_api_key or settings.smtp_host):
+        email_status = (f"{provider.upper()} · envío real", "active")
+    else:
+        email_status = ("Modo simulado (console)", "simulated")
+    auth_status = (
+        ("Autenticación desactivada (dev)", "error")
+        if settings.disable_admin_auth
+        else ("Login por token activo", "active")
+    )
+    sysstatus = (
+        '<div class="eg-sysstatus">'
+        f'<span class="eg-sysstatus__item"><b>Email:</b> {pill(email_status[1], email_status[0])}</span>'
+        f'<span class="eg-sysstatus__item"><b>Acceso:</b> {pill(auth_status[1], auth_status[0])}</span>'
+        f'<span class="eg-sysstatus__item"><b>Último monitoreo:</b> {h(last_job_html)}</span>'
+        "</div>"
+    )
 
     body = f"""
 {banner}
 <header class="eg-admin-header">
   <div>
-    <p class="eg-eyebrow">Alertas DT</p>
-    <h1>Panel de administración</h1>
+    <p class="eg-eyebrow">External Group · Alertas DT</p>
+    <h1>Panel Alertas DT</h1>
+    <p class="eg-admin-header__sub">Monitoreo de publicaciones DT y alertas por email</p>
   </div>
   <form method="post" action="/api/jobs/check-dt">
     <input type="hidden" name="manual" value="1">
     <button class="eg-btn eg-btn--primary" type="submit" formmethod="post" formaction="/api/jobs/check-dt" data-job-token>Ejecutar monitoreo</button>
   </form>
 </header>
+{sysstatus}
 <section class="eg-metrics">
-  <div class="eg-metric"><strong>{total_subs}</strong><span>Suscriptores</span></div>
-  <div class="eg-metric"><strong>{active_count}</strong><span>Activos</span></div>
+  <div class="eg-metric"><strong>{active_count}</strong><span>Suscriptores activos</span></div>
   <div class="eg-metric"><strong>{paused_count}</strong><span>Pausados</span></div>
-  <div class="eg-metric"><strong>{len(documents)}</strong><span>Documentos</span></div>
-  <div class="eg-metric"><strong>{pending_count}</strong><span>Por revisar</span></div>
-  <div class="eg-metric"><strong>{ready_count}</strong><span>Listas</span></div>
-  <div class="eg-metric"><strong>{sent_count}</strong><span>Enviadas</span></div>
-  <div class="eg-metric"><strong>{sent_deliveries}</strong><span>Envíos totales</span></div>
+  <div class="eg-metric"><strong>{len(documents)}</strong><span>Documentos detectados</span></div>
+  <div class="eg-metric"><strong>{pending_count}</strong><span>Pendientes de revisión</span></div>
+  <div class="eg-metric"><strong>{ready_count}</strong><span>Listas para enviar</span></div>
+  <div class="eg-metric"><strong>{sent_count}</strong><span>Alertas enviadas</span></div>
+  <div class="eg-metric"><strong>{sent_deliveries}</strong><span>Envíos registrados</span></div>
 </section>
-<p class="eg-muted eg-lastjob">Último job: {last_job_html}</p>
 {render_nav(path)}
 {render_admin_section(path, subscribers, alerts, documents, jobs)}
 """
@@ -535,7 +668,11 @@ def render_admin_section(
 
 def render_jobs(jobs: list[dict[str, Any]]) -> str:
     if not jobs:
-        return '<section class="eg-card eg-panel"><h2>Últimos jobs</h2><p class="eg-muted">Sin ejecuciones todavía.</p></section>'
+        return (
+            '<section class="eg-card eg-panel"><h2>Historial de monitoreo</h2>'
+            '<div class="eg-empty"><strong>Aún no se ha ejecutado el monitoreo.</strong>'
+            '<span>Usa "Ejecutar monitoreo" para buscar nuevas publicaciones de la DT.</span></div></section>'
+        )
     rows = "".join(
         f"""
 <tr>
@@ -586,7 +723,7 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
   <div class="eg-table-wrap">
     <table class="eg-table">
       <thead><tr><th>Email</th><th>Estado</th><th>Registro</th><th>Actualización</th><th>Fuente</th><th></th></tr></thead>
-      <tbody>{rows or '<tr><td colspan="6">Sin suscriptores.</td></tr>'}</tbody>
+      <tbody>{rows or empty_row(6, "Aún no hay suscriptores.", "Puedes probar el formulario público usando un correo interno.")}</tbody>
     </table>
   </div>
   <p class="eg-muted">WhatsApp reservado para fase futura: el MVP notifica solo por email.</p>
@@ -643,7 +780,7 @@ def render_alerts(alerts: list[dict[str, Any]]) -> str:
   <div class="eg-table-wrap">
     <table class="eg-table">
       <thead><tr><th>Documento</th><th>Categoría</th><th>Relevancia</th><th>Estado</th><th>Generada</th><th>Acciones</th></tr></thead>
-      <tbody>{rows or '<tr><td colspan="6">Sin alertas.</td></tr>'}</tbody>
+      <tbody>{rows or empty_row(6, "Aún no hay alertas generadas.", "Las alertas aparecerán cuando se detecten documentos nuevos.")}</tbody>
     </table>
   </div>
 </section>
@@ -659,7 +796,7 @@ def render_documents(documents: list[dict[str, Any]]) -> str:
   <td class="eg-muted">{h(item.get('publication_date') or '—')}</td>
   <td class="eg-muted">{h(item.get('dt_article_id'))}</td>
   <td>{pill(item['status'])}</td>
-  <td><a href="{h(item['canonical_url'])}" target="_blank" rel="noreferrer">DT</a></td>
+  <td><a class="eg-link" href="{h(item['canonical_url'])}" target="_blank" rel="noreferrer">Ver en DT ↗</a></td>
   <td>
     <div class="eg-actions">
       <form method="post" action="/admin/documents/{item['id']}/regenerate">
@@ -680,7 +817,7 @@ def render_documents(documents: list[dict[str, Any]]) -> str:
   <div class="eg-table-wrap">
     <table class="eg-table">
       <thead><tr><th>Documento</th><th>Categoría</th><th>Fecha</th><th>ID DT</th><th>Estado</th><th>Link</th><th>Acciones</th></tr></thead>
-      <tbody>{rows or '<tr><td colspan="7">Sin documentos.</td></tr>'}</tbody>
+      <tbody>{rows or empty_row(7, "Aún no hay documentos detectados.", "Ejecuta el monitoreo para buscar nuevas publicaciones de la Dirección del Trabajo.")}</tbody>
     </table>
   </div>
 </section>
@@ -703,27 +840,48 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
     email_text = render_alert_email_text(alert)
     # El HTML del email se aísla en un iframe srcdoc (escapado) para no afectar el admin.
     srcdoc = h(email_html)
+
+    real_send = (
+        (settings.email_provider == "sendgrid" and settings.sendgrid_api_key)
+        or (settings.email_provider == "resend" and settings.resend_api_key)
+        or (settings.email_provider == "smtp" and settings.smtp_host)
+    )
+    if real_send:
+        send_note = (
+            '<div class="eg-flash" style="margin:0 0 16px;">Envío real habilitado '
+            f"({h(settings.email_provider)}). El botón \"Enviar prueba\" envía un correo de verdad.</div>"
+        )
+    else:
+        send_note = (
+            '<div class="eg-flash" style="margin:0 0 16px;">El envío está en modo simulado. '
+            "Configura SendGrid en Render para habilitar correos reales.</div>"
+        )
     body = f"""
 <section class="eg-container eg-preview">
-  <p class="eg-eyebrow">Vista previa de email</p>
+  <p class="eg-eyebrow">Vista previa del email que recibirá el suscriptor</p>
   <h1>{h(alert['title'])}</h1>
+  {send_note}
   <dl class="eg-kv">
     <div><dt>Estado</dt><dd>{pill(alert['status'])}</dd></div>
     <div><dt>Categoría</dt><dd>{h(alert['category'])}</dd></div>
     <div><dt>Relevancia</dt><dd>{pill(alert['relevance'])}</dd></div>
     <div><dt>Fecha doc.</dt><dd>{h(alert.get('publication_date') or '—')}</dd></div>
-    <div><dt>Asunto</dt><dd>{h(subject)}</dd></div>
-    <div><dt>Documento</dt><dd><a href="{h(alert['canonical_url'])}" target="_blank" rel="noreferrer">Ver en DT</a></dd></div>
+    <div><dt>Asunto del email</dt><dd>{h(subject)}</dd></div>
+    <div><dt>Documento</dt><dd><a class="eg-link" href="{h(alert['canonical_url'])}" target="_blank" rel="noreferrer">Ver en DT ↗</a></dd></div>
   </dl>
   <div class="eg-actions">
-    <a class="eg-btn eg-btn--secondary" href="/admin/alerts">Volver al admin</a>
+    <a class="eg-btn eg-btn--secondary" href="/admin/alerts">← Volver al admin</a>
+    <form method="post" action="/admin/alerts/{alert_id}/test" class="eg-inline-form">
+      <input class="eg-input eg-input--sm" type="email" name="to" placeholder="correo de prueba (opcional)" aria-label="Correo de prueba">
+      <button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">Enviar prueba</button>
+    </form>
   </div>
-  <h2 style="margin-top:24px;">Render HTML</h2>
+  <h2 style="margin-top:24px;">Versión HTML</h2>
   <div class="eg-preview__frame">
-    <iframe title="Vista previa email" srcdoc="{srcdoc}"></iframe>
+    <iframe title="Vista previa del email (HTML)" srcdoc="{srcdoc}"></iframe>
   </div>
   <details style="margin-top:18px;">
-    <summary>Ver versión texto plano</summary>
+    <summary>Ver versión en texto plano</summary>
     <pre>{h(email_text)}</pre>
   </details>
 </section>
@@ -1017,10 +1175,42 @@ body.eg {
 .eg-embed { padding: 18px; }
 .eg-embed .eg-card { box-shadow: none; }
 
+/* ---------- Secciones landing (beneficios / cómo funciona) ---------- */
+.eg-section--light { background: var(--eg-bg); }
+.eg-section--soft { background: var(--eg-surface-2); }
+.eg-section__title { margin: 6px 0 26px; }
+.eg-benefits { margin-top: 8px; }
+.eg-benefit { text-align: left; }
+.eg-benefit__icon {
+  display: inline-grid; place-items: center; width: 46px; height: 46px; margin-bottom: 12px;
+  border-radius: 14px; background: color-mix(in srgb, var(--eg-accent) 14%, transparent);
+  font-size: 22px; line-height: 1;
+}
+.eg-benefit h3 { font-size: 1.05rem; margin: 0 0 6px; }
+.eg-benefit p { margin: 0; font-size: 14px; color: var(--eg-text-muted); }
+.eg-steps {
+  list-style: none; margin: 0; padding: 0;
+  display: grid; gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.eg-step {
+  display: flex; gap: 16px; align-items: flex-start;
+  background: var(--eg-surface); border: 1px solid var(--eg-border);
+  border-radius: var(--eg-radius); padding: 18px 20px;
+}
+.eg-step__num {
+  flex: none; display: inline-grid; place-items: center; width: 36px; height: 36px;
+  border-radius: 999px; background: var(--eg-cta); color: var(--eg-text-on-cta);
+  font-family: var(--eg-font-heading); font-weight: 700; font-size: 16px;
+}
+.eg-step h3 { font-size: 1rem; margin: 4px 0 4px; }
+.eg-step p { margin: 0; font-size: 14px; color: var(--eg-text-muted); }
+@media (max-width: 720px) { .eg-steps { grid-template-columns: 1fr; } }
+
 /* ---------- Feedback / Auth ---------- */
 .eg-feedback, .eg-auth { padding: clamp(40px, 8vw, 90px) 20px; display: grid; justify-items: center; }
 .eg-feedback__card, .eg-auth__card { max-width: 560px; width: 100%; text-align: center; }
 .eg-auth__card { text-align: left; max-width: 440px; }
+.eg-auth__help { color: var(--eg-text-muted); font-size: 14px; margin: 0 0 16px; }
 .eg-feedback__lead { color: var(--eg-text-muted); }
 .eg-feedback__icon {
   display: inline-grid; place-items: center; width: 56px; height: 56px; margin: 0 auto 14px;
@@ -1137,12 +1327,35 @@ html body main.eg-app {
     padding: 0;
 }
 
-/* ---------- Admin operativo (etapas 4/8/10/11) ---------- */
+/* ---------- Admin operativo (etapas 4/8/10/11) + pulido UX/UI ---------- */
 .eg-devbanner {
   width: min(1180px, calc(100% - 40px)); margin: 0 auto 18px;
   background: #FEF3C7; color: #92400E; border: 1px solid #FCD34D;
   border-radius: 12px; padding: 12px 16px; font-size: 14px; font-weight: 700;
 }
+.eg-admin-header__sub { color: var(--eg-text-muted); margin: 4px 0 0; font-size: 14px; }
+
+/* Estado del sistema (proveedor email / auth / último job) */
+.eg-sysstatus {
+  width: min(1180px, calc(100% - 40px)); margin: 0 auto 20px;
+  display: flex; flex-wrap: wrap; gap: 10px 22px; align-items: center;
+  background: var(--eg-surface); border: 1px solid var(--eg-border);
+  border-radius: var(--eg-radius); padding: 12px 18px;
+}
+.eg-sysstatus__item { display: inline-flex; align-items: center; gap: 8px; font-size: 13.5px; color: var(--eg-text-muted); }
+.eg-sysstatus__item b { color: var(--eg-text); font-weight: 700; }
+
+/* Estados vacíos amigables */
+.eg-empty { display: grid; gap: 4px; padding: 24px 8px; text-align: center; }
+.eg-empty strong { color: var(--eg-text); font-size: 15px; }
+.eg-empty span { color: var(--eg-text-subtle); font-size: 13.5px; }
+.eg-empty-row td { background: transparent; }
+.eg-empty-row:hover td { background: transparent; }
+
+/* Link tabular destacado */
+.eg-link { color: var(--eg-support); font-weight: 600; white-space: nowrap; }
+.eg-link:hover { color: var(--eg-accent); }
+
 .eg-lastjob { width: min(1180px, calc(100% - 40px)); margin: 0 auto 18px; }
 .eg-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .eg-actions form { margin: 0; }
@@ -1185,6 +1398,23 @@ html body main.eg-app {
   border-radius: 12px; padding: 12px 16px; font-size: 14px; font-weight: 600;
   background: color-mix(in srgb, var(--eg-support) 12%, transparent); color: var(--eg-support);
   border: 1px solid var(--eg-border-accent);
+}
+/* eg-flash dentro de una card (preview/login) ocupa el ancho del contenedor */
+.eg-preview .eg-flash, .eg-auth__card .eg-flash, .eg-form .eg-flash { width: 100%; }
+
+/* ---------- Accesibilidad (etapa 14): foco visible y no depender solo del color ---------- */
+.eg a:focus-visible, .eg-link:focus-visible, .eg-tab:focus-visible,
+.eg-nav__link:focus-visible, summary:focus-visible {
+  outline: 2px solid var(--eg-focus); outline-offset: 2px; border-radius: 6px;
+}
+.eg-check input:focus-visible { outline: 2px solid var(--eg-focus); outline-offset: 2px; }
+.eg-pill { border: 1px solid color-mix(in srgb, currentColor 30%, transparent); }
+
+/* ---------- Responsive del estado del sistema ---------- */
+@media (max-width: 600px) {
+  .eg-sysstatus { flex-direction: column; align-items: flex-start; gap: 8px; }
+  .eg-inline-form { flex-wrap: wrap; }
+  .eg-input--sm { max-width: 100%; flex: 1 1 160px; }
 }
 """
 
