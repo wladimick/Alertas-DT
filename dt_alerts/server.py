@@ -76,7 +76,7 @@ class AppHandler(BaseHTTPRequestHandler):
             if token and token == self.settings.admin_token:
                 self.redirect("/admin", set_admin_cookie=True)
             else:
-                self.respond_html(render_login())
+                self.respond_html(render_login(settings=self.settings))
         elif path in {"/admin", "/admin/subscribers", "/admin/alerts", "/admin/documents"}:
             if not self.is_admin():
                 self.redirect("/admin/login")
@@ -102,7 +102,10 @@ class AppHandler(BaseHTTPRequestHandler):
             if payload.get("token") == self.settings.admin_token:
                 self.redirect("/admin", set_admin_cookie=True)
             else:
-                self.respond_html(render_login(error="Token inválido."), status=HTTPStatus.UNAUTHORIZED)
+                self.respond_html(
+                    render_login(error="Token inválido. Verifica e inténtalo de nuevo.", settings=self.settings),
+                    status=HTTPStatus.UNAUTHORIZED,
+                )
         elif path == "/api/jobs/check-dt":
             if not self.is_job_authorized():
                 self.respond_json({"error": "No autorizado."}, status=HTTPStatus.UNAUTHORIZED)
@@ -336,16 +339,39 @@ def render_public_form(
     </div>
     <label class="eg-check eg-check--consent">
       <input type="checkbox" name="consent" required>
-      <span>Acepto recibir alertas sobre normativa DT y comunicaciones asociadas a esta suscripción.</span>
+      <span>Acepto recibir alertas informativas por email sobre nuevas publicaciones de la Dirección del Trabajo.</span>
     </label>
-    <button class="eg-btn eg-btn--primary eg-btn--block" type="submit">Suscribirme</button>
-    <p class="eg-fineprint">Recibirás alertas por email cuando la DT publique normativa relevante. Puedes pausar tu suscripción cuando quieras.</p>
+    <button class="eg-btn eg-btn--primary eg-btn--block" type="submit">Suscribirme a las alertas</button>
+    <p class="eg-fineprint">Podrás solicitar la baja cuando quieras. Los resúmenes son informativos y no reemplazan la revisión del documento oficial.</p>
   </form>
 """
     if embed:
         # En el iframe no mostramos hero ni header: solo la tarjeta funcional.
         body = f'<div class="eg-embed">{form}</div>'
         return render_page("Alertas DT", body, compact=embed)
+
+    benefits = [
+        ("🔎", "Monitoreo periódico", "Revisamos las publicaciones de la Dirección del Trabajo por ti."),
+        ("📝", "Resumen práctico", "Un resumen claro, sin jerga, listo para tomar decisiones."),
+        ("⚖️", "Impacto laboral", "Qué significa para contadores, remuneraciones y empresas."),
+        ("🔗", "Documento oficial", "Enlace directo a la fuente original de la DT."),
+    ]
+    benefit_cards = "".join(
+        f'<article class="eg-card eg-benefit"><span class="eg-benefit__icon" aria-hidden="true">{ic}</span>'
+        f'<h3>{h(t)}</h3><p>{h(d)}</p></article>'
+        for ic, t, d in benefits
+    )
+    steps = [
+        ("1", "Te suscribes con tu email", "Sin instalar nada. Solo tu correo y aceptar recibir alertas."),
+        ("2", "Monitoreamos la DT", "El sistema revisa periódicamente las nuevas publicaciones oficiales."),
+        ("3", "Generamos un resumen", "Cada documento nuevo se resume con su impacto práctico."),
+        ("4", "Recibes la alerta por email", "Te llega un correo claro con el resumen y el enlace oficial."),
+    ]
+    step_cards = "".join(
+        f'<li class="eg-step"><span class="eg-step__num" aria-hidden="true">{n}</span>'
+        f'<div><h3>{h(t)}</h3><p>{h(d)}</p></div></li>'
+        for n, t, d in steps
+    )
 
     body = f"""
 <section class="eg-hero" data-eg-theme="dark" data-eg-accent="green">
@@ -354,8 +380,8 @@ def render_public_form(
   <div class="eg-container eg-hero__grid">
     <div class="eg-hero__copy eg-fade-up">
       <p class="eg-eyebrow">Alertas Dirección del Trabajo</p>
-      <h1 class="eg-hero__title">Novedades laborales <span>relevantes</span> para tu gestión contable</h1>
-      <p class="eg-hero__lead">Avisos automáticos cuando la DT publique dictámenes, ordinarios, circulares, resoluciones u otros documentos normativos.</p>
+      <h1 class="eg-hero__title">Alertas DT para <span>contadores y empresas</span></h1>
+      <p class="eg-hero__lead">Monitoreamos nuevas publicaciones de la Dirección del Trabajo y te enviamos un resumen práctico por email, pensado para gestión laboral, contabilidad y empresas.</p>
       <ul class="eg-hero__points">
         <li class="eg-chip">Monitoreo continuo</li>
         <li class="eg-chip">Resumen orientado a contadores</li>
@@ -365,6 +391,22 @@ def render_public_form(
     {form}
   </div>
 </section>
+
+<section class="eg-section eg-section--light" data-eg-theme="light" data-eg-density="compact">
+  <div class="eg-container">
+    <p class="eg-eyebrow">Beneficios</p>
+    <h2 class="eg-section__title">Normativa laboral, sin perderte nada</h2>
+    <div class="eg-grid-4 eg-benefits">{benefit_cards}</div>
+  </div>
+</section>
+
+<section class="eg-section eg-section--soft" data-eg-theme="light" data-eg-density="compact">
+  <div class="eg-container">
+    <p class="eg-eyebrow">Cómo funciona</p>
+    <h2 class="eg-section__title">De la publicación oficial a tu correo, en cuatro pasos</h2>
+    <ol class="eg-steps">{step_cards}</ol>
+  </div>
+</section>
 """
     return render_page("Alertas DT", body, compact=embed)
 
@@ -372,42 +414,58 @@ def render_public_form(
 def render_thanks(*, embed: bool, updated: bool = False) -> str:
     if updated:
         eyebrow = "Suscripción actualizada"
-        title = "Tu suscripción ya existía y fue actualizada correctamente."
+        title = "¡Listo! Actualizamos tu suscripción"
     else:
-        eyebrow = "Suscripción registrada"
-        title = "Listo, quedaste inscrito en Alertas DT."
+        eyebrow = "Suscripción recibida"
+        title = "¡Suscripción recibida!"
+    back_button = (
+        '<a class="eg-btn eg-btn--primary" href="/">Volver al inicio</a>'
+        if not embed
+        else ""
+    )
     body = f"""
 <section class="eg-container eg-feedback">
   <div class="eg-card eg-feedback__card" data-eg-theme="light" data-eg-accent="green">
     <span class="eg-feedback__icon" aria-hidden="true">&#10003;</span>
     <p class="eg-eyebrow">{h(eyebrow)}</p>
     <h1>{h(title)}</h1>
-    <p class="eg-feedback__lead">Cuando se detecte nueva normativa relevante, recibirás la alerta por email.</p>
+    <p class="eg-feedback__lead">Desde ahora recibirás alertas informativas cuando detectemos nuevas publicaciones relevantes de la Dirección del Trabajo.</p>
+    {back_button}
+    <p class="eg-fineprint" style="margin-top:18px;">Este servicio se encuentra en etapa de prueba interna.</p>
   </div>
 </section>
 """
-    return render_page("Suscripción registrada", body, compact=embed)
+    return render_page("Suscripción recibida", body, compact=embed)
 
 
-def render_login(error: str | None = None) -> str:
-    error_html = f'<p class="eg-error">{h(error)}</p>' if error else ""
+def render_login(error: str | None = None, settings: Settings | None = None) -> str:
+    error_html = f'<p class="eg-error" role="alert">{h(error)}</p>' if error else ""
+    dev_html = ""
+    if settings is not None and settings.disable_admin_auth:
+        dev_html = (
+            '<p class="eg-flash" style="margin:0 0 14px;">'
+            "Modo desarrollo activo: la autenticación admin está desactivada.</p>"
+        )
     body = f"""
 <section class="eg-container eg-auth">
   <div class="eg-card eg-auth__card" data-eg-theme="light">
-    <p class="eg-eyebrow">Panel admin</p>
-    <h1>Ingresar</h1>
+    <p class="eg-eyebrow">External Group · Alertas DT</p>
+    <h1>Acceso administrativo</h1>
+    <p class="eg-auth__help">Ingresa el token de administración para revisar suscriptores, documentos detectados y alertas.</p>
+    {dev_html}
     {error_html}
     <form class="eg-form" method="post" action="/admin/login">
       <div class="eg-field">
-        <label class="eg-label" for="eg-token">Token</label>
-        <input class="eg-input" id="eg-token" name="token" type="password" required autocomplete="current-password">
+        <label class="eg-label" for="eg-token">Token de administración</label>
+        <input class="eg-input" id="eg-token" name="token" type="password" required
+               autocomplete="current-password" placeholder="••••••••">
       </div>
-      <button class="eg-btn eg-btn--primary eg-btn--block" type="submit">Entrar</button>
+      <button class="eg-btn eg-btn--primary eg-btn--block" type="submit">Entrar al panel</button>
     </form>
   </div>
 </section>
 """
-    return render_page("Admin", body, theme="dark")
+    return render_page("Acceso administrativo", body, theme="dark")
 
 
 # Traducción de estados técnicos a microcopy ejecutivo (solo presentación;
@@ -1060,10 +1118,42 @@ body.eg {
 .eg-embed { padding: 18px; }
 .eg-embed .eg-card { box-shadow: none; }
 
+/* ---------- Secciones landing (beneficios / cómo funciona) ---------- */
+.eg-section--light { background: var(--eg-bg); }
+.eg-section--soft { background: var(--eg-surface-2); }
+.eg-section__title { margin: 6px 0 26px; }
+.eg-benefits { margin-top: 8px; }
+.eg-benefit { text-align: left; }
+.eg-benefit__icon {
+  display: inline-grid; place-items: center; width: 46px; height: 46px; margin-bottom: 12px;
+  border-radius: 14px; background: color-mix(in srgb, var(--eg-accent) 14%, transparent);
+  font-size: 22px; line-height: 1;
+}
+.eg-benefit h3 { font-size: 1.05rem; margin: 0 0 6px; }
+.eg-benefit p { margin: 0; font-size: 14px; color: var(--eg-text-muted); }
+.eg-steps {
+  list-style: none; margin: 0; padding: 0;
+  display: grid; gap: 14px; grid-template-columns: repeat(2, minmax(0, 1fr));
+}
+.eg-step {
+  display: flex; gap: 16px; align-items: flex-start;
+  background: var(--eg-surface); border: 1px solid var(--eg-border);
+  border-radius: var(--eg-radius); padding: 18px 20px;
+}
+.eg-step__num {
+  flex: none; display: inline-grid; place-items: center; width: 36px; height: 36px;
+  border-radius: 999px; background: var(--eg-cta); color: var(--eg-text-on-cta);
+  font-family: var(--eg-font-heading); font-weight: 700; font-size: 16px;
+}
+.eg-step h3 { font-size: 1rem; margin: 4px 0 4px; }
+.eg-step p { margin: 0; font-size: 14px; color: var(--eg-text-muted); }
+@media (max-width: 720px) { .eg-steps { grid-template-columns: 1fr; } }
+
 /* ---------- Feedback / Auth ---------- */
 .eg-feedback, .eg-auth { padding: clamp(40px, 8vw, 90px) 20px; display: grid; justify-items: center; }
 .eg-feedback__card, .eg-auth__card { max-width: 560px; width: 100%; text-align: center; }
 .eg-auth__card { text-align: left; max-width: 440px; }
+.eg-auth__help { color: var(--eg-text-muted); font-size: 14px; margin: 0 0 16px; }
 .eg-feedback__lead { color: var(--eg-text-muted); }
 .eg-feedback__icon {
   display: inline-grid; place-items: center; width: 56px; height: 56px; margin: 0 auto 14px;
