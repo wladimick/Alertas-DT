@@ -44,6 +44,27 @@ La interfaz incluye:
 - Estados visuales para revisión, envío simulado y credenciales pendientes.
 - Microcopy en español (estados técnicos traducidos), responsive y foco accesible.
 
+## Panel administrativo (sidebar)
+
+El admin usa un layout tipo SaaS con **sidebar lateral** e íconos SVG inline (sin
+librerías externas):
+
+- **Sidebar** oscuro con navegación: Resumen, Suscriptores, Documentos, Alertas,
+  Monitoreo. El ítem activo coincide con la ruta. En mobile se convierte en una barra
+  de navegación superior.
+- **Topbar** por sección: título, subtítulo, estado de email (SendGrid real / Console
+  simulado) y de acceso (token / desarrollo), y el botón "Ejecutar monitoreo".
+- **Resumen** (`/admin`): cards de métricas, panel "Estado del sistema" y jobs/alertas
+  recientes.
+- **Alertas** (`/admin/alerts`): tarjetas revisables con resumen recortado y acciones
+  (Vista previa, Marcar lista, Enviar prueba, Enviar).
+- **Documentos** y **Suscriptores**: tablas compactas con estados y acciones.
+- **Monitoreo** (`/admin/jobs`): historial de ejecuciones.
+- **Vista previa de email**: detalle de la alerta + render HTML enmarcado + texto plano.
+
+Rutas admin: `/admin`, `/admin/subscribers`, `/admin/documents`, `/admin/alerts`,
+`/admin/jobs`, `/admin/alerts/{id}/preview-email`.
+
 ## Estado de envío de email
 
 Por defecto, la app usa:
@@ -93,6 +114,7 @@ GET   /admin                    Resumen (jobs + alertas recientes)
 GET   /admin/subscribers        Suscriptores
 GET   /admin/documents          Documentos detectados
 GET   /admin/alerts             Alertas
+GET   /admin/jobs               Monitoreo (historial de jobs)
 GET   /admin/alerts/{id}/preview-email   Vista previa del email
 POST  /api/subscribe            Alta/actualización de suscriptor
 POST  /api/jobs/check-dt        Ejecuta el monitoreo (requiere X-Job-Token)
