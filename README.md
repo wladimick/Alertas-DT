@@ -85,6 +85,31 @@ EMAIL_FROM=alertasdt@externalgroup.cl
 
 (No se incluyen credenciales reales en el repositorio; se definen solo en Render.)
 
+## Persistencia de suscriptores
+
+En modo actual, la app usa **SQLite**. Para demos internas funciona, pero en Render el
+filesystem puede **no ser persistente** entre redeploys/restarts si no se configura un
+disco persistente o una base externa.
+
+Importante: el archivo de base (`data/*.sqlite3`) **ya no se versiona** (ver `.gitignore`).
+Antes estaba commiteado y cada redeploy lo sobrescribía con el snapshot del repo, lo que
+hacía "desaparecer" suscriptores creados en producción.
+
+Para producción se recomienda:
+
+1. **Render Persistent Disk** para SQLite, o
+2. **Postgres** administrado.
+
+Si se usa SQLite en Render, configurar `DATABASE_PATH` apuntando a una ruta persistente
+(el mount del disco), por ejemplo:
+
+```env
+DATABASE_PATH=/var/data/dt_alertas.sqlite3
+```
+
+Sin disco persistente ni base externa, los datos se reinician al redeploy o restart del
+servicio.
+
 ## Ejecutar localmente
 
 ```bash
