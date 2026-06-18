@@ -1,14 +1,19 @@
 from __future__ import annotations
 
 import json
+import logging
 import time
 from typing import Any
 
 from . import db
 from .config import DT_SOURCES, Settings, get_settings
 from .dt_scraper import ScrapedDocument, content_hash, enrich_document_detail, fetch_listing
-from .notifier import dispatch_alert
 from .summarizer import summarize_document
+
+
+log = logging.getLogger("dt_alerts.worker")
+if not log.handlers:
+    logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
 def run_check(settings: Settings | None = None) -> dict[str, Any]:
@@ -23,13 +28,20 @@ def run_check(settings: Settings | None = None) -> dict[str, Any]:
     with db.connect(settings.database_path) as conn:
         job_id = db.start_job(conn, "check-dt")
         baseline_run = db.count_documents(conn) == 0 and not settings.alert_on_first_run
+        log.info(
+            "Job check-dt iniciado (id=%s, baseline=%s, fuentes=%s)",
+            job_id, baseline_run, len(DT_SOURCES),
+        )
         try:
             for source in DT_SOURCES:
                 try:
                     docs = fetch_listing(
                         source, limit=settings.max_listing_documents_per_source
                     )
+                    log.info("Fuente '%s': %s documentos en listado", source["category"], len(docs))
                 except Exception as exc:
+                    # Un error en una fuente no rompe el resto del job.
+                    log.warning("Fuente '%s' falló: %s", source["category"], exc)
                     source_errors.append(f"{source['category']}: {exc}")
                     continue
 
@@ -47,9 +59,14 @@ def run_check(settings: Settings | None = None) -> dict[str, Any]:
                     alert_id, sent = process_new_document(conn, document_id, doc, settings)
                     if alert_id:
                         processed_count += 1
+                        log.info("Documento nuevo procesado: %s (alerta %s, pendiente revisión)", doc.title, alert_id)
                     sent_count += sent
 
             status = "success" if not source_errors else "partial"
+            log.info(
+                "Job check-dt %s: nuevos=%s procesados=%s envios=%s errores=%s",
+                status, discovered_count, processed_count, sent_count, len(source_errors),
+            )
             db.finish_job(
                 conn,
                 job_id,
@@ -68,6 +85,7 @@ def run_check(settings: Settings | None = None) -> dict[str, Any]:
                 "source_errors": source_errors,
             }
         except Exception as exc:
+            log.error("Job check-dt falló: %s", exc)
             db.finish_job(
                 conn,
                 job_id,
@@ -96,12 +114,11 @@ def process_new_document(
 
     doc_dict = enriched.to_db_dict()
     summary = summarize_document(doc_dict, settings)
-    if detail_error and summary.status == "ready":
-        summary.status = "pending_review"
-        summary.ai_error = detail_error
-    elif detail_error:
+    if detail_error:
         summary.ai_error = f"{detail_error} | {summary.ai_error or ''}".strip(" |")
 
+    # Flujo de revisión: toda alerta nueva nace 'pending_review'.
+    # El envío a suscriptores es manual desde el admin (etapa 11), nunca automático.
     alert_id = db.create_or_update_alert(
         conn,
         document_id,
@@ -109,7 +126,7 @@ def process_new_document(
         key_points=summary.key_points,
         practical_impacts=summary.practical_impacts,
         relevance=summary.relevance,
-        status=summary.status,
+        status="pending_review",
         ai_error=summary.ai_error,
     )
     db.update_document_processed(
@@ -122,10 +139,32 @@ def process_new_document(
         last_error=detail_error,
     )
 
-    sent = 0
-    if summary.status == "ready":
-        sent = dispatch_alert(conn, alert_id, settings)
-    return alert_id, sent
+    # No se envía nada en el job: las alertas quedan listas para revisión.
+    return alert_id, 0
+
+
+def regenerate_alert(conn, document_id: int, settings: Settings | None = None) -> int | None:
+    """
+    Regenera el resumen/alerta de un documento ya almacenado, sin volver a scrapear.
+    Útil desde el admin. La alerta vuelve a 'pending_review'.
+    """
+    settings = settings or get_settings()
+    document = db.get_document(conn, document_id)
+    if not document:
+        return None
+    summary = summarize_document(document, settings)
+    alert_id = db.create_or_update_alert(
+        conn,
+        document_id,
+        summary=summary.summary,
+        key_points=summary.key_points,
+        practical_impacts=summary.practical_impacts,
+        relevance=summary.relevance,
+        status="pending_review",
+        ai_error=summary.ai_error,
+    )
+    log.info("Resumen regenerado para documento %s (alerta %s)", document_id, alert_id)
+    return alert_id
 
 
 def scheduler_loop(settings: Settings | None = None) -> None:

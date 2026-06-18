@@ -335,6 +335,21 @@ def list_documents(conn: sqlite3.Connection, limit: int = 200) -> list[dict[str,
     return [dict(row) for row in rows]
 
 
+def get_document(conn: sqlite3.Connection, document_id: int) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM documents WHERE id = ?", (document_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def count_sent_deliveries(conn: sqlite3.Connection) -> int:
+    """Envíos efectivos o simulados registrados en deliveries."""
+    row = conn.execute(
+        "SELECT COUNT(*) AS total FROM deliveries WHERE status IN ('sent', 'simulated')"
+    ).fetchone()
+    return int(row["total"])
+
+
 def create_or_update_alert(
     conn: sqlite3.Connection,
     document_id: int,

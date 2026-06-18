@@ -12,8 +12,14 @@ from typing import Any
 
 from . import db
 from .config import Settings, get_settings
-from .notifier import dispatch_alert
-from .worker import run_check, scheduler_loop
+from .notifier import (
+    dispatch_alert,
+    render_alert_email_html,
+    render_alert_email_text,
+    send_test_alert_email,
+    subject_for,
+)
+from .worker import regenerate_alert, run_check, scheduler_loop
 
 
 def h(value: Any) -> str:
@@ -26,11 +32,6 @@ def bool_from_form(value: Any) -> bool:
     if value is None:
         return False
     return str(value).lower() in {"1", "true", "on", "yes", "si", "sí"}
-
-
-# TEMPORAL: desactiva el login por token del panel admin para esta ocasión.
-# Volver a False (o eliminar el bypass en is_admin) para reactivar la autenticación.
-DISABLE_ADMIN_AUTH = True
 
 
 class AppHandler(BaseHTTPRequestHandler):
@@ -58,11 +59,17 @@ class AppHandler(BaseHTTPRequestHandler):
         elif path == "/embed":
             self.respond_html(render_public_form(self.settings, embed=True, query=query))
         elif path == "/thanks":
-            self.respond_html(render_thanks(embed=bool_from_form(query.get("embed", ["0"])[0])))
+            self.respond_html(
+                render_thanks(
+                    embed=bool_from_form(query.get("embed", ["0"])[0]),
+                    updated=bool_from_form(query.get("updated", ["0"])[0]),
+                )
+            )
         elif path == "/healthz":
             self.respond_json({"ok": True, "service": "dt-alertas"})
         elif path == "/admin/login":
-            if DISABLE_ADMIN_AUTH:
+            if self.settings.disable_admin_auth:
+                # Modo desarrollo: sin autenticación, vamos directo al panel.
                 self.redirect("/admin")
                 return
             token = query.get("token", [""])[0]
@@ -74,7 +81,13 @@ class AppHandler(BaseHTTPRequestHandler):
             if not self.is_admin():
                 self.redirect("/admin/login")
                 return
-            self.respond_html(render_admin(path, self.settings))
+            flash = query.get("flash", [""])[0]
+            self.respond_html(render_admin(path, self.settings, flash=flash))
+        elif match := re.match(r"^/admin/alerts/(\d+)/preview-email$", path):
+            if not self.is_admin():
+                self.redirect("/admin/login")
+                return
+            self.respond_html(render_alert_preview(int(match.group(1)), self.settings))
         else:
             self.respond_not_found()
 
@@ -105,38 +118,101 @@ class AppHandler(BaseHTTPRequestHandler):
                     conn, subscriber_id, "paused" if action == "pause" else "active"
                 )
             self.redirect("/admin/subscribers")
-        elif match := re.match(r"^/admin/alerts/(\d+)/resend$", path):
+        elif match := re.match(r"^/admin/alerts/(\d+)/ready$", path):
             self.require_admin()
             alert_id = int(match.group(1))
             with db.connect(self.settings.database_path) as conn:
-                dispatch_alert(conn, alert_id, self.settings)
-            self.redirect("/admin/alerts")
+                db.set_alert_status(conn, alert_id, "ready_to_send")
+            self.redirect_flash("/admin/alerts", "Alerta marcada como lista para enviar.")
+        elif match := re.match(r"^/admin/alerts/(\d+)/(send|resend)$", path):
+            self.require_admin()
+            alert_id = int(match.group(1))
+            with db.connect(self.settings.database_path) as conn:
+                count = dispatch_alert(conn, alert_id, self.settings)
+            self.redirect_flash(
+                "/admin/alerts", f"Envío procesado: {count} destinatario(s) activo(s)."
+            )
+        elif match := re.match(r"^/admin/alerts/(\d+)/test$", path):
+            self.require_admin()
+            alert_id = int(match.group(1))
+            payload = self.read_payload()
+            to_email = (payload.get("to") or "").strip() or self.settings.test_email_to
+            if not to_email:
+                self.redirect_flash(
+                    "/admin/alerts",
+                    "Indica un correo de prueba o configura TEST_EMAIL_TO.",
+                )
+                return
+            with db.connect(self.settings.database_path) as conn:
+                alert = db.get_alert_with_document(conn, alert_id)
+            if not alert:
+                self.redirect_flash("/admin/alerts", "Alerta no encontrada.")
+                return
+            result = send_test_alert_email(to_email, alert, self.settings)
+            self.redirect_flash("/admin/alerts", result.get("message") or "Prueba procesada.")
+        elif match := re.match(r"^/admin/documents/(\d+)/regenerate$", path):
+            self.require_admin()
+            document_id = int(match.group(1))
+            with db.connect(self.settings.database_path) as conn:
+                alert_id = regenerate_alert(conn, document_id, self.settings)
+            msg = "Resumen regenerado (queda pendiente de revisión)." if alert_id else "Documento no encontrado."
+            self.redirect_flash("/admin/documents", msg)
         elif match := re.match(r"^/admin/documents/(\d+)/ignore$", path):
             self.require_admin()
             document_id = int(match.group(1))
             with db.connect(self.settings.database_path) as conn:
                 db.set_document_status(conn, document_id, "ignored")
-            self.redirect("/admin/documents")
+            self.redirect_flash("/admin/documents", "Documento marcado como ignorado.")
         else:
             self.respond_not_found()
 
     def handle_subscribe(self) -> None:
         payload = self.read_payload()
-        with db.connect(self.settings.database_path) as conn:
-            subscriber = db.upsert_subscriber(
-                conn,
-                email=payload.get("email", ""),
-                whatsapp=payload.get("whatsapp_optional") or payload.get("whatsapp"),
-                notify_email=bool_from_form(payload.get("notify_email", True)),
-                notify_whatsapp=bool_from_form(payload.get("notify_whatsapp")),
-                source_page=payload.get("source_page"),
-                consent=bool_from_form(payload.get("consent")),
-            )
-        if self.wants_json():
-            self.respond_json({"ok": True, "subscriber": public_subscriber(subscriber)})
-            return
         embed = bool_from_form(payload.get("embed"))
-        self.redirect(f"/thanks?embed={int(embed)}")
+        try:
+            with db.connect(self.settings.database_path) as conn:
+                # Detectamos existencia antes del upsert para distinguir alta vs actualización
+                # de forma robusta (los timestamps pueden coincidir en el mismo segundo).
+                email_norm = db.normalize_email(payload.get("email", ""))
+                updated = bool(
+                    conn.execute(
+                        "SELECT 1 FROM subscribers WHERE email = ?", (email_norm,)
+                    ).fetchone()
+                )
+                subscriber = db.upsert_subscriber(
+                    conn,
+                    email=payload.get("email", ""),
+                    # WhatsApp reservado para fase futura: no se captura ni notifica.
+                    whatsapp=None,
+                    notify_email=True,
+                    notify_whatsapp=False,
+                    source_page=payload.get("source_page"),
+                    consent=bool_from_form(payload.get("consent")),
+                )
+        except ValueError as exc:
+            # Email inválido o sin consentimiento: mensaje amigable.
+            if self.wants_json():
+                self.respond_json({"ok": False, "error": str(exc)}, status=HTTPStatus.BAD_REQUEST)
+                return
+            query = {"source_page": [payload.get("source_page") or "wordpress"]}
+            self.respond_html(
+                render_public_form(
+                    self.settings,
+                    embed=embed,
+                    query=query,
+                    error=str(exc),
+                    email_value=payload.get("email", ""),
+                ),
+                status=HTTPStatus.BAD_REQUEST,
+            )
+            return
+
+        if self.wants_json():
+            self.respond_json(
+                {"ok": True, "updated": updated, "subscriber": public_subscriber(subscriber)}
+            )
+            return
+        self.redirect(f"/thanks?embed={int(embed)}&updated={int(updated)}")
 
     def read_payload(self) -> dict[str, Any]:
         length = int(self.headers.get("Content-Length", "0") or "0")
@@ -152,7 +228,8 @@ class AppHandler(BaseHTTPRequestHandler):
         return "application/json" in accept
 
     def is_admin(self) -> bool:
-        if DISABLE_ADMIN_AUTH:
+        # El bypass solo aplica si DISABLE_ADMIN_AUTH=True (modo desarrollo explícito).
+        if self.settings.disable_admin_auth:
             return True
         cookie_header = self.headers.get("Cookie", "")
         cookie = SimpleCookie(cookie_header)
@@ -165,6 +242,10 @@ class AppHandler(BaseHTTPRequestHandler):
 
     def is_job_authorized(self) -> bool:
         return self.headers.get("X-Job-Token") == self.settings.job_token
+
+    def redirect_flash(self, target: str, message: str) -> None:
+        sep = "&" if "?" in target else "?"
+        self.redirect(f"{target}{sep}flash={urllib.parse.quote(message)}")
 
     def redirect(self, target: str, *, set_admin_cookie: bool = False) -> None:
         self.send_response(HTTPStatus.SEE_OTHER)
@@ -230,34 +311,35 @@ def public_subscriber(subscriber: dict[str, Any]) -> dict[str, Any]:
 
 
 def render_public_form(
-    settings: Settings, *, embed: bool, query: dict[str, list[str]]
+    settings: Settings,
+    *,
+    embed: bool,
+    query: dict[str, list[str]],
+    error: str | None = None,
+    email_value: str = "",
 ) -> str:
     source_page = query.get("source_page", ["wordpress"])[0]
+    error_html = f'<p class="eg-error" role="alert">{h(error)}</p>' if error else ""
+    # MVP centrado en email: WhatsApp reservado para fase futura (no se muestra).
     # Tarjeta de formulario: tema claro forzado para lectura y orden (guía EG §5/§19).
     form = f"""
-  <form class="eg-card eg-form" data-eg-theme="light" method="post" action="/api/subscribe">
+  <form class="eg-card eg-form" data-eg-theme="light" method="post" action="/api/subscribe" novalidate>
     <input type="hidden" name="source_page" value="{h(source_page)}">
     <input type="hidden" name="embed" value="{int(embed)}">
     <p class="eg-eyebrow">Suscripción</p>
     <h2 class="eg-form__title">Activa tus alertas</h2>
+    {error_html}
     <div class="eg-field">
       <label class="eg-label" for="eg-email">Correo electrónico</label>
-      <input class="eg-input" id="eg-email" name="email" type="email" required placeholder="nombre@empresa.cl">
-    </div>
-    <div class="eg-field">
-      <label class="eg-label" for="eg-wa">WhatsApp <span class="eg-label__hint">opcional</span></label>
-      <input class="eg-input" id="eg-wa" name="whatsapp_optional" type="tel" placeholder="+56912345678">
-    </div>
-    <div class="eg-checks">
-      <label class="eg-check"><input type="checkbox" name="notify_email" checked> Email</label>
-      <label class="eg-check"><input type="checkbox" name="notify_whatsapp"> WhatsApp</label>
+      <input class="eg-input" id="eg-email" name="email" type="email" required
+             value="{h(email_value)}" placeholder="nombre@empresa.cl" autocomplete="email">
     </div>
     <label class="eg-check eg-check--consent">
       <input type="checkbox" name="consent" required>
       <span>Acepto recibir alertas sobre normativa DT y comunicaciones asociadas a esta suscripción.</span>
     </label>
     <button class="eg-btn eg-btn--primary eg-btn--block" type="submit">Suscribirme</button>
-    <p class="eg-fineprint">WhatsApp requiere consentimiento y activación posterior de API Business.</p>
+    <p class="eg-fineprint">Recibirás alertas por email cuando la DT publique normativa relevante. Puedes pausar tu suscripción cuando quieras.</p>
   </form>
 """
     if embed:
@@ -277,7 +359,7 @@ def render_public_form(
       <ul class="eg-hero__points">
         <li class="eg-chip">Monitoreo continuo</li>
         <li class="eg-chip">Resumen orientado a contadores</li>
-        <li class="eg-chip">Email y WhatsApp</li>
+        <li class="eg-chip">Alertas por email</li>
       </ul>
     </div>
     {form}
@@ -287,14 +369,20 @@ def render_public_form(
     return render_page("Alertas DT", body, compact=embed)
 
 
-def render_thanks(*, embed: bool) -> str:
-    body = """
+def render_thanks(*, embed: bool, updated: bool = False) -> str:
+    if updated:
+        eyebrow = "Suscripción actualizada"
+        title = "Tu suscripción ya existía y fue actualizada correctamente."
+    else:
+        eyebrow = "Suscripción registrada"
+        title = "Listo, quedaste inscrito en Alertas DT."
+    body = f"""
 <section class="eg-container eg-feedback">
   <div class="eg-card eg-feedback__card" data-eg-theme="light" data-eg-accent="green">
     <span class="eg-feedback__icon" aria-hidden="true">&#10003;</span>
-    <p class="eg-eyebrow">Suscripción registrada</p>
-    <h1>Listo, quedaste inscrito en Alertas DT.</h1>
-    <p class="eg-feedback__lead">Cuando se detecte nueva normativa relevante, recibirás la alerta según tus preferencias.</p>
+    <p class="eg-eyebrow">{h(eyebrow)}</p>
+    <h1>{h(title)}</h1>
+    <p class="eg-feedback__lead">Cuando se detecte nueva normativa relevante, recibirás la alerta por email.</p>
   </div>
 </section>
 """
@@ -322,17 +410,51 @@ def render_login(error: str | None = None) -> str:
     return render_page("Admin", body, theme="dark")
 
 
-def render_admin(path: str, settings: Settings) -> str:
+def fmt_dt(value: Any) -> str:
+    """Formatea timestamps ISO a algo legible (YYYY-MM-DD HH:MM)."""
+    text = str(value or "")
+    return text.replace("T", " ")[:16] if text else "—"
+
+
+def pill(value: Any, label: Any = None) -> str:
+    """Pill de estado con color semántico via data-status (ver CSS)."""
+    v = str(value or "")
+    return f'<span class="eg-pill" data-status="{h(v)}">{h(label if label is not None else v)}</span>'
+
+
+def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
     with db.connect(settings.database_path) as conn:
         subscribers = db.list_subscribers(conn)
         alerts = db.list_alerts(conn)
         documents = db.list_documents(conn)
         jobs = db.latest_jobs(conn)
+        sent_deliveries = db.count_sent_deliveries(conn)
 
-    active_count = sum(1 for item in subscribers if item["status"] == "active")
-    ready_count = sum(1 for item in alerts if item["status"] == "ready")
-    pending_count = sum(1 for item in alerts if item["status"] == "pending_review")
+    total_subs = len(subscribers)
+    active_count = sum(1 for s in subscribers if s["status"] == "active")
+    paused_count = sum(1 for s in subscribers if s["status"] == "paused")
+    pending_count = sum(1 for a in alerts if a["status"] == "pending_review")
+    # "ready" es el estado legacy; lo tratamos como ready_to_send.
+    ready_count = sum(1 for a in alerts if a["status"] in {"ready_to_send", "ready"})
+    sent_count = sum(1 for a in alerts if a["status"] == "sent")
+    last_job = jobs[0] if jobs else None
+
+    banner = ""
+    if settings.disable_admin_auth:
+        banner = (
+            '<div class="eg-devbanner" role="alert">'
+            '⚠ Modo desarrollo: autenticación admin desactivada '
+            '(DISABLE_ADMIN_AUTH=True). No usar en producción.</div>'
+        )
+    if flash:
+        banner += f'<div class="eg-flash" role="status">{h(flash)}</div>'
+
+    last_job_html = "Sin ejecuciones"
+    if last_job:
+        last_job_html = f"{fmt_dt(last_job['started_at'])} · {h(last_job['status'])}"
+
     body = f"""
+{banner}
 <header class="eg-admin-header">
   <div>
     <p class="eg-eyebrow">Alertas DT</p>
@@ -344,15 +466,18 @@ def render_admin(path: str, settings: Settings) -> str:
   </form>
 </header>
 <section class="eg-metrics">
-  <div class="eg-metric"><strong>{len(subscribers)}</strong><span>Suscriptores</span></div>
+  <div class="eg-metric"><strong>{total_subs}</strong><span>Suscriptores</span></div>
   <div class="eg-metric"><strong>{active_count}</strong><span>Activos</span></div>
+  <div class="eg-metric"><strong>{paused_count}</strong><span>Pausados</span></div>
   <div class="eg-metric"><strong>{len(documents)}</strong><span>Documentos</span></div>
-  <div class="eg-metric"><strong>{ready_count}</strong><span>Alertas listas</span></div>
   <div class="eg-metric"><strong>{pending_count}</strong><span>Por revisar</span></div>
+  <div class="eg-metric"><strong>{ready_count}</strong><span>Listas</span></div>
+  <div class="eg-metric"><strong>{sent_count}</strong><span>Enviadas</span></div>
+  <div class="eg-metric"><strong>{sent_deliveries}</strong><span>Envíos totales</span></div>
 </section>
+<p class="eg-muted eg-lastjob">Último job: {last_job_html}</p>
 {render_nav(path)}
-{render_jobs(jobs)}
-{render_admin_section(path, subscribers, alerts, documents)}
+{render_admin_section(path, subscribers, alerts, documents, jobs)}
 """
     body += """
 <script>
@@ -381,8 +506,8 @@ def render_nav(path: str) -> str:
     links = [
         ("/admin", "Resumen"),
         ("/admin/subscribers", "Suscriptores"),
-        ("/admin/alerts", "Alertas"),
         ("/admin/documents", "Documentos"),
+        ("/admin/alerts", "Alertas"),
     ]
     items = "".join(
         f'<a class="eg-tab{ " is-active" if path == href else "" }" href="{href}">{label}</a>'
@@ -396,6 +521,7 @@ def render_admin_section(
     subscribers: list[dict[str, Any]],
     alerts: list[dict[str, Any]],
     documents: list[dict[str, Any]],
+    jobs: list[dict[str, Any]],
 ) -> str:
     if path == "/admin/subscribers":
         return render_subscribers(subscribers)
@@ -403,7 +529,8 @@ def render_admin_section(
         return render_alerts(alerts)
     if path == "/admin/documents":
         return render_documents(documents)
-    return render_alerts(alerts[:10]) + render_subscribers(subscribers[:10])
+    # Resumen: historial de jobs + extracto de alertas recientes.
+    return render_jobs(jobs) + render_alerts(alerts[:8])
 
 
 def render_jobs(jobs: list[dict[str, Any]]) -> str:
@@ -412,19 +539,19 @@ def render_jobs(jobs: list[dict[str, Any]]) -> str:
     rows = "".join(
         f"""
 <tr>
-  <td>{h(job['started_at'])}</td>
-  <td><span class="eg-pill">{h(job['status'])}</span></td>
+  <td>{fmt_dt(job['started_at'])}</td>
+  <td>{pill(job['status'])}</td>
   <td>{h(job['discovered_count'])}</td>
   <td>{h(job['processed_count'])}</td>
   <td>{h(job['sent_count'])}</td>
-  <td>{h(job.get('error'))}</td>
+  <td class="eg-muted">{h(job.get('error'))}</td>
 </tr>
 """
         for job in jobs
     )
     return f"""
 <section class="eg-card eg-panel">
-  <h2>Últimos jobs</h2>
+  <h2>Historial de jobs</h2>
   <div class="eg-table-wrap">
     <table class="eg-table">
       <thead><tr><th>Inicio</th><th>Estado</th><th>Nuevos</th><th>Procesados</th><th>Envíos</th><th>Error</th></tr></thead>
@@ -439,11 +566,11 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
     rows = "".join(
         f"""
 <tr>
-  <td>{h(item['email'])}</td>
-  <td>{h(item.get('whatsapp'))}</td>
-  <td>{'Email' if item['notify_email'] else ''} {'WhatsApp' if item['notify_whatsapp'] else ''}</td>
-  <td><span class="eg-pill">{h(item['status'])}</span></td>
-  <td>{h(item['premium_status'])}</td>
+  <td><strong>{h(item['email'])}</strong></td>
+  <td>{pill(item['status'])}</td>
+  <td class="eg-muted">{fmt_dt(item.get('created_at'))}</td>
+  <td class="eg-muted">{fmt_dt(item.get('updated_at'))}</td>
+  <td class="eg-muted">{h(item.get('source_page') or '—')}</td>
   <td>
     <form method="post" action="/admin/subscribers/{item['id']}/{'pause' if item['status'] == 'active' else 'reactivate'}">
       <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">{'Pausar' if item['status'] == 'active' else 'Reactivar'}</button>
@@ -458,12 +585,39 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
   <h2>Suscriptores</h2>
   <div class="eg-table-wrap">
     <table class="eg-table">
-      <thead><tr><th>Email</th><th>WhatsApp</th><th>Canales</th><th>Estado</th><th>Plan</th><th></th></tr></thead>
+      <thead><tr><th>Email</th><th>Estado</th><th>Registro</th><th>Actualización</th><th>Fuente</th><th></th></tr></thead>
       <tbody>{rows or '<tr><td colspan="6">Sin suscriptores.</td></tr>'}</tbody>
     </table>
   </div>
+  <p class="eg-muted">WhatsApp reservado para fase futura: el MVP notifica solo por email.</p>
 </section>
 """
+
+
+def alert_actions(item: dict[str, Any]) -> str:
+    alert_id = item["id"]
+    status = item["status"]
+    actions = [
+        f'<a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/alerts/{alert_id}/preview-email">Vista previa</a>'
+    ]
+    if status == "pending_review":
+        actions.append(
+            f'<form method="post" action="/admin/alerts/{alert_id}/ready">'
+            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">Marcar lista</button></form>'
+        )
+    if status in {"ready_to_send", "ready"}:
+        actions.append(
+            f'<form method="post" action="/admin/alerts/{alert_id}/send" '
+            f'onsubmit="return confirm(\'¿Enviar esta alerta a los suscriptores activos?\');">'
+            f'<button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">Enviar</button></form>'
+        )
+    # Enviar prueba (a TEST_EMAIL_TO o al correo escrito).
+    actions.append(
+        f'<form method="post" action="/admin/alerts/{alert_id}/test" class="eg-inline-form">'
+        f'<input class="eg-input eg-input--sm" type="email" name="to" placeholder="correo prueba (opcional)">'
+        f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">Enviar prueba</button></form>'
+    )
+    return '<div class="eg-actions">' + "".join(actions) + "</div>"
 
 
 def render_alerts(alerts: list[dict[str, Any]]) -> str:
@@ -475,14 +629,10 @@ def render_alerts(alerts: list[dict[str, Any]]) -> str:
     <p class="eg-muted">{h(item['summary'])}</p>
   </td>
   <td>{h(item['category'])}</td>
-  <td><span class="eg-pill">{h(item['relevance'])}</span></td>
-  <td><span class="eg-pill">{h(item['status'])}</span></td>
-  <td><a href="{h(item['canonical_url'])}" target="_blank" rel="noreferrer">DT</a></td>
-  <td>
-    <form method="post" action="/admin/alerts/{item['id']}/resend">
-      <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">Reenviar</button>
-    </form>
-  </td>
+  <td>{pill(item['relevance'])}</td>
+  <td>{pill(item['status'])}</td>
+  <td class="eg-muted">{fmt_dt(item.get('created_at'))}</td>
+  <td>{alert_actions(item)}</td>
 </tr>
 """
         for item in alerts
@@ -492,7 +642,7 @@ def render_alerts(alerts: list[dict[str, Any]]) -> str:
   <h2>Alertas</h2>
   <div class="eg-table-wrap">
     <table class="eg-table">
-      <thead><tr><th>Documento</th><th>Categoría</th><th>Relevancia</th><th>Estado</th><th>Link</th><th></th></tr></thead>
+      <thead><tr><th>Documento</th><th>Categoría</th><th>Relevancia</th><th>Estado</th><th>Generada</th><th>Acciones</th></tr></thead>
       <tbody>{rows or '<tr><td colspan="6">Sin alertas.</td></tr>'}</tbody>
     </table>
   </div>
@@ -506,13 +656,19 @@ def render_documents(documents: list[dict[str, Any]]) -> str:
 <tr>
   <td><strong>{h(item['title'])}</strong><p class="eg-muted">{h(item.get('abstract'))}</p></td>
   <td>{h(item['category'])}</td>
-  <td>{h(item.get('publication_date'))}</td>
-  <td><span class="eg-pill">{h(item['status'])}</span></td>
+  <td class="eg-muted">{h(item.get('publication_date') or '—')}</td>
+  <td class="eg-muted">{h(item.get('dt_article_id'))}</td>
+  <td>{pill(item['status'])}</td>
   <td><a href="{h(item['canonical_url'])}" target="_blank" rel="noreferrer">DT</a></td>
   <td>
-    <form method="post" action="/admin/documents/{item['id']}/ignore">
-      <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">Ignorar</button>
-    </form>
+    <div class="eg-actions">
+      <form method="post" action="/admin/documents/{item['id']}/regenerate">
+        <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">Regenerar resumen</button>
+      </form>
+      <form method="post" action="/admin/documents/{item['id']}/ignore">
+        <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">Ignorar</button>
+      </form>
+    </div>
   </td>
 </tr>
 """
@@ -523,12 +679,56 @@ def render_documents(documents: list[dict[str, Any]]) -> str:
   <h2>Documentos detectados</h2>
   <div class="eg-table-wrap">
     <table class="eg-table">
-      <thead><tr><th>Documento</th><th>Categoría</th><th>Fecha</th><th>Estado</th><th>Link</th><th></th></tr></thead>
-      <tbody>{rows or '<tr><td colspan="6">Sin documentos.</td></tr>'}</tbody>
+      <thead><tr><th>Documento</th><th>Categoría</th><th>Fecha</th><th>ID DT</th><th>Estado</th><th>Link</th><th>Acciones</th></tr></thead>
+      <tbody>{rows or '<tr><td colspan="7">Sin documentos.</td></tr>'}</tbody>
     </table>
   </div>
 </section>
 """
+
+
+def render_alert_preview(alert_id: int, settings: Settings) -> str:
+    with db.connect(settings.database_path) as conn:
+        alert = db.get_alert_with_document(conn, alert_id)
+    if not alert:
+        body = (
+            '<section class="eg-container eg-feedback"><div class="eg-card eg-feedback__card" data-eg-theme="light">'
+            '<p class="eg-eyebrow">Vista previa</p><h1>Alerta no encontrada</h1>'
+            '<a class="eg-btn eg-btn--secondary" href="/admin/alerts">Volver al admin</a></div></section>'
+        )
+        return render_page("Vista previa", body)
+
+    subject = subject_for(alert)
+    email_html = render_alert_email_html(alert)
+    email_text = render_alert_email_text(alert)
+    # El HTML del email se aísla en un iframe srcdoc (escapado) para no afectar el admin.
+    srcdoc = h(email_html)
+    body = f"""
+<section class="eg-container eg-preview">
+  <p class="eg-eyebrow">Vista previa de email</p>
+  <h1>{h(alert['title'])}</h1>
+  <dl class="eg-kv">
+    <div><dt>Estado</dt><dd>{pill(alert['status'])}</dd></div>
+    <div><dt>Categoría</dt><dd>{h(alert['category'])}</dd></div>
+    <div><dt>Relevancia</dt><dd>{pill(alert['relevance'])}</dd></div>
+    <div><dt>Fecha doc.</dt><dd>{h(alert.get('publication_date') or '—')}</dd></div>
+    <div><dt>Asunto</dt><dd>{h(subject)}</dd></div>
+    <div><dt>Documento</dt><dd><a href="{h(alert['canonical_url'])}" target="_blank" rel="noreferrer">Ver en DT</a></dd></div>
+  </dl>
+  <div class="eg-actions">
+    <a class="eg-btn eg-btn--secondary" href="/admin/alerts">Volver al admin</a>
+  </div>
+  <h2 style="margin-top:24px;">Render HTML</h2>
+  <div class="eg-preview__frame">
+    <iframe title="Vista previa email" srcdoc="{srcdoc}"></iframe>
+  </div>
+  <details style="margin-top:18px;">
+    <summary>Ver versión texto plano</summary>
+    <pre>{h(email_text)}</pre>
+  </details>
+</section>
+"""
+    return render_page("Vista previa de email", body, density="compact")
 
 
 # Logos oficiales External Group (claro para fondos oscuros, oscuro para fondos claros).
@@ -840,7 +1040,7 @@ body.eg {
 }
 .eg-admin-header h1 { margin: 0; }
 .eg-metrics {
-  display: grid; grid-template-columns: repeat(5, minmax(0, 1fr)); gap: 14px; margin-bottom: 22px;
+  display: grid; grid-template-columns: repeat(auto-fit, minmax(130px, 1fr)); gap: 14px; margin-bottom: 16px;
 }
 .eg-metric {
   background: var(--eg-surface); border: 1px solid var(--eg-border);
@@ -935,6 +1135,56 @@ html body footer.eg-footer {
 
 html body main.eg-app {
     padding: 0;
+}
+
+/* ---------- Admin operativo (etapas 4/8/10/11) ---------- */
+.eg-devbanner {
+  width: min(1180px, calc(100% - 40px)); margin: 0 auto 18px;
+  background: #FEF3C7; color: #92400E; border: 1px solid #FCD34D;
+  border-radius: 12px; padding: 12px 16px; font-size: 14px; font-weight: 700;
+}
+.eg-lastjob { width: min(1180px, calc(100% - 40px)); margin: 0 auto 18px; }
+.eg-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
+.eg-actions form { margin: 0; }
+.eg-inline-form { display: flex; gap: 6px; align-items: center; }
+.eg-input--sm { min-height: 36px; padding: 6px 10px; font-size: 13px; max-width: 200px; border-radius: 10px; }
+
+/* Pills con color semántico por estado */
+.eg-pill[data-status="active"], .eg-pill[data-status="sent"], .eg-pill[data-status="ready_to_send"],
+.eg-pill[data-status="ready"], .eg-pill[data-status="processed"], .eg-pill[data-status="success"],
+.eg-pill[data-status="alto"] {
+  background: color-mix(in srgb, #167A5F 16%, transparent); color: #0F5E51;
+}
+.eg-pill[data-status="paused"], .eg-pill[data-status="pending_review"], .eg-pill[data-status="partial"],
+.eg-pill[data-status="baseline"], .eg-pill[data-status="discovered"], .eg-pill[data-status="medio"],
+.eg-pill[data-status="running"], .eg-pill[data-status="skipped"] {
+  background: color-mix(in srgb, #B45309 16%, transparent); color: #92400E;
+}
+.eg-pill[data-status="error"], .eg-pill[data-status="failed"], .eg-pill[data-status="ignored"],
+.eg-pill[data-status="bajo"] {
+  background: color-mix(in srgb, #B42318 14%, transparent); color: #B42318;
+}
+
+/* Vista previa de email (etapa 8) */
+.eg-preview { width: min(1180px, calc(100% - 40px)); margin-inline: auto; }
+.eg-preview__frame {
+  border: 1px solid var(--eg-border); border-radius: var(--eg-radius);
+  background: #fff; overflow: hidden; margin-top: 12px;
+}
+.eg-preview__frame iframe { width: 100%; min-height: 640px; border: 0; display: block; }
+.eg-preview pre {
+  white-space: pre-wrap; word-break: break-word; background: var(--eg-surface-2);
+  border-radius: 12px; padding: 16px; font-size: 13px; line-height: 1.5; overflow-x: auto;
+}
+.eg-kv { display: grid; gap: 6px; margin: 0 0 16px; }
+.eg-kv div { display: grid; grid-template-columns: 140px 1fr; gap: 12px; font-size: 14px; }
+.eg-kv dt { font-weight: 700; color: var(--eg-text); }
+.eg-kv dd { margin: 0; color: var(--eg-text-muted); }
+.eg-flash {
+  width: min(1180px, calc(100% - 40px)); margin: 0 auto 16px;
+  border-radius: 12px; padding: 12px 16px; font-size: 14px; font-weight: 600;
+  background: color-mix(in srgb, var(--eg-support) 12%, transparent); color: var(--eg-support);
+  border: 1px solid var(--eg-border-accent);
 }
 """
 

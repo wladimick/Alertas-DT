@@ -4,10 +4,31 @@ import tempfile
 import unittest
 from pathlib import Path
 
-from dt_alerts import db
+from dt_alerts import db, notifier, worker
 from dt_alerts.config import get_settings
 from dt_alerts.dt_scraper import parse_listing
 from dt_alerts.summarizer import summarize_document
+
+
+def settings_for(path: Path, **overrides):
+    base = get_settings()
+    data = {**base.__dict__, "database_path": path}
+    data.update(overrides)
+    return base.__class__(**data)
+
+
+def sample_alert() -> dict:
+    return {
+        "title": "ORD. N°906/41 sobre remuneraciones y registro electrónico",
+        "category": "Dictámenes",
+        "publication_date": "27/12/2024",
+        "relevance": "alto",
+        "status": "pending_review",
+        "summary": "La DT precisa criterios de cálculo de remuneraciones.",
+        "key_points_json": '["Aplica a empleadores", "Afecta gratificaciones"]',
+        "practical_impacts_json": '["Revisar liquidaciones."]',
+        "canonical_url": "https://www.dt.gob.cl/legislacion/1624/w3-article-127291.html",
+    }
 
 
 LISTING_HTML = """
@@ -90,6 +111,120 @@ class MvpTestCase(unittest.TestCase):
                         source_page="test",
                         consent=True,
                     )
+
+    def test_subscriber_requires_consent(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                with self.assertRaises(ValueError):
+                    db.upsert_subscriber(
+                        conn,
+                        email="ok@empresa.cl",
+                        whatsapp=None,
+                        notify_email=True,
+                        notify_whatsapp=False,
+                        source_page="test",
+                        consent=False,
+                    )
+
+    # --- Auth admin (etapa 2) ---
+    def test_admin_auth_enabled_by_default(self) -> None:
+        # Sin DISABLE_ADMIN_AUTH en entorno, el bypass debe estar apagado.
+        self.assertFalse(get_settings().disable_admin_auth)
+
+    # --- Email (etapas 7/9) ---
+    def test_email_render_html_and_text_do_not_fail(self) -> None:
+        alert = sample_alert()
+        html_body = notifier.render_alert_email_html(alert)
+        text_body = notifier.render_alert_email_text(alert)
+        self.assertIn("External Group", html_body)
+        self.assertIn("Ver documento oficial", html_body)
+        self.assertIn("Puntos clave", text_body)
+
+    def test_email_render_tolerates_missing_fields(self) -> None:
+        # No debe fallar aunque falten campos opcionales.
+        minimal = {"title": "Doc", "canonical_url": "https://x"}
+        self.assertIsInstance(notifier.render_alert_email_html(minimal), str)
+        self.assertIsInstance(notifier.render_alert_email_text(minimal), str)
+
+    def test_subject_generation_and_truncation(self) -> None:
+        short = notifier.subject_for({"title": "Circular 5"})
+        self.assertEqual(short, "Nueva normativa DT: Circular 5")
+        long_title = "x" * 300
+        subject = notifier.subject_for({"title": long_title})
+        self.assertLessEqual(len(subject), len("Nueva normativa DT: ") + notifier.SUBJECT_MAX)
+        self.assertTrue(subject.endswith("…"))
+
+    def test_email_console_is_simulated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            settings = settings_for(path, email_provider="console")
+            result = notifier.send_email(
+                settings, to="a@b.cl", subject="s", html_body="<p>x</p>", text_body="x"
+            )
+        self.assertEqual(result["status"], "simulated")
+        self.assertEqual(result["provider"], "console")
+
+    def test_email_sendgrid_without_key_is_skipped(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            settings = settings_for(path, email_provider="sendgrid", sendgrid_api_key="")
+            result = notifier.send_email(
+                settings, to="a@b.cl", subject="s", html_body="<p>x</p>", text_body="x"
+            )
+        self.assertEqual(result["status"], "skipped_missing_credentials")
+        self.assertFalse(result["ok"])
+
+    # --- Worker / job (etapa 5) ---
+    def test_job_without_new_documents_succeeds(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            settings = settings_for(path, alert_on_first_run=True)
+            original = worker.fetch_listing
+            worker.fetch_listing = lambda source, limit=25: []
+            try:
+                result = worker.run_check(settings)
+            finally:
+                worker.fetch_listing = original
+        self.assertEqual(result["status"], "success")
+        self.assertEqual(result["discovered_count"], 0)
+
+    def test_job_records_source_error_without_breaking(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            settings = settings_for(path, alert_on_first_run=True)
+
+            def boom(source, limit=25):
+                raise RuntimeError("URL caída")
+
+            original = worker.fetch_listing
+            worker.fetch_listing = boom
+            try:
+                result = worker.run_check(settings)
+            finally:
+                worker.fetch_listing = original
+        self.assertEqual(result["status"], "partial")
+        self.assertTrue(result["source_errors"])
+
+    def test_duplicate_document_is_not_recreated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            doc = {
+                "dt_article_id": "999",
+                "canonical_url": "https://www.dt.gob.cl/legislacion/1624/w3-article-999.html",
+                "source_url": "https://www.dt.gob.cl/x.html",
+                "category": "Dictámenes",
+                "title": "Doc 999",
+            }
+            with db.connect(path) as conn:
+                _, first_new = db.upsert_document(conn, doc)
+                _, second_new = db.upsert_document(conn, doc)
+                total = db.count_documents(conn)
+        self.assertTrue(first_new)
+        self.assertFalse(second_new)
+        self.assertEqual(total, 1)
 
     def test_fallback_summary_is_pending_review_without_api_key(self) -> None:
         settings = get_settings()

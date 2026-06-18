@@ -74,6 +74,7 @@ class Settings:
     app_port: int
     admin_token: str
     job_token: str
+    disable_admin_auth: bool
     database_path: Path
     run_worker: bool
     run_on_startup: bool
@@ -82,9 +83,13 @@ class Settings:
     alert_on_first_run: bool
     openai_api_key: str
     openai_model: str
+    email_provider: str
+    sendgrid_api_key: str
     resend_api_key: str
     email_from: str
+    email_from_name: str
     email_reply_to: str
+    test_email_to: str
     smtp_host: str
     smtp_port: int
     smtp_username: str
@@ -108,6 +113,9 @@ def get_settings() -> Settings:
         app_port=env_int("APP_PORT", 8000),
         admin_token=os.getenv("ADMIN_TOKEN", "dev-admin-token"),
         job_token=os.getenv("JOB_TOKEN", os.getenv("ADMIN_TOKEN", "dev-job-token")),
+        # Seguridad: el bypass de login solo se activa explícitamente (modo desarrollo).
+        # Por defecto False -> el admin siempre exige ADMIN_TOKEN.
+        disable_admin_auth=env_bool("DISABLE_ADMIN_AUTH", False),
         database_path=db_path,
         run_worker=env_bool("RUN_WORKER", True),
         run_on_startup=env_bool("RUN_ON_STARTUP", False),
@@ -116,9 +124,15 @@ def get_settings() -> Settings:
         alert_on_first_run=env_bool("ALERT_ON_FIRST_RUN", False),
         openai_api_key=os.getenv("OPENAI_API_KEY", ""),
         openai_model=os.getenv("OPENAI_MODEL", "gpt-4o-mini"),
+        # Proveedor de email recomendado: sendgrid. "console" = modo simulado para pruebas.
+        # Se mantiene compatibilidad con resend/smtp si ya estaban configurados.
+        email_provider=os.getenv("EMAIL_PROVIDER", "console").strip().lower(),
+        sendgrid_api_key=os.getenv("SENDGRID_API_KEY", ""),
         resend_api_key=os.getenv("RESEND_API_KEY", ""),
-        email_from=os.getenv("EMAIL_FROM", "Alertas DT <alertas@example.com>"),
+        email_from=os.getenv("EMAIL_FROM", "alertas@example.com"),
+        email_from_name=os.getenv("EMAIL_FROM_NAME", "Alertas DT"),
         email_reply_to=os.getenv("EMAIL_REPLY_TO", ""),
+        test_email_to=os.getenv("TEST_EMAIL_TO", ""),
         smtp_host=os.getenv("SMTP_HOST", ""),
         smtp_port=env_int("SMTP_PORT", 587),
         smtp_username=os.getenv("SMTP_USERNAME", ""),
