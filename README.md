@@ -128,16 +128,21 @@ Ningún correo real sale sin credenciales explícitas.
 
 1. Crear una **API key** en SendGrid (permiso Mail Send).
 2. Verificar el **sender** (dominio o remitente único) que usarás en `EMAIL_FROM`.
-3. En Render, definir variables:
+3. En **Render → Environment**, definir las variables (referencia; la API key se pega
+   solo en Render, nunca en el repositorio):
    ```env
    EMAIL_PROVIDER=sendgrid
-   SENDGRID_API_KEY=SG.xxxxx
-   EMAIL_FROM=alertas@tudominio.cl
+   SENDGRID_API_KEY=            # se define en Render, no en el código
+   EMAIL_FROM=alertasdt@externalgroup.cl
    EMAIL_FROM_NAME=Alertas DT
-   EMAIL_REPLY_TO=contacto@tudominio.cl
+   EMAIL_REPLY_TO=contacto@externalgroup.cl
+   TEST_EMAIL_TO=
    ```
 4. Probar con **Enviar prueba** desde el admin hacia tu propio correo.
 5. Si falta `SENDGRID_API_KEY`, la app no falla: registra `skipped_missing_credentials`.
+
+> La app lee estas variables **solo desde el entorno** (`os.getenv`). No hay `.env`
+> versionado ni credenciales en el código; los secretos viven únicamente en Render.
 
 > Compatibilidad: si ya usabas `RESEND_API_KEY` o `SMTP_*`, puedes apuntar
 > `EMAIL_PROVIDER=resend` o `EMAIL_PROVIDER=smtp`. SendGrid es el recomendado.
