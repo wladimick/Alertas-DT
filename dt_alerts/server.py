@@ -756,7 +756,7 @@ def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
         banner += f'<div class="eg-flash" role="status">{h(flash)}</div>'
 
     if path == "/admin/subscribers":
-        section = render_subscribers(subscribers)
+        section = render_db_info(settings, subscribers) + render_subscribers(subscribers)
     elif path == "/admin/documents":
         section = render_documents(documents)
     elif path == "/admin/alerts":
@@ -819,6 +819,28 @@ def render_jobs(jobs: list[dict[str, Any]]) -> str:
       <tbody>{rows}</tbody>
     </table>
   </div>
+</section>
+"""
+
+
+def render_db_info(settings: Settings, subscribers: list[dict[str, Any]]) -> str:
+    """Card informativa: motor, ruta parcial y última actualización de suscriptores.
+    Ayuda a confirmar que el admin lee la base esperada. No expone datos sensibles."""
+    from pathlib import Path
+
+    p = Path(str(settings.database_path))
+    partial = "/".join(p.parts[-2:]) if len(p.parts) >= 2 else p.name
+    last_update = max((s.get("updated_at") or "" for s in subscribers), default="")
+    return f"""
+<section class="eg-card eg-panel">
+  <h2>Base de datos</h2>
+  <dl class="eg-kv">
+    <div><dt>Motor</dt><dd>SQLite</dd></div>
+    <div><dt>Ruta</dt><dd class="eg-muted">…/{h(partial)}</dd></div>
+    <div><dt>Suscriptores</dt><dd>{len(subscribers)}</dd></div>
+    <div><dt>Última actualización</dt><dd>{fmt_dt(last_update) if last_update else '—'}</dd></div>
+  </dl>
+  <p class="eg-muted">En Render, usa un disco persistente o Postgres para que los suscriptores no se reinicien entre despliegues. Ver README.</p>
 </section>
 """
 

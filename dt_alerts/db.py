@@ -172,7 +172,8 @@ def upsert_subscriber(
             notify_whatsapp = excluded.notify_whatsapp,
             whatsapp_opt_in = excluded.whatsapp_opt_in,
             consent = excluded.consent,
-            source_page = excluded.source_page,
+            -- Conserva el origen original si la nueva suscripción no trae source_page.
+            source_page = COALESCE(excluded.source_page, subscribers.source_page),
             status = 'active',
             updated_at = excluded.updated_at
         """,
