@@ -20,6 +20,7 @@ from .notifier import (
     subject_for,
 )
 from .worker import regenerate_alert, run_check, scheduler_loop
+from . import wordpress_sync
 
 
 def h(value: Any) -> str:
@@ -170,6 +171,23 @@ class AppHandler(BaseHTTPRequestHandler):
             with db.connect(self.settings.database_path) as conn:
                 db.set_document_status(conn, document_id, "ignored")
             self.redirect_flash("/admin/documents", "Documento marcado como ignorado.")
+        elif path == "/admin/wordpress/sync":
+            self.require_admin()
+            result = wordpress_sync.sync(self.settings)
+            if result["status"] == "ok":
+                msg = (
+                    f"Sincronización WordPress completada: "
+                    f"{result['received']} recibidos, "
+                    f"{result['created']} creados, "
+                    f"{result['updated']} actualizados."
+                )
+            elif result["status"] == "disabled":
+                msg = "Sincronización WordPress desactivada (WORDPRESS_SYNC_ENABLED=false)."
+            elif result["status"] == "misconfigured":
+                msg = f"WordPress sin configurar: {result['error']}"
+            else:
+                msg = f"Error sincronizando WordPress: {result['error']}"
+            self.redirect_flash("/admin/subscribers", msg)
         else:
             self.respond_not_found()
 
@@ -824,13 +842,40 @@ def render_jobs(jobs: list[dict[str, Any]]) -> str:
 
 
 def render_db_info(settings: Settings, subscribers: list[dict[str, Any]]) -> str:
-    """Card informativa: motor, ruta parcial y última actualización de suscriptores.
-    Ayuda a confirmar que el admin lee la base esperada. No expone datos sensibles."""
+    """Cards informativas: base de datos y estado de sincronización WordPress."""
     from pathlib import Path
 
     p = Path(str(settings.database_path))
     partial = "/".join(p.parts[-2:]) if len(p.parts) >= 2 else p.name
     last_update = max((s.get("updated_at") or "" for s in subscribers), default="")
+
+    # WordPress sync status card
+    if settings.wordpress_sync_enabled:
+        wp_status = '<span class="pill pill--active">Activo</span>'
+        wp_url = h(settings.wordpress_api_url) if settings.wordpress_api_url else "—"
+        wp_section = f"""
+<section class="eg-card eg-panel">
+  <h2>Sincronización WordPress</h2>
+  <dl class="eg-kv">
+    <div><dt>Estado</dt><dd>{wp_status}</dd></div>
+    <div><dt>API URL</dt><dd class="eg-muted">{wp_url}</dd></div>
+    <div><dt>Intervalo</dt><dd>{h(settings.wordpress_sync_interval_minutes)} min</dd></div>
+  </dl>
+  <form method="post" action="/admin/wordpress/sync" style="margin-top:12px">
+    <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
+      Sincronizar ahora
+    </button>
+  </form>
+</section>
+"""
+    else:
+        wp_section = """
+<section class="eg-card eg-panel">
+  <h2>Sincronización WordPress</h2>
+  <p class="eg-muted">Desactivada. Configura <code>WORDPRESS_SYNC_ENABLED=true</code> y <code>WORDPRESS_API_URL</code> para importar suscriptores desde WordPress.</p>
+</section>
+"""
+
     return f"""
 <section class="eg-card eg-panel">
   <h2>Base de datos</h2>
@@ -840,9 +885,9 @@ def render_db_info(settings: Settings, subscribers: list[dict[str, Any]]) -> str
     <div><dt>Suscriptores</dt><dd>{len(subscribers)}</dd></div>
     <div><dt>Última actualización</dt><dd>{fmt_dt(last_update) if last_update else '—'}</dd></div>
   </dl>
-  <p class="eg-muted">En Render, usa un disco persistente o Postgres para que los suscriptores no se reinicien entre despliegues. Ver README.</p>
+  <p class="eg-muted">En operación local productiva, apunta DATABASE_PATH a una ruta fuera del repo. Ver README.</p>
 </section>
-"""
+{wp_section}"""
 
 
 def render_subscribers(subscribers: list[dict[str, Any]]) -> str:

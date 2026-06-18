@@ -1,0 +1,178 @@
+/* Alertas DT — Public Form Styles
+   Compatible con External Group Design System */
+
+:root {
+  --eg-primary:      #1A5276;
+  --eg-primary-dark: #154360;
+  --eg-accent:       #2E86C1;
+  --eg-text:         #1C2833;
+  --eg-muted:        #717D7E;
+  --eg-border:       #D5D8DC;
+  --eg-bg:           #FFFFFF;
+  --eg-bg-alt:       #F2F3F4;
+  --eg-success:      #1E8449;
+  --eg-error:        #C0392B;
+  --eg-radius:       8px;
+  --eg-shadow:       0 2px 12px rgba(0,0,0,.08);
+  --eg-font:         'Montserrat', 'Lato', system-ui, sans-serif;
+}
+
+.eg-card.eg-form.alertas-dt-form {
+  background: var(--eg-bg);
+  border-radius: var(--eg-radius);
+  box-shadow: var(--eg-shadow);
+  border: 1px solid var(--eg-border);
+  padding: 32px;
+  max-width: 480px;
+  font-family: var(--eg-font);
+  color: var(--eg-text);
+  margin: 0 auto;
+}
+
+.eg-eyebrow {
+  font-size: .75rem;
+  font-weight: 700;
+  letter-spacing: .08em;
+  text-transform: uppercase;
+  color: var(--eg-accent);
+  margin: 0 0 6px;
+}
+
+.eg-form__title {
+  font-size: 1.5rem;
+  font-weight: 700;
+  margin: 0 0 20px;
+  color: var(--eg-text);
+  line-height: 1.2;
+}
+
+.eg-field {
+  display: flex;
+  flex-direction: column;
+  gap: 6px;
+  margin-bottom: 16px;
+}
+
+.eg-label {
+  font-size: .875rem;
+  font-weight: 600;
+  color: var(--eg-text);
+}
+
+.eg-input {
+  height: 44px;
+  padding: 0 14px;
+  border: 1.5px solid var(--eg-border);
+  border-radius: var(--eg-radius);
+  font-size: 1rem;
+  font-family: inherit;
+  color: var(--eg-text);
+  background: var(--eg-bg);
+  transition: border-color .15s;
+  width: 100%;
+  box-sizing: border-box;
+}
+
+.eg-input:focus {
+  border-color: var(--eg-accent);
+  outline: none;
+  box-shadow: 0 0 0 3px rgba(46,134,193,.15);
+}
+
+.eg-check {
+  display: flex;
+  align-items: flex-start;
+  gap: 10px;
+  font-size: .875rem;
+  color: var(--eg-text);
+  cursor: pointer;
+  margin-bottom: 20px;
+}
+
+.eg-check input[type="checkbox"] {
+  margin-top: 3px;
+  flex-shrink: 0;
+  width: 16px;
+  height: 16px;
+  accent-color: var(--eg-primary);
+}
+
+.eg-btn {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  height: 44px;
+  padding: 0 24px;
+  border: none;
+  border-radius: var(--eg-radius);
+  font-size: 1rem;
+  font-family: inherit;
+  font-weight: 600;
+  cursor: pointer;
+  transition: background .15s, transform .1s;
+}
+
+.eg-btn--primary {
+  background: var(--eg-primary);
+  color: #fff;
+}
+
+.eg-btn--primary:hover {
+  background: var(--eg-primary-dark);
+}
+
+.eg-btn--primary:active {
+  transform: scale(.98);
+}
+
+.eg-btn--block {
+  width: 100%;
+}
+
+.eg-btn:disabled {
+  opacity: .6;
+  cursor: not-allowed;
+}
+
+.eg-fineprint {
+  font-size: .75rem;
+  color: var(--eg-muted);
+  margin: 12px 0 0;
+  line-height: 1.5;
+}
+
+/* Mensajes de estado */
+.alertas-dt-message {
+  padding: 12px 16px;
+  border-radius: var(--eg-radius);
+  font-size: .875rem;
+  font-weight: 500;
+  margin-bottom: 16px;
+}
+
+.alertas-dt-message--success {
+  background: #EAFAF1;
+  border: 1px solid #A9DFBF;
+  color: var(--eg-success);
+}
+
+.alertas-dt-message--error {
+  background: #FDEDEC;
+  border: 1px solid #F1948A;
+  color: var(--eg-error);
+}
+
+/* Honeypot oculto */
+.adt-hp {
+  display: none !important;
+  visibility: hidden !important;
+  position: absolute;
+  left: -9999px;
+}
+
+/* Responsive */
+@media (max-width: 540px) {
+  .eg-card.eg-form.alertas-dt-form {
+    padding: 24px 16px;
+  }
+}
