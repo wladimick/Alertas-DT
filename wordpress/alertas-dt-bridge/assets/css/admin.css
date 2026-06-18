@@ -101,3 +101,32 @@
 }
 
 .adt-pre em { color: #F39C12; font-style: normal; }
+
+/* Banner de revelación de token (un solo uso) */
+.adt-token-reveal__box {
+    display: flex;
+    align-items: center;
+    gap: 12px;
+    margin: 10px 0 8px;
+    flex-wrap: wrap;
+}
+
+.adt-token-full {
+    font-family: monospace;
+    font-size: .9rem;
+    background: #1C2833;
+    color: #2ECC71;
+    border: 1px solid #27AE60;
+    border-radius: 6px;
+    padding: 8px 14px;
+    user-select: all;
+    word-break: break-all;
+    flex: 1;
+    min-width: 0;
+}
+
+.adt-reveal-note {
+    font-size: .8rem;
+    color: #666;
+    margin: 4px 0 0;
+}

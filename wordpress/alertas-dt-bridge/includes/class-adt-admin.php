@@ -33,12 +33,19 @@ class ADT_Admin {
         );
     }
 
+    /** Clave del transient de revelación de token (por usuario, TTL 60 s). */
+    private static function reveal_key(): string {
+        return 'adt_token_reveal_' . get_current_user_id();
+    }
+
     public static function handle_regenerate(): void {
         if ( ! current_user_can( 'manage_options' ) ) {
             wp_die( 'Sin permisos.' );
         }
         check_admin_referer( 'adt_regenerate_token' );
-        ADT_Settings::regenerate_token();
+        $new_token = ADT_Settings::regenerate_token();
+        // Guardar token completo en transient de un solo uso (60 s, solo para este usuario).
+        set_transient( self::reveal_key(), $new_token, 60 );
         wp_safe_redirect( add_query_arg( 'adt_notice', 'token_regenerated', admin_url( 'admin.php?page=alertas-dt' ) ) );
         exit;
     }
@@ -55,12 +62,63 @@ class ADT_Admin {
         $active    = ADT_Database::count( 'active' );
         $last_sync = ADT_Settings::get_last_sync() ?: '—';
         $base_url  = rest_url( ADT_REST::NAMESPACE );
+
+        // Consumir el transient de revelación (solo se muestra una vez).
+        $reveal_token = get_transient( self::reveal_key() );
+        if ( $reveal_token ) {
+            delete_transient( self::reveal_key() );
+        }
         ?>
         <div class="wrap adt-admin">
             <h1>Alertas DT <span class="adt-version">v<?php echo esc_html( ADT_VERSION ); ?></span></h1>
 
-            <?php if ( 'token_regenerated' === $notice ) : ?>
-                <div class="notice notice-success is-dismissible"><p>Token regenerado correctamente.</p></div>
+            <?php if ( $reveal_token ) : ?>
+                <div class="notice notice-warning adt-token-reveal" style="border-left-color:#d97706;">
+                    <h3 style="margin:.5em 0 .25em;">⚠️ Token nuevo generado — cópialo ahora</h3>
+                    <p>Este token completo se muestra <strong>una sola vez</strong>. Al recargar la página quedará enmascarado.</p>
+                    <div class="adt-token-reveal__box">
+                        <code id="adt-token-full" class="adt-token-full"><?php echo esc_html( $reveal_token ); ?></code>
+                        <button type="button" class="button button-primary" id="adt-copy-btn"
+                                onclick="adtCopyToken()">Copiar token</button>
+                    </div>
+                    <p class="adt-reveal-note">
+                        Pega este valor en <code>WORDPRESS_API_TOKEN</code> en el entorno de la app local.
+                        <strong>No lo guardes en el repositorio.</strong>
+                    </p>
+                </div>
+                <script>
+                function adtCopyToken() {
+                    var val = document.getElementById('adt-token-full').textContent;
+                    if (navigator.clipboard) {
+                        navigator.clipboard.writeText(val).then(function() {
+                            var btn = document.getElementById('adt-copy-btn');
+                            btn.textContent = '¡Copiado!';
+                            btn.disabled = true;
+                            setTimeout(function() {
+                                btn.textContent = 'Copiar token';
+                                btn.disabled = false;
+                            }, 3000);
+                        });
+                    } else {
+                        // Fallback para navegadores sin Clipboard API
+                        var ta = document.createElement('textarea');
+                        ta.value = val;
+                        ta.style.position = 'fixed';
+                        ta.style.opacity = '0';
+                        document.body.appendChild(ta);
+                        ta.select();
+                        document.execCommand('copy');
+                        document.body.removeChild(ta);
+                        var btn = document.getElementById('adt-copy-btn');
+                        btn.textContent = '¡Copiado!';
+                        setTimeout(function() { btn.textContent = 'Copiar token'; }, 3000);
+                    }
+                }
+                </script>
+            <?php elseif ( 'token_regenerated' === $notice ) : ?>
+                <div class="notice notice-error is-dismissible">
+                    <p><strong>El token ya no está disponible para mostrar.</strong> Si no lo copiaste, genera uno nuevo con el botón "Regenerar token".</p>
+                </div>
             <?php endif; ?>
 
             <div class="adt-cards">
@@ -114,6 +172,9 @@ class ADT_Admin {
                                     Regenerar token
                                 </button>
                             </form>
+                            <p class="adt-muted" style="margin-top:6px;">
+                                Al regenerar, el token completo aparecerá <strong>una sola vez</strong> para que puedas copiarlo.
+                            </p>
                         </td>
                     </tr>
                 </table>
@@ -121,16 +182,17 @@ class ADT_Admin {
 
             <div class="adt-section">
                 <h2>Configurar app Python local</h2>
-                <p>Agrega estas variables de entorno en el computador donde corre la app:</p>
+                <p>Agrega estas variables de entorno en el computador donde corre la app.<br>
+                   <strong>Copia el token desde el banner que aparece al regenerarlo y pégalo en <code>WORDPRESS_API_TOKEN</code>.</strong></p>
                 <pre class="adt-pre">WORDPRESS_SYNC_ENABLED=true
 WORDPRESS_API_URL=<?php echo esc_html( rtrim( $base_url, '/' ) ); ?>
 
-WORDPRESS_API_TOKEN=<em>pega aquí el token API</em>
+WORDPRESS_API_TOKEN=<em>pega aquí el token — aparece al regenerar</em>
 WORDPRESS_SYNC_INTERVAL_MINUTES=15
 WORDPRESS_SYNC_LIMIT=100</pre>
                 <p class="adt-muted">
-                    El token se genera automáticamente al activar el plugin. Puedes regenerarlo arriba si lo necesitas.
                     <strong>No compartas el token ni lo guardes en el repositorio.</strong>
+                    Si lo pierdes, genera uno nuevo con "Regenerar token" y actualiza la variable en la app local.
                 </p>
             </div>
 
