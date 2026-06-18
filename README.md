@@ -33,6 +33,37 @@ basado en el sistema **External Group**.
 
 ---
 
+## UX/UI de la demo
+
+La interfaz incluye:
+
+- Landing pública para suscripción por email, con beneficios y "cómo funciona".
+- Formulario embebible para WordPress.
+- Panel administrativo con métricas, suscriptores, documentos, alertas y jobs.
+- Vista previa de email (HTML + texto).
+- Estados visuales para revisión, envío simulado y credenciales pendientes.
+- Microcopy en español (estados técnicos traducidos), responsive y foco accesible.
+
+## Estado de envío de email
+
+Por defecto, la app usa:
+
+```env
+EMAIL_PROVIDER=console
+```
+
+Esto permite probar la interfaz y registrar envíos **simulados** sin enviar correos reales.
+
+Para envío real en Render:
+
+```env
+EMAIL_PROVIDER=sendgrid
+SENDGRID_API_KEY=...
+EMAIL_FROM=alertasdt@externalgroup.cl
+```
+
+(No se incluyen credenciales reales en el repositorio; se definen solo en Render.)
+
 ## Ejecutar localmente
 
 ```bash
@@ -177,8 +208,8 @@ curl -X POST http://localhost:8000/api/jobs/check-dt -H "X-Job-Token: <JOB_TOKEN
 Usa el shortcode/snippet de `wordpress/shortcode-snippet.php` o un iframe:
 
 ```html
-<iframe src="https://alertas.tudominio.cl/embed"
-        style="width:100%;min-height:600px;border:0;" loading="lazy"></iframe>
+<iframe src="https://alertas-dt.onrender.com/embed"
+        width="100%" height="460" style="border:0;" loading="lazy"></iframe>
 ```
 
 ---
