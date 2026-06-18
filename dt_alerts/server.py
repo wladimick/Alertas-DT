@@ -23,7 +23,9 @@ from .worker import regenerate_alert, run_check, scheduler_loop
 
 
 def h(value: Any) -> str:
-    return html.escape(str(value or ""), quote=True)
+    # None -> "" (no mostramos "None"); pero 0 / valores falsy válidos se conservan
+    # (antes "value or ''" convertía 0 en cadena vacía y ocultaba métricas en cero).
+    return html.escape("" if value is None else str(value), quote=True)
 
 
 def bool_from_form(value: Any) -> bool:
@@ -77,7 +79,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.redirect("/admin", set_admin_cookie=True)
             else:
                 self.respond_html(render_login(settings=self.settings))
-        elif path in {"/admin", "/admin/subscribers", "/admin/alerts", "/admin/documents"}:
+        elif path in {"/admin", "/admin/subscribers", "/admin/alerts", "/admin/documents", "/admin/jobs"}:
             if not self.is_admin():
                 self.redirect("/admin/login")
                 return
@@ -132,9 +134,11 @@ class AppHandler(BaseHTTPRequestHandler):
             alert_id = int(match.group(1))
             with db.connect(self.settings.database_path) as conn:
                 count = dispatch_alert(conn, alert_id, self.settings)
-            self.redirect_flash(
-                "/admin/alerts", f"Envío procesado: {count} destinatario(s) activo(s)."
-            )
+            if count:
+                msg = f"Alerta procesada para {count} suscriptor(es) activo(s)."
+            else:
+                msg = "Sin envíos: no hay suscriptores activos o ya habían recibido la alerta."
+            self.redirect_flash("/admin/alerts", msg)
         elif match := re.match(r"^/admin/alerts/(\d+)/test$", path):
             self.require_admin()
             alert_id = int(match.group(1))
@@ -152,7 +156,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.redirect_flash("/admin/alerts", "Alerta no encontrada.")
                 return
             result = send_test_alert_email(to_email, alert, self.settings)
-            self.redirect_flash("/admin/alerts", result.get("message") or "Prueba procesada.")
+            self.redirect_flash("/admin/alerts", flash_for_email_result(result))
         elif match := re.match(r"^/admin/documents/(\d+)/regenerate$", path):
             self.require_admin()
             document_id = int(match.group(1))
@@ -506,6 +510,23 @@ def status_label(value: Any) -> str:
     return STATUS_LABELS.get(v, v or "—")
 
 
+def flash_for_email_result(result: dict[str, Any]) -> str:
+    """Mensaje flash ejecutivo (no técnico) para el resultado de un envío de prueba."""
+    status = result.get("status")
+    if status == "sent":
+        return "Correo de prueba enviado correctamente."
+    if status == "simulated":
+        return "Envío simulado registrado. Configura SendGrid en Render para enviar correos reales."
+    if status == "skipped_missing_credentials":
+        return "No se envió: faltan credenciales de SendGrid. Configúralas en Render (Mail Send)."
+    if status == "failed":
+        return (
+            "No se pudo enviar el correo con SendGrid. Revisa que la API key esté activa "
+            "y tenga permiso Mail Send."
+        )
+    return result.get("message") or "Prueba procesada."
+
+
 def fmt_dt(value: Any) -> str:
     """Formatea timestamps ISO a algo legible (YYYY-MM-DD HH:MM)."""
     text = str(value or "")
@@ -532,87 +553,98 @@ def pill(value: Any, label: Any = None) -> str:
     return f'<span class="eg-pill" data-status="{h(v)}">{h(text)}</span>'
 
 
-def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
-    with db.connect(settings.database_path) as conn:
-        subscribers = db.list_subscribers(conn)
-        alerts = db.list_alerts(conn)
-        documents = db.list_documents(conn)
-        jobs = db.latest_jobs(conn)
-        sent_deliveries = db.count_sent_deliveries(conn)
+# --------------------------------------------------------------------------
+# Íconos SVG inline (estilo lineal, currentColor; sin dependencias externas).
+# --------------------------------------------------------------------------
+ICONS = {
+    "dashboard": '<rect x="3" y="3" width="7" height="7"/><rect x="14" y="3" width="7" height="7"/><rect x="14" y="14" width="7" height="7"/><rect x="3" y="14" width="7" height="7"/>',
+    "users": '<path d="M17 21v-2a4 4 0 0 0-4-4H5a4 4 0 0 0-4 4v2"/><circle cx="9" cy="7" r="4"/><path d="M23 21v-2a4 4 0 0 0-3-3.87"/><path d="M16 3.13a4 4 0 0 1 0 7.75"/>',
+    "document": '<path d="M14 2H6a2 2 0 0 0-2 2v16a2 2 0 0 0 2 2h12a2 2 0 0 0 2-2V8z"/><polyline points="14 2 14 8 20 8"/><line x1="16" y1="13" x2="8" y2="13"/><line x1="16" y1="17" x2="8" y2="17"/>',
+    "bell": '<path d="M18 8A6 6 0 0 0 6 8c0 7-3 9-3 9h18s-3-2-3-9"/><path d="M13.73 21a2 2 0 0 1-3.46 0"/>',
+    "activity": '<polyline points="22 12 18 12 15 21 9 3 6 12 2 12"/>',
+    "mail": '<path d="M4 4h16a2 2 0 0 1 2 2v12a2 2 0 0 1-2 2H4a2 2 0 0 1-2-2V6a2 2 0 0 1 2-2z"/><polyline points="22,6 12,13 2,6"/>',
+    "refresh": '<polyline points="23 4 23 10 17 10"/><polyline points="1 20 1 14 7 14"/><path d="M3.51 9a9 9 0 0 1 14.85-3.36L23 10M1 14l4.64 4.36A9 9 0 0 0 20.49 15"/>',
+    "check": '<polyline points="20 6 9 17 4 12"/>',
+    "send": '<line x1="22" y1="2" x2="11" y2="13"/><polygon points="22 2 15 22 11 13 2 9 22 2"/>',
+    "eye": '<path d="M1 12s4-8 11-8 11 8 11 8-4 8-11 8-11-8-11-8z"/><circle cx="12" cy="12" r="3"/>',
+    "external": '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>',
+    "alert": '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
+    "back": '<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>',
+}
 
-    total_subs = len(subscribers)
-    active_count = sum(1 for s in subscribers if s["status"] == "active")
-    paused_count = sum(1 for s in subscribers if s["status"] == "paused")
-    pending_count = sum(1 for a in alerts if a["status"] == "pending_review")
-    # "ready" es el estado legacy; lo tratamos como ready_to_send.
-    ready_count = sum(1 for a in alerts if a["status"] in {"ready_to_send", "ready"})
-    sent_count = sum(1 for a in alerts if a["status"] == "sent")
-    last_job = jobs[0] if jobs else None
 
-    banner = ""
-    if settings.disable_admin_auth:
-        banner = (
-            '<div class="eg-devbanner" role="alert">'
-            '⚠ Modo desarrollo: autenticación admin desactivada '
-            '(DISABLE_ADMIN_AUTH=True). No usar en producción.</div>'
-        )
-    if flash:
-        banner += f'<div class="eg-flash" role="status">{h(flash)}</div>'
+def icon(name: str, size: int = 20) -> str:
+    return (
+        f'<svg class="eg-ic" width="{size}" height="{size}" viewBox="0 0 24 24" fill="none" '
+        f'stroke="currentColor" stroke-width="2" stroke-linecap="round" stroke-linejoin="round" '
+        f'aria-hidden="true">{ICONS.get(name, "")}</svg>'
+    )
 
-    last_job_html = "Sin ejecuciones aún"
-    if last_job:
-        last_job_html = f"{fmt_dt(last_job['started_at'])} · {status_label(last_job['status'])}"
 
-    # Estado del sistema (honesto para la demo): proveedor de email y modo real/simulado.
+# Metadatos de cada sección admin (título + subtítulo de la topbar).
+SECTION_META = {
+    "/admin": ("Resumen operativo", "Estado general del monitoreo DT, suscriptores y alertas por email."),
+    "/admin/subscribers": ("Suscriptores", "Personas inscritas para recibir alertas por email."),
+    "/admin/documents": ("Documentos detectados", "Publicaciones DT encontradas por el monitoreo."),
+    "/admin/alerts": ("Alertas", "Resúmenes generados, listos para revisar y enviar."),
+    "/admin/jobs": ("Monitoreo", "Historial de ejecuciones del monitoreo DT."),
+}
+
+SIDEBAR_NAV = [
+    ("/admin", "Resumen", "dashboard"),
+    ("/admin/subscribers", "Suscriptores", "users"),
+    ("/admin/documents", "Documentos", "document"),
+    ("/admin/alerts", "Alertas", "bell"),
+    ("/admin/jobs", "Monitoreo", "activity"),
+]
+
+
+def email_mode(settings: Settings) -> tuple[str, str]:
+    """Etiqueta + clave de estado para el proveedor/modo de email."""
     provider = settings.email_provider
     if provider == "sendgrid" and settings.sendgrid_api_key:
-        email_status = ("SendGrid · envío real", "active")
-    elif provider == "sendgrid":
-        email_status = ("SendGrid sin credenciales · simulado", "pending_review")
-    elif provider in {"resend", "smtp"} and (settings.resend_api_key or settings.smtp_host):
-        email_status = (f"{provider.upper()} · envío real", "active")
-    else:
-        email_status = ("Modo simulado (console)", "simulated")
-    auth_status = (
-        ("Autenticación desactivada (dev)", "error")
-        if settings.disable_admin_auth
-        else ("Login por token activo", "active")
-    )
-    sysstatus = (
-        '<div class="eg-sysstatus">'
-        f'<span class="eg-sysstatus__item"><b>Email:</b> {pill(email_status[1], email_status[0])}</span>'
-        f'<span class="eg-sysstatus__item"><b>Acceso:</b> {pill(auth_status[1], auth_status[0])}</span>'
-        f'<span class="eg-sysstatus__item"><b>Último monitoreo:</b> {h(last_job_html)}</span>'
-        "</div>"
-    )
+        return ("SendGrid · envío real", "active")
+    if provider == "sendgrid":
+        return ("SendGrid sin credenciales", "pending_review")
+    if provider in {"resend", "smtp"} and (settings.resend_api_key or settings.smtp_host):
+        return (f"{provider.upper()} · envío real", "active")
+    return ("Console · simulado", "simulated")
 
-    body = f"""
-{banner}
-<header class="eg-admin-header">
-  <div>
-    <p class="eg-eyebrow">External Group · Alertas DT</p>
-    <h1>Panel Alertas DT</h1>
-    <p class="eg-admin-header__sub">Monitoreo de publicaciones DT y alertas por email</p>
-  </div>
-  <form method="post" action="/api/jobs/check-dt">
-    <input type="hidden" name="manual" value="1">
-    <button class="eg-btn eg-btn--primary" type="submit" formmethod="post" formaction="/api/jobs/check-dt" data-job-token>Ejecutar monitoreo</button>
-  </form>
-</header>
-{sysstatus}
-<section class="eg-metrics">
-  <div class="eg-metric"><strong>{active_count}</strong><span>Suscriptores activos</span></div>
-  <div class="eg-metric"><strong>{paused_count}</strong><span>Pausados</span></div>
-  <div class="eg-metric"><strong>{len(documents)}</strong><span>Documentos detectados</span></div>
-  <div class="eg-metric"><strong>{pending_count}</strong><span>Pendientes de revisión</span></div>
-  <div class="eg-metric"><strong>{ready_count}</strong><span>Listas para enviar</span></div>
-  <div class="eg-metric"><strong>{sent_count}</strong><span>Alertas enviadas</span></div>
-  <div class="eg-metric"><strong>{sent_deliveries}</strong><span>Envíos registrados</span></div>
-</section>
-{render_nav(path)}
-{render_admin_section(path, subscribers, alerts, documents, jobs)}
+
+def auth_mode(settings: Settings) -> tuple[str, str]:
+    if settings.disable_admin_auth:
+        return ("Modo desarrollo", "error")
+    return ("Login por token activo", "active")
+
+
+def render_sidebar(path: str, settings: Settings) -> str:
+    email_label, email_key = email_mode(settings)
+    parts = []
+    for href, label, ic in SIDEBAR_NAV:
+        active = path == href
+        cls = " is-active" if active else ""
+        aria = ' aria-current="page"' if active else ""
+        parts.append(
+            f'<a class="eg-side__link{cls}" href="{href}"{aria}>'
+            f'<span class="eg-side__ic">{icon(ic)}</span><span>{label}</span></a>'
+        )
+    items = "".join(parts)
+    return f"""
+<div class="eg-side__brand">
+  <img class="eg-logo eg-logo--sm" src="{EG_LOGO_LIGHT}" alt="External Group" />
+  <span class="eg-side__product">Alertas DT</span>
+</div>
+<nav class="eg-side__nav" aria-label="Navegación del panel">{items}</nav>
+<div class="eg-side__status">
+  <span class="eg-side__dot" data-status="{h(email_key)}"></span>
+  <span>{h(email_label)}</span>
+</div>
+<p class="eg-side__foot">MVP interno · External Group</p>
 """
-    body += """
+
+
+# Script (una vez por página admin) para el botón "Ejecutar monitoreo".
+MONITOR_SCRIPT = """
 <script>
 document.querySelectorAll('[data-job-token]').forEach(function(button) {
   button.closest('form').addEventListener('submit', async function(event) {
@@ -621,7 +653,7 @@ document.querySelectorAll('[data-job-token]').forEach(function(button) {
     button.textContent = 'Ejecutando...';
     try {
       const token = prompt('JOB_TOKEN');
-      if (!token) return;
+      if (!token) { button.disabled = false; button.textContent = 'Ejecutar monitoreo'; return; }
       await fetch('/api/jobs/check-dt', { method: 'POST', headers: { 'X-Job-Token': token } });
       location.reload();
     } finally {
@@ -632,38 +664,130 @@ document.querySelectorAll('[data-job-token]').forEach(function(button) {
 });
 </script>
 """
-    return render_page("Admin Alertas DT", body, density="compact")
 
 
-def render_nav(path: str) -> str:
-    links = [
-        ("/admin", "Resumen"),
-        ("/admin/subscribers", "Suscriptores"),
-        ("/admin/documents", "Documentos"),
-        ("/admin/alerts", "Alertas"),
-    ]
-    items = "".join(
-        f'<a class="eg-tab{ " is-active" if path == href else "" }" href="{href}">{label}</a>'
-        for href, label in links
+def render_topbar(title: str, subtitle: str, settings: Settings, *, show_action: bool = True) -> str:
+    email_label, email_key = email_mode(settings)
+    auth_label, auth_key = auth_mode(settings)
+    action = ""
+    if show_action:
+        action = (
+            '<form method="post" action="/api/jobs/check-dt" class="eg-topbar__action">'
+            '<input type="hidden" name="manual" value="1">'
+            '<button class="eg-btn eg-btn--primary eg-btn--sm" type="submit" '
+            'formaction="/api/jobs/check-dt" data-job-token>'
+            f'{icon("refresh", 18)}<span>Ejecutar monitoreo</span></button></form>'
+        )
+    return f"""
+<header class="eg-topbar">
+  <div class="eg-topbar__titles">
+    <h1>{h(title)}</h1>
+    <p>{h(subtitle)}</p>
+  </div>
+  <div class="eg-topbar__right">
+    <span class="eg-topbar__status">{icon("mail", 16)} {pill(email_key, email_label)}</span>
+    <span class="eg-topbar__status">{pill(auth_key, auth_label)}</span>
+    {action}
+  </div>
+</header>
+"""
+
+
+def metric_card(ic: str, value: Any, label: str, sub: str, tone: str = "muted") -> str:
+    return (
+        f'<article class="eg-stat" data-tone="{h(tone)}">'
+        f'<span class="eg-stat__ic">{icon(ic, 18)}</span>'
+        f'<strong class="eg-stat__num">{h(value)}</strong>'
+        f'<span class="eg-stat__label">{h(label)}</span>'
+        f'<span class="eg-stat__sub">{h(sub)}</span>'
+        "</article>"
     )
-    return f'<nav class="eg-tabs">{items}</nav>'
 
 
-def render_admin_section(
-    path: str,
-    subscribers: list[dict[str, Any]],
-    alerts: list[dict[str, Any]],
-    documents: list[dict[str, Any]],
-    jobs: list[dict[str, Any]],
-) -> str:
+def render_system_status(settings: Settings, last_job: dict[str, Any] | None) -> str:
+    email_label, email_key = email_mode(settings)
+    auth_label, auth_key = auth_mode(settings)
+    real = email_key == "active"
+    last_job_html = "Sin ejecuciones aún"
+    last_error = ""
+    if last_job:
+        last_job_html = f"{fmt_dt(last_job['started_at'])} · {status_label(last_job['status'])}"
+        if last_job.get("error"):
+            last_error = (
+                f'<div><dt>Último error</dt><dd class="eg-muted">{h(last_job["error"])}</dd></div>'
+            )
+    return f"""
+<section class="eg-card eg-panel">
+  <h2>Estado del sistema</h2>
+  <dl class="eg-kv">
+    <div><dt>Email</dt><dd>{pill(email_key, email_label)}</dd></div>
+    <div><dt>Modo de envío</dt><dd>{'Correos reales' if real else 'Simulado (no se envían correos)'}</dd></div>
+    <div><dt>Acceso admin</dt><dd>{pill(auth_key, auth_label)}</dd></div>
+    <div><dt>Último monitoreo</dt><dd>{h(last_job_html)}</dd></div>
+    {last_error}
+  </dl>
+</section>
+"""
+
+
+def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
+    with db.connect(settings.database_path) as conn:
+        subscribers = db.list_subscribers(conn)
+        alerts = db.list_alerts(conn)
+        documents = db.list_documents(conn)
+        jobs = db.latest_jobs(conn)
+        sent_deliveries = db.count_sent_deliveries(conn)
+
+    active_count = sum(1 for s in subscribers if s["status"] == "active")
+    paused_count = sum(1 for s in subscribers if s["status"] == "paused")
+    pending_count = sum(1 for a in alerts if a["status"] == "pending_review")
+    ready_count = sum(1 for a in alerts if a["status"] in {"ready_to_send", "ready"})
+    sent_count = sum(1 for a in alerts if a["status"] == "sent")
+    last_job = jobs[0] if jobs else None
+
+    banner = ""
+    if settings.disable_admin_auth:
+        banner = (
+            '<div class="eg-devbanner" role="alert">'
+            "⚠ Modo desarrollo: autenticación admin desactivada "
+            "(DISABLE_ADMIN_AUTH=True). No usar en producción.</div>"
+        )
+    if flash:
+        banner += f'<div class="eg-flash" role="status">{h(flash)}</div>'
+
     if path == "/admin/subscribers":
-        return render_subscribers(subscribers)
-    if path == "/admin/alerts":
-        return render_alerts(alerts)
-    if path == "/admin/documents":
-        return render_documents(documents)
-    # Resumen: historial de jobs + extracto de alertas recientes.
-    return render_jobs(jobs) + render_alerts(alerts[:8])
+        section = render_subscribers(subscribers)
+    elif path == "/admin/documents":
+        section = render_documents(documents)
+    elif path == "/admin/alerts":
+        section = render_alerts(alerts)
+    elif path == "/admin/jobs":
+        section = (
+            '<p class="eg-section-note">El monitoreo revisa las fuentes configuradas de la '
+            "Dirección del Trabajo y registra nuevos documentos sin duplicar URLs ya "
+            "detectadas.</p>" + render_jobs(jobs)
+        )
+    else:  # /admin -> Resumen
+        cards = (
+            metric_card("users", active_count, "Suscriptores activos", f"{paused_count} pausados", "accent")
+            + metric_card("document", len(documents), "Documentos detectados", "desde fuentes DT", "info")
+            + metric_card("bell", pending_count, "Pendientes de revisión", "requieren validación", "warning")
+            + metric_card("check", ready_count, "Listas para enviar", "revisadas y aprobadas", "info")
+            + metric_card("send", sent_count, "Alertas enviadas", "a suscriptores activos", "success")
+            + metric_card("mail", sent_deliveries, "Envíos registrados", "incluye simulados", "muted")
+        )
+        section = (
+            f'<section class="eg-stats">{cards}</section>'
+            + render_system_status(settings, last_job)
+            + render_jobs(jobs[:5])
+            + render_alerts(alerts[:6])
+        )
+
+    title, subtitle = SECTION_META.get(path, SECTION_META["/admin"])
+    content = banner + section + MONITOR_SCRIPT
+    sidebar = render_sidebar(path, settings)
+    topbar = render_topbar(title, subtitle, settings)
+    return render_page(title, content, sidebar=sidebar, topbar=topbar)
 
 
 def render_jobs(jobs: list[dict[str, Any]]) -> str:
@@ -735,7 +859,8 @@ def alert_actions(item: dict[str, Any]) -> str:
     alert_id = item["id"]
     status = item["status"]
     actions = [
-        f'<a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/alerts/{alert_id}/preview-email">Vista previa</a>'
+        f'<a class="eg-btn eg-btn--primary eg-btn--sm" href="/admin/alerts/{alert_id}/preview-email">'
+        f'{icon("eye", 16)}<span>Vista previa</span></a>'
     ]
     if status == "pending_review":
         actions.append(
@@ -746,45 +871,45 @@ def alert_actions(item: dict[str, Any]) -> str:
         actions.append(
             f'<form method="post" action="/admin/alerts/{alert_id}/send" '
             f'onsubmit="return confirm(\'¿Enviar esta alerta a los suscriptores activos?\');">'
-            f'<button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">Enviar</button></form>'
+            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">{icon("send", 16)}<span>Enviar</span></button></form>'
         )
     # Enviar prueba (a TEST_EMAIL_TO o al correo escrito).
     actions.append(
         f'<form method="post" action="/admin/alerts/{alert_id}/test" class="eg-inline-form">'
-        f'<input class="eg-input eg-input--sm" type="email" name="to" placeholder="correo prueba (opcional)">'
+        f'<input class="eg-input eg-input--sm" type="email" name="to" placeholder="correo de prueba" aria-label="Correo de prueba">'
         f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">Enviar prueba</button></form>'
     )
     return '<div class="eg-actions">' + "".join(actions) + "</div>"
 
 
-def render_alerts(alerts: list[dict[str, Any]]) -> str:
-    rows = "".join(
-        f"""
-<tr>
-  <td>
-    <strong>{h(item['title'])}</strong>
-    <p class="eg-muted">{h(item['summary'])}</p>
-  </td>
-  <td>{h(item['category'])}</td>
-  <td>{pill(item['relevance'])}</td>
-  <td>{pill(item['status'])}</td>
-  <td class="eg-muted">{fmt_dt(item.get('created_at'))}</td>
-  <td>{alert_actions(item)}</td>
-</tr>
-"""
-        for item in alerts
-    )
+def alert_card(item: dict[str, Any]) -> str:
     return f"""
-<section class="eg-card eg-panel">
-  <h2>Alertas</h2>
-  <div class="eg-table-wrap">
-    <table class="eg-table">
-      <thead><tr><th>Documento</th><th>Categoría</th><th>Relevancia</th><th>Estado</th><th>Generada</th><th>Acciones</th></tr></thead>
-      <tbody>{rows or empty_row(6, "Aún no hay alertas generadas.", "Las alertas aparecerán cuando se detecten documentos nuevos.")}</tbody>
-    </table>
+<article class="eg-alert">
+  <div class="eg-alert__head">
+    <span class="eg-alert__cat">{h(item['category'])}</span>
+    <span class="eg-alert__meta">{pill(item['relevance'])} {pill(item['status'])}</span>
   </div>
-</section>
+  <h3 class="eg-alert__title">{h(item['title'])}</h3>
+  <p class="eg-alert__summary">{h(item['summary'])}</p>
+  <div class="eg-alert__foot">
+    <span class="eg-alert__date">{fmt_dt(item.get('created_at'))}</span>
+    {alert_actions(item)}
+  </div>
+</article>
 """
+
+
+def render_alerts(alerts: list[dict[str, Any]]) -> str:
+    if not alerts:
+        return (
+            '<h2 class="eg-block-title">Alertas</h2>'
+            '<div class="eg-card eg-panel"><div class="eg-empty">'
+            "<strong>Aún no hay alertas generadas.</strong>"
+            "<span>Las alertas aparecerán cuando se detecten documentos nuevos.</span>"
+            "</div></div>"
+        )
+    cards = "".join(alert_card(item) for item in alerts)
+    return f'<h2 class="eg-block-title">Alertas</h2><div class="eg-alert-grid">{cards}</div>'
 
 
 def render_documents(documents: list[dict[str, Any]]) -> str:
@@ -827,19 +952,20 @@ def render_documents(documents: list[dict[str, Any]]) -> str:
 def render_alert_preview(alert_id: int, settings: Settings) -> str:
     with db.connect(settings.database_path) as conn:
         alert = db.get_alert_with_document(conn, alert_id)
+    sidebar = render_sidebar("/admin/alerts", settings)
     if not alert:
+        topbar = render_topbar("Vista previa", "Alerta no encontrada.", settings, show_action=False)
         body = (
-            '<section class="eg-container eg-feedback"><div class="eg-card eg-feedback__card" data-eg-theme="light">'
-            '<p class="eg-eyebrow">Vista previa</p><h1>Alerta no encontrada</h1>'
-            '<a class="eg-btn eg-btn--secondary" href="/admin/alerts">Volver al admin</a></div></section>'
+            '<div class="eg-card eg-panel"><div class="eg-empty">'
+            "<strong>Alerta no encontrada.</strong>"
+            "<span>Es posible que haya sido eliminada o que el enlace sea incorrecto.</span></div>"
+            '<a class="eg-btn eg-btn--secondary" href="/admin/alerts">Volver a Alertas</a></div>'
         )
-        return render_page("Vista previa", body)
+        return render_page("Vista previa", body, sidebar=sidebar, topbar=topbar)
 
     subject = subject_for(alert)
-    email_html = render_alert_email_html(alert)
+    srcdoc = h(render_alert_email_html(alert))
     email_text = render_alert_email_text(alert)
-    # El HTML del email se aísla en un iframe srcdoc (escapado) para no afectar el admin.
-    srcdoc = h(email_html)
 
     real_send = (
         (settings.email_provider == "sendgrid" and settings.sendgrid_api_key)
@@ -848,45 +974,65 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
     )
     if real_send:
         send_note = (
-            '<div class="eg-flash" style="margin:0 0 16px;">Envío real habilitado '
-            f"({h(settings.email_provider)}). El botón \"Enviar prueba\" envía un correo de verdad.</div>"
+            '<div class="eg-flash">Envío real habilitado '
+            f"({h(settings.email_provider)}). El botón “Enviar prueba” envía un correo de verdad.</div>"
         )
     else:
         send_note = (
-            '<div class="eg-flash" style="margin:0 0 16px;">El envío está en modo simulado. '
+            '<div class="eg-flash">El envío está en modo simulado. '
             "Configura SendGrid en Render para habilitar correos reales.</div>"
         )
+
+    ready_btn = ""
+    if alert["status"] == "pending_review":
+        ready_btn = (
+            f'<form method="post" action="/admin/alerts/{alert_id}/ready">'
+            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">Marcar lista</button></form>'
+        )
+
+    topbar = render_topbar(
+        "Vista previa de email",
+        "Revisa el correo tal como lo recibirá el suscriptor antes de enviarlo.",
+        settings,
+        show_action=False,
+    )
     body = f"""
-<section class="eg-container eg-preview">
-  <p class="eg-eyebrow">Vista previa del email que recibirá el suscriptor</p>
-  <h1>{h(alert['title'])}</h1>
-  {send_note}
-  <dl class="eg-kv">
-    <div><dt>Estado</dt><dd>{pill(alert['status'])}</dd></div>
-    <div><dt>Categoría</dt><dd>{h(alert['category'])}</dd></div>
-    <div><dt>Relevancia</dt><dd>{pill(alert['relevance'])}</dd></div>
-    <div><dt>Fecha doc.</dt><dd>{h(alert.get('publication_date') or '—')}</dd></div>
-    <div><dt>Asunto del email</dt><dd>{h(subject)}</dd></div>
-    <div><dt>Documento</dt><dd><a class="eg-link" href="{h(alert['canonical_url'])}" target="_blank" rel="noreferrer">Ver en DT ↗</a></dd></div>
-  </dl>
-  <div class="eg-actions">
-    <a class="eg-btn eg-btn--secondary" href="/admin/alerts">← Volver al admin</a>
-    <form method="post" action="/admin/alerts/{alert_id}/test" class="eg-inline-form">
-      <input class="eg-input eg-input--sm" type="email" name="to" placeholder="correo de prueba (opcional)" aria-label="Correo de prueba">
-      <button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">Enviar prueba</button>
-    </form>
-  </div>
-  <h2 style="margin-top:24px;">Versión HTML</h2>
-  <div class="eg-preview__frame">
-    <iframe title="Vista previa del email (HTML)" srcdoc="{srcdoc}"></iframe>
-  </div>
-  <details style="margin-top:18px;">
-    <summary>Ver versión en texto plano</summary>
-    <pre>{h(email_text)}</pre>
-  </details>
-</section>
+{send_note}
+<div class="eg-preview-grid">
+  <section class="eg-card eg-panel">
+    <h2>Detalle de la alerta</h2>
+    <dl class="eg-kv">
+      <div><dt>Documento</dt><dd>{h(alert['title'])}</dd></div>
+      <div><dt>Estado</dt><dd>{pill(alert['status'])}</dd></div>
+      <div><dt>Categoría</dt><dd>{h(alert['category'])}</dd></div>
+      <div><dt>Relevancia</dt><dd>{pill(alert['relevance'])}</dd></div>
+      <div><dt>Fecha doc.</dt><dd>{h(alert.get('publication_date') or '—')}</dd></div>
+      <div><dt>Asunto</dt><dd>{h(subject)}</dd></div>
+      <div><dt>Fuente</dt><dd><a class="eg-link" href="{h(alert['canonical_url'])}" target="_blank" rel="noreferrer">Ver en DT ↗</a></dd></div>
+    </dl>
+    <div class="eg-actions">
+      <a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/alerts">{icon("back", 16)}<span>Volver a Alertas</span></a>
+      {ready_btn}
+      <form method="post" action="/admin/alerts/{alert_id}/test" class="eg-inline-form">
+        <input class="eg-input eg-input--sm" type="email" name="to" placeholder="correo de prueba" aria-label="Correo de prueba">
+        <button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">Enviar prueba</button>
+      </form>
+    </div>
+  </section>
+  <section class="eg-card eg-panel">
+    <h2>Vista previa del email</h2>
+    <p class="eg-muted">Así se verá el correo en la bandeja del suscriptor.</p>
+    <div class="eg-preview__frame">
+      <iframe title="Vista previa del email (HTML)" srcdoc="{srcdoc}"></iframe>
+    </div>
+    <details style="margin-top:14px;">
+      <summary>Ver versión en texto plano</summary>
+      <pre>{h(email_text)}</pre>
+    </details>
+  </section>
+</div>
 """
-    return render_page("Vista previa de email", body, density="compact")
+    return render_page("Vista previa de email", body, sidebar=sidebar, topbar=topbar)
 
 
 # Logos oficiales External Group (claro para fondos oscuros, oscuro para fondos claros).
@@ -928,14 +1074,10 @@ def render_page(
     compact: bool = False,
     theme: str = "light",
     density: str = "editorial",
+    sidebar: str | None = None,
+    topbar: str = "",
 ) -> str:
-    body_class = "eg eg--compact" if compact else "eg"
-    # En modo embed (iframe) no incluimos header/footer ni cromo del shell.
-    chrome_top = "" if compact else render_header()
-    chrome_bottom = "" if compact else render_footer()
-    return f"""
-<!doctype html>
-<html lang="es">
+    head = f"""
 <head>
   <meta charset="utf-8">
   <meta name="viewport" content="width=device-width, initial-scale=1">
@@ -945,6 +1087,34 @@ def render_page(
   <link href="https://fonts.googleapis.com/css2?family=Lato:wght@400;700&family=Montserrat:wght@500;600;700&display=swap" rel="stylesheet">
   <style>{CSS}</style>
 </head>
+"""
+    if sidebar is not None:
+        # Layout administrativo tipo SaaS: sidebar fijo + main con topbar + contenido.
+        # Sin header/footer público.
+        return f"""
+<!doctype html>
+<html lang="es">
+{head}
+<body class="eg eg--admin" data-eg-theme="light" data-eg-density="compact">
+  <div class="eg-shell">
+    <aside class="eg-sidebar" data-eg-theme="dark">{sidebar}</aside>
+    <div class="eg-main">
+      {topbar}
+      <div class="eg-content">{body}</div>
+    </div>
+  </div>
+</body>
+</html>
+""".strip()
+
+    body_class = "eg eg--compact" if compact else "eg"
+    # En modo embed (iframe) no incluimos header/footer ni cromo del shell.
+    chrome_top = "" if compact else render_header()
+    chrome_bottom = "" if compact else render_footer()
+    return f"""
+<!doctype html>
+<html lang="es">
+{head}
 <body class="{body_class}" data-eg-theme="{h(theme)}" data-eg-density="{h(density)}">
   {chrome_top}
   <main class="eg-app">{body}</main>
@@ -1415,6 +1585,121 @@ html body main.eg-app {
   .eg-sysstatus { flex-direction: column; align-items: flex-start; gap: 8px; }
   .eg-inline-form { flex-wrap: wrap; }
   .eg-input--sm { max-width: 100%; flex: 1 1 160px; }
+}
+
+/* =====================================================================
+   Panel administrativo SaaS con sidebar (rediseño)
+   ===================================================================== */
+.eg--admin { background: var(--eg-bg); }
+.eg-shell { display: grid; grid-template-columns: 264px 1fr; min-height: 100vh; }
+
+/* Sidebar */
+.eg-sidebar {
+  background: #0E2230; color: rgba(255,255,255,.82);
+  position: sticky; top: 0; align-self: start; height: 100vh;
+  display: flex; flex-direction: column; gap: 16px; padding: 22px 16px;
+}
+.eg-side__brand {
+  display: flex; flex-direction: column; align-items: flex-start; gap: 6px;
+  padding: 2px 8px 16px; border-bottom: 1px solid rgba(255,255,255,.08);
+}
+.eg-side__brand .eg-logo { height: 30px; width: auto; max-width: 160px; }
+.eg-side__product {
+  font-family: var(--eg-font-body); font-weight: 700; color: rgba(255,255,255,.7);
+  font-size: 11px; letter-spacing: .16em; text-transform: uppercase;
+}
+.eg-side__nav { display: flex; flex-direction: column; gap: 4px; }
+.eg-side__link {
+  display: flex; align-items: center; gap: 12px; padding: 10px 12px; border-radius: 10px;
+  color: rgba(255,255,255,.74); font-weight: 600; font-size: 14px; text-decoration: none;
+  transition: background .16s ease, color .16s ease;
+}
+.eg-side__link:hover { background: rgba(255,255,255,.06); color: #fff; }
+.eg-side__link.is-active { background: var(--eg-cta); color: var(--eg-text-on-cta); }
+.eg-side__link:focus-visible { outline: 2px solid #24EBA1; outline-offset: 2px; }
+.eg-side__ic { display: inline-flex; }
+.eg-side__status {
+  margin-top: auto; display: flex; align-items: center; gap: 8px; font-size: 12.5px;
+  color: rgba(255,255,255,.6); padding: 12px; border-top: 1px solid rgba(255,255,255,.08);
+}
+.eg-side__dot { width: 8px; height: 8px; border-radius: 999px; background: #24EBA1; flex: none; }
+.eg-side__dot[data-status="simulated"], .eg-side__dot[data-status="pending_review"] { background: #F79009; }
+.eg-side__dot[data-status="error"] { background: #F97066; }
+.eg-side__foot { font-size: 11.5px; color: rgba(255,255,255,.4); margin: 0; padding: 0 12px; }
+.eg-ic { flex: none; }
+
+/* Main + topbar */
+.eg-main { min-width: 0; display: flex; flex-direction: column; }
+.eg-topbar {
+  position: sticky; top: 0; z-index: 20;
+  background: rgba(245,247,250,.92); backdrop-filter: blur(8px);
+  border-bottom: 1px solid var(--eg-border);
+  display: flex; align-items: center; justify-content: space-between; gap: 16px; padding: 16px 28px;
+}
+.eg-topbar__titles h1 { font-size: 1.4rem; margin: 0; }
+.eg-topbar__titles p { margin: 2px 0 0; color: var(--eg-text-muted); font-size: 13.5px; }
+.eg-topbar__right { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; justify-content: flex-end; }
+.eg-topbar__status { display: inline-flex; align-items: center; gap: 6px; color: var(--eg-text-muted); font-size: 13px; }
+.eg-content { padding: 24px 28px 48px; }
+.eg-content .eg-flash, .eg-content .eg-devbanner { width: 100%; margin: 0 0 14px; }
+
+/* Stats (cards de métricas) */
+.eg-stats { display: grid; grid-template-columns: repeat(auto-fit, minmax(190px, 1fr)); gap: 14px; margin-bottom: 18px; }
+.eg-stat {
+  background: var(--eg-surface); border: 1px solid var(--eg-border); border-radius: var(--eg-radius);
+  padding: 16px 18px; display: grid; gap: 2px; box-shadow: 0 8px 24px rgba(10,34,49,.05);
+}
+.eg-stat__ic {
+  width: 34px; height: 34px; border-radius: 10px; display: inline-grid; place-items: center;
+  color: #fff; background: var(--eg-text-subtle); margin-bottom: 6px;
+}
+.eg-stat[data-tone="accent"] .eg-stat__ic { background: #167A5F; }
+.eg-stat[data-tone="info"] .eg-stat__ic { background: #0478B4; }
+.eg-stat[data-tone="warning"] .eg-stat__ic { background: #B45309; }
+.eg-stat[data-tone="success"] .eg-stat__ic { background: #12B76A; }
+.eg-stat__num { font-family: var(--eg-font-heading); font-size: 1.9rem; line-height: 1; color: var(--eg-text); }
+.eg-stat__label { font-weight: 700; font-size: 13.5px; color: var(--eg-text); margin-top: 4px; }
+.eg-stat__sub { font-size: 12px; color: var(--eg-text-subtle); }
+
+.eg-block-title { margin: 18px 0 12px; font-size: 1.15rem; }
+.eg-section-note { color: var(--eg-text-muted); font-size: 14px; margin: 0 0 14px; }
+
+/* Alertas en cards */
+.eg-alert-grid { display: grid; grid-template-columns: repeat(auto-fill, minmax(330px, 1fr)); gap: 14px; }
+.eg-alert {
+  background: var(--eg-surface); border: 1px solid var(--eg-border); border-radius: var(--eg-radius);
+  padding: 18px; display: flex; flex-direction: column; gap: 10px; box-shadow: 0 8px 24px rgba(10,34,49,.05);
+}
+.eg-alert__head { display: flex; align-items: center; justify-content: space-between; gap: 8px; }
+.eg-alert__cat { font-size: 12px; font-weight: 700; letter-spacing: .04em; text-transform: uppercase; color: var(--eg-text-subtle); }
+.eg-alert__meta { display: flex; gap: 6px; flex-wrap: wrap; justify-content: flex-end; }
+.eg-alert__title { font-size: 1rem; margin: 0; line-height: 1.3; }
+.eg-alert__summary {
+  margin: 0; color: var(--eg-text-muted); font-size: 13.5px; line-height: 1.5;
+  display: -webkit-box; -webkit-line-clamp: 3; -webkit-box-orient: vertical; overflow: hidden;
+}
+.eg-alert__foot { margin-top: auto; display: flex; flex-direction: column; gap: 10px; }
+.eg-alert__date { font-size: 12px; color: var(--eg-text-subtle); }
+
+/* Vista previa: dos columnas */
+.eg-preview-grid { display: grid; grid-template-columns: minmax(280px, 360px) 1fr; gap: 16px; align-items: start; }
+
+.eg-btn .eg-ic { margin-right: -2px; }
+
+/* Responsive del shell: sidebar pasa a barra superior */
+@media (max-width: 860px) {
+  .eg-shell { grid-template-columns: 1fr; }
+  .eg-sidebar {
+    position: static; height: auto; flex-direction: row; flex-wrap: wrap;
+    align-items: center; gap: 10px; padding: 12px 16px;
+  }
+  .eg-side__brand { border-bottom: 0; padding: 0; margin-right: auto; }
+  .eg-side__nav { flex-direction: row; flex-wrap: wrap; gap: 6px; width: 100%; overflow-x: auto; }
+  .eg-side__status, .eg-side__foot { display: none; }
+  .eg-topbar { position: static; flex-direction: column; align-items: flex-start; padding: 14px 16px; }
+  .eg-topbar__right { width: 100%; justify-content: flex-start; }
+  .eg-content { padding: 16px; }
+  .eg-preview-grid { grid-template-columns: 1fr; }
 }
 """
 
