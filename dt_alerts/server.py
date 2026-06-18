@@ -20,6 +20,7 @@ from .notifier import (
     subject_for,
 )
 from .worker import regenerate_alert, run_check, scheduler_loop
+from . import wordpress_sync
 
 
 def h(value: Any) -> str:
@@ -170,6 +171,23 @@ class AppHandler(BaseHTTPRequestHandler):
             with db.connect(self.settings.database_path) as conn:
                 db.set_document_status(conn, document_id, "ignored")
             self.redirect_flash("/admin/documents", "Documento marcado como ignorado.")
+        elif path == "/admin/wordpress/sync":
+            self.require_admin()
+            result = wordpress_sync.sync(self.settings)
+            if result["status"] == "ok":
+                msg = (
+                    f"Sincronización WordPress completada: "
+                    f"{result['received']} recibidos, "
+                    f"{result['created']} creados, "
+                    f"{result['updated']} actualizados."
+                )
+            elif result["status"] == "disabled":
+                msg = "Sincronización WordPress desactivada (WORDPRESS_SYNC_ENABLED=false)."
+            elif result["status"] == "misconfigured":
+                msg = f"WordPress sin configurar: {result['error']}"
+            else:
+                msg = f"Error sincronizando WordPress: {result['error']}"
+            self.redirect_flash("/admin/subscribers", msg)
         else:
             self.respond_not_found()
 
@@ -570,6 +588,10 @@ ICONS = {
     "external": '<path d="M18 13v6a2 2 0 0 1-2 2H5a2 2 0 0 1-2-2V8a2 2 0 0 1 2-2h6"/><polyline points="15 3 21 3 21 9"/><line x1="10" y1="14" x2="21" y2="3"/>',
     "alert": '<path d="M10.29 3.86 1.82 18a2 2 0 0 0 1.71 3h16.94a2 2 0 0 0 1.71-3L13.71 3.86a2 2 0 0 0-3.42 0z"/><line x1="12" y1="9" x2="12" y2="13"/><line x1="12" y1="17" x2="12.01" y2="17"/>',
     "back": '<line x1="19" y1="12" x2="5" y2="12"/><polyline points="12 19 5 12 12 5"/>',
+    "pause": '<rect x="6" y="4" width="4" height="16"/><rect x="14" y="4" width="4" height="16"/>',
+    "play": '<polygon points="5 3 19 12 5 21 5 3"/>',
+    "x-circle": '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>',
+    "logout": '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
 }
 
 
@@ -756,7 +778,7 @@ def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
         banner += f'<div class="eg-flash" role="status">{h(flash)}</div>'
 
     if path == "/admin/subscribers":
-        section = render_subscribers(subscribers)
+        section = render_db_info(settings, subscribers) + render_subscribers(subscribers)
     elif path == "/admin/documents":
         section = render_documents(documents)
     elif path == "/admin/alerts":
@@ -823,6 +845,55 @@ def render_jobs(jobs: list[dict[str, Any]]) -> str:
 """
 
 
+def render_db_info(settings: Settings, subscribers: list[dict[str, Any]]) -> str:
+    """Cards informativas: base de datos y estado de sincronización WordPress."""
+    from pathlib import Path
+
+    p = Path(str(settings.database_path))
+    partial = "/".join(p.parts[-2:]) if len(p.parts) >= 2 else p.name
+    last_update = max((s.get("updated_at") or "" for s in subscribers), default="")
+
+    # WordPress sync status card
+    if settings.wordpress_sync_enabled:
+        wp_status = '<span class="pill pill--active">Activo</span>'
+        wp_url = h(settings.wordpress_api_url) if settings.wordpress_api_url else "—"
+        wp_section = f"""
+<section class="eg-card eg-panel">
+  <h2>Sincronización WordPress</h2>
+  <dl class="eg-kv">
+    <div><dt>Estado</dt><dd>{wp_status}</dd></div>
+    <div><dt>API URL</dt><dd class="eg-muted">{wp_url}</dd></div>
+    <div><dt>Intervalo</dt><dd>{h(settings.wordpress_sync_interval_minutes)} min</dd></div>
+  </dl>
+  <form method="post" action="/admin/wordpress/sync" style="margin-top:12px">
+    <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
+      {icon("refresh", 14)}<span>Sincronizar ahora</span>
+    </button>
+  </form>
+</section>
+"""
+    else:
+        wp_section = """
+<section class="eg-card eg-panel">
+  <h2>Sincronización WordPress</h2>
+  <p class="eg-muted">Desactivada. Configura <code>WORDPRESS_SYNC_ENABLED=true</code> y <code>WORDPRESS_API_URL</code> para importar suscriptores desde WordPress.</p>
+</section>
+"""
+
+    return f"""
+<section class="eg-card eg-panel">
+  <h2>Base de datos</h2>
+  <dl class="eg-kv">
+    <div><dt>Motor</dt><dd>SQLite</dd></div>
+    <div><dt>Ruta</dt><dd class="eg-muted">…/{h(partial)}</dd></div>
+    <div><dt>Suscriptores</dt><dd>{len(subscribers)}</dd></div>
+    <div><dt>Última actualización</dt><dd>{fmt_dt(last_update) if last_update else '—'}</dd></div>
+  </dl>
+  <p class="eg-muted">En operación local productiva, apunta DATABASE_PATH a una ruta fuera del repo. Ver README.</p>
+</section>
+{wp_section}"""
+
+
 def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
     rows = "".join(
         f"""
@@ -834,7 +905,9 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
   <td class="eg-muted">{h(item.get('source_page') or '—')}</td>
   <td>
     <form method="post" action="/admin/subscribers/{item['id']}/{'pause' if item['status'] == 'active' else 'reactivate'}">
-      <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">{'Pausar' if item['status'] == 'active' else 'Reactivar'}</button>
+      <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
+        {icon('pause', 14) if item['status'] == 'active' else icon('play', 14)}<span>{'Pausar' if item['status'] == 'active' else 'Reactivar'}</span>
+      </button>
     </form>
   </td>
 </tr>
@@ -860,24 +933,26 @@ def alert_actions(item: dict[str, Any]) -> str:
     status = item["status"]
     actions = [
         f'<a class="eg-btn eg-btn--primary eg-btn--sm" href="/admin/alerts/{alert_id}/preview-email">'
-        f'{icon("eye", 16)}<span>Vista previa</span></a>'
+        f'{icon("eye", 14)}<span>Vista previa</span></a>'
     ]
     if status == "pending_review":
         actions.append(
             f'<form method="post" action="/admin/alerts/{alert_id}/ready">'
-            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">Marcar lista</button></form>'
+            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">'
+            f'{icon("check", 14)}<span>Marcar lista</span></button></form>'
         )
     if status in {"ready_to_send", "ready"}:
         actions.append(
             f'<form method="post" action="/admin/alerts/{alert_id}/send" '
             f'onsubmit="return confirm(\'¿Enviar esta alerta a los suscriptores activos?\');">'
-            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">{icon("send", 16)}<span>Enviar</span></button></form>'
+            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">'
+            f'{icon("send", 14)}<span>Enviar</span></button></form>'
         )
-    # Enviar prueba (a TEST_EMAIL_TO o al correo escrito).
     actions.append(
         f'<form method="post" action="/admin/alerts/{alert_id}/test" class="eg-inline-form">'
         f'<input class="eg-input eg-input--sm" type="email" name="to" placeholder="correo de prueba" aria-label="Correo de prueba">'
-        f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">Enviar prueba</button></form>'
+        f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">'
+        f'{icon("mail", 14)}<span>Enviar prueba</span></button></form>'
     )
     return '<div class="eg-actions">' + "".join(actions) + "</div>"
 
@@ -921,14 +996,22 @@ def render_documents(documents: list[dict[str, Any]]) -> str:
   <td class="eg-muted">{h(item.get('publication_date') or '—')}</td>
   <td class="eg-muted">{h(item.get('dt_article_id'))}</td>
   <td>{pill(item['status'])}</td>
-  <td><a class="eg-link" href="{h(item['canonical_url'])}" target="_blank" rel="noreferrer">Ver en DT ↗</a></td>
+  <td>
+    <a class="eg-btn eg-btn--primary eg-btn--sm" href="{h(item['canonical_url'])}" target="_blank" rel="noreferrer">
+      {icon('external', 14)}<span>Ver en DT</span>
+    </a>
+  </td>
   <td>
     <div class="eg-actions">
       <form method="post" action="/admin/documents/{item['id']}/regenerate">
-        <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">Regenerar resumen</button>
+        <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
+          {icon('refresh', 14)}<span>Regenerar resumen</span>
+        </button>
       </form>
       <form method="post" action="/admin/documents/{item['id']}/ignore">
-        <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">Ignorar</button>
+        <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
+          {icon('x-circle', 14)}<span>Ignorar</span>
+        </button>
       </form>
     </div>
   </td>
@@ -987,7 +1070,8 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
     if alert["status"] == "pending_review":
         ready_btn = (
             f'<form method="post" action="/admin/alerts/{alert_id}/ready">'
-            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">Marcar lista</button></form>'
+            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">'
+            f'{icon("check", 15)}<span>Marcar lista</span></button></form>'
         )
 
     topbar = render_topbar(
@@ -1008,14 +1092,16 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
       <div><dt>Relevancia</dt><dd>{pill(alert['relevance'])}</dd></div>
       <div><dt>Fecha doc.</dt><dd>{h(alert.get('publication_date') or '—')}</dd></div>
       <div><dt>Asunto</dt><dd>{h(subject)}</dd></div>
-      <div><dt>Fuente</dt><dd><a class="eg-link" href="{h(alert['canonical_url'])}" target="_blank" rel="noreferrer">Ver en DT ↗</a></dd></div>
+      <div><dt>Fuente</dt><dd><a class="eg-btn eg-btn--primary eg-btn--sm" href="{h(alert['canonical_url'])}" target="_blank" rel="noreferrer">{icon('external', 14)}<span>Ver en DT</span></a></dd></div>
     </dl>
     <div class="eg-actions">
       <a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/alerts">{icon("back", 16)}<span>Volver a Alertas</span></a>
       {ready_btn}
       <form method="post" action="/admin/alerts/{alert_id}/test" class="eg-inline-form">
         <input class="eg-input eg-input--sm" type="email" name="to" placeholder="correo de prueba" aria-label="Correo de prueba">
-        <button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">Enviar prueba</button>
+        <button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">
+          {icon("mail", 15)}<span>Enviar prueba</span>
+        </button>
       </form>
     </div>
   </section>
@@ -1310,6 +1396,8 @@ body.eg {
 .eg-btn--secondary:hover { color: var(--eg-accent); border-color: var(--eg-border-accent); transform: translateY(-2px); }
 .eg-btn--sm { min-height: 38px; padding: 8px 16px; font-size: 14px; }
 .eg-btn--block { width: 100%; }
+button.eg-btn.eg-btn--secondary.eg-btn--sm { min-width: 150px; }
+a.eg-btn.eg-btn--primary.eg-btn--sm { color: white; }
 
 /* ---------- Card / Panel (9.6 / 8) ---------- */
 .eg-card {
@@ -1436,6 +1524,7 @@ body.eg {
 .eg-table td strong { color: var(--eg-text); font-weight: 700; }
 .eg-table td form { margin: 0; }
 .eg-muted { color: var(--eg-text-subtle); font-size: 13px; line-height: 1.45; margin: 4px 0 0; }
+p.eg-muted { max-height: 75px; overflow: hidden; }
 
 /* Pills de estado */
 .eg-pill {
@@ -1529,6 +1618,8 @@ html body main.eg-app {
 .eg-lastjob { width: min(1180px, calc(100% - 40px)); margin: 0 auto 18px; }
 .eg-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
 .eg-actions form { margin: 0; }
+.eg-alert__foot .eg-actions .eg-btn { font-size: 12px; }
+span.eg-alert__meta > span { font-size: 9px; padding: 1px 10px; }
 .eg-inline-form { display: flex; gap: 6px; align-items: center; }
 .eg-input--sm { min-height: 36px; padding: 6px 10px; font-size: 13px; max-width: 200px; border-radius: 10px; }
 
@@ -1618,6 +1709,10 @@ html body main.eg-app {
 .eg-side__link.is-active { background: var(--eg-cta); color: var(--eg-text-on-cta); }
 .eg-side__link:focus-visible { outline: 2px solid #24EBA1; outline-offset: 2px; }
 .eg-side__ic { display: inline-flex; }
+aside.eg-sidebar a { color: white; font-weight: 300; }
+aside.eg-sidebar a span.eg-side__ic { color: #31b78d; }
+aside.eg-sidebar a.eg-side__link.is-active span.eg-side__ic,
+aside.eg-sidebar a.eg-side__link.is-active { color: white; }
 .eg-side__status {
   margin-top: auto; display: flex; align-items: center; gap: 8px; font-size: 12.5px;
   color: rgba(255,255,255,.6); padding: 12px; border-top: 1px solid rgba(255,255,255,.08);

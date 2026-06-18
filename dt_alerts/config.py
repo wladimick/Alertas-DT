@@ -100,6 +100,12 @@ class Settings:
     whatsapp_access_token: str
     whatsapp_template_name: str
     whatsapp_language: str
+    # WordPress sync
+    wordpress_sync_enabled: bool
+    wordpress_api_url: str
+    wordpress_api_token: str
+    wordpress_sync_interval_minutes: int
+    wordpress_sync_limit: int
 
 
 def get_settings() -> Settings:
@@ -145,4 +151,10 @@ def get_settings() -> Settings:
             "WHATSAPP_TEMPLATE_NAME", "dt_alerta_normativa"
         ),
         whatsapp_language=os.getenv("WHATSAPP_LANGUAGE", "es"),
+        # WordPress sync (desactivado por defecto; no rompe si no está configurado)
+        wordpress_sync_enabled=env_bool("WORDPRESS_SYNC_ENABLED", False),
+        wordpress_api_url=os.getenv("WORDPRESS_API_URL", "").rstrip("/"),
+        wordpress_api_token=os.getenv("WORDPRESS_API_TOKEN", ""),
+        wordpress_sync_interval_minutes=env_int("WORDPRESS_SYNC_INTERVAL_MINUTES", 15),
+        wordpress_sync_limit=env_int("WORDPRESS_SYNC_LIMIT", 100),
     )

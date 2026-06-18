@@ -1,13 +1,16 @@
 from __future__ import annotations
 
+import json
 import tempfile
 import unittest
+import unittest.mock as mock
 from pathlib import Path
 
 from dt_alerts import db, notifier, worker
 from dt_alerts.config import get_settings
 from dt_alerts.dt_scraper import parse_listing
 from dt_alerts.summarizer import summarize_document
+from dt_alerts import wordpress_sync
 
 
 def settings_for(path: Path, **overrides):
@@ -128,6 +131,84 @@ class MvpTestCase(unittest.TestCase):
                         consent=False,
                     )
 
+    # --- Persistencia / listado de suscriptores ---
+    def _subscribe(self, conn, email, *, source_page="test"):
+        return db.upsert_subscriber(
+            conn, email=email, whatsapp=None, notify_email=True,
+            notify_whatsapp=False, source_page=source_page, consent=True,
+        )
+
+    def test_subscriber_appears_in_listing_and_metrics(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                self._subscribe(conn, "nuevo@empresa.cl")
+                subs = db.list_subscribers(conn)
+                active = sum(1 for s in subs if s["status"] == "active")
+        emails = [s["email"] for s in subs]
+        self.assertIn("nuevo@empresa.cl", emails)
+        self.assertEqual(active, 1)
+
+    def test_paused_subscriber_still_listed(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                sub = self._subscribe(conn, "pausado@empresa.cl")
+                db.set_subscriber_status(conn, sub["id"], "paused")
+                subs = db.list_subscribers(conn)
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0]["status"], "paused")
+
+    def test_source_page_is_saved(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                self._subscribe(conn, "src@empresa.cl", source_page="embed")
+                subs = db.list_subscribers(conn)
+        self.assertEqual(subs[0]["source_page"], "embed")
+
+    def test_resubscribe_without_source_keeps_original(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                self._subscribe(conn, "keep@empresa.cl", source_page="landing")
+                # Re-suscripción sin source_page no debe borrar el origen original.
+                db.upsert_subscriber(
+                    conn, email="keep@empresa.cl", whatsapp=None, notify_email=True,
+                    notify_whatsapp=False, source_page=None, consent=True,
+                )
+                subs = db.list_subscribers(conn)
+        self.assertEqual(subs[0]["source_page"], "landing")
+
+    def test_email_normalization_avoids_duplicates(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                self._subscribe(conn, "TEST@MAIL.COM")
+                self._subscribe(conn, "test@mail.com")
+                subs = db.list_subscribers(conn)
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0]["email"], "test@mail.com")
+
+    def test_existing_email_is_reactivated(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                sub = self._subscribe(conn, "vuelve@empresa.cl")
+                db.set_subscriber_status(conn, sub["id"], "paused")
+                # Volver a suscribirse debe reactivar el registro existente.
+                again = self._subscribe(conn, "vuelve@empresa.cl")
+                subs = db.list_subscribers(conn)
+        self.assertEqual(sub["id"], again["id"])
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0]["status"], "active")
+
     # --- Auth admin (etapa 2) ---
     def test_admin_auth_enabled_by_default(self) -> None:
         # Sin DISABLE_ADMIN_AUTH en entorno, el bypass debe estar apagado.
@@ -243,6 +324,138 @@ class MvpTestCase(unittest.TestCase):
         self.assertEqual(result.status, "pending_review")
         self.assertEqual(result.relevance, "alto")
         self.assertTrue(result.practical_impacts)
+
+
+class WordPressSyncTestCase(unittest.TestCase):
+    """Tests para dt_alerts.wordpress_sync."""
+
+    def _db_settings(self, tmp: str, **overrides) -> object:
+        path = Path(tmp) / "t.sqlite3"
+        db.init_db(path)
+        return settings_for(path, **overrides)
+
+    def test_sync_disabled_by_default(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._db_settings(tmp)
+        result = wordpress_sync.sync(settings)
+        self.assertEqual(result["status"], "disabled")
+        self.assertIsNone(result["error"])
+
+    def test_sync_misconfigured_without_url(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._db_settings(
+                tmp,
+                wordpress_sync_enabled=True,
+                wordpress_api_url="",
+                wordpress_api_token="",
+            )
+        result = wordpress_sync.sync(settings)
+        self.assertEqual(result["status"], "misconfigured")
+        self.assertIsNotNone(result["error"])
+
+    def _fake_response(self, subscribers: list[dict]) -> object:
+        payload = json.dumps({
+            "ok": True,
+            "total": len(subscribers),
+            "page": 1,
+            "limit": 100,
+            "subscribers": subscribers,
+        }).encode()
+        resp = mock.MagicMock()
+        resp.read.return_value = payload
+        resp.__enter__ = lambda s: s
+        resp.__exit__ = mock.MagicMock(return_value=False)
+        return resp
+
+    def test_sync_creates_subscriber_from_wordpress(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._db_settings(
+                tmp,
+                wordpress_sync_enabled=True,
+                wordpress_api_url="https://example.cl/wp-json/alertas-dt/v1",
+                wordpress_api_token="test-token",
+                wordpress_sync_limit=100,
+            )
+            fake = self._fake_response([{
+                "id": 1,
+                "email": "wp@empresa.cl",
+                "status": "active",
+                "consent": True,
+                "source_page": "home",
+                "source_url": "https://example.cl/",
+                "created_at": "2026-06-18 10:00:00",
+                "updated_at": "2026-06-18 10:00:00",
+            }])
+            with mock.patch("urllib.request.urlopen", return_value=fake):
+                result = wordpress_sync.sync(settings)
+
+            with db.connect(settings.database_path) as conn:
+                subs = db.list_subscribers(conn)
+
+        self.assertEqual(result["status"], "ok")
+        self.assertEqual(result["received"], 1)
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(subs[0]["email"], "wp@empresa.cl")
+
+    def test_sync_does_not_duplicate_existing_email(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._db_settings(
+                tmp,
+                wordpress_sync_enabled=True,
+                wordpress_api_url="https://example.cl/wp-json/alertas-dt/v1",
+                wordpress_api_token="test-token",
+                wordpress_sync_limit=100,
+            )
+            with db.connect(settings.database_path) as conn:
+                db.upsert_subscriber(
+                    conn, email="dup@empresa.cl", whatsapp=None,
+                    notify_email=True, notify_whatsapp=False,
+                    source_page="local", consent=True,
+                )
+
+            fake = self._fake_response([{
+                "id": 2, "email": "dup@empresa.cl", "status": "active",
+                "consent": True, "source_page": "wordpress",
+                "created_at": "2026-06-18 10:00:00", "updated_at": "2026-06-18 10:00:00",
+            }])
+            with mock.patch("urllib.request.urlopen", return_value=fake):
+                result = wordpress_sync.sync(settings)
+
+            with db.connect(settings.database_path) as conn:
+                subs = db.list_subscribers(conn)
+
+        self.assertEqual(len(subs), 1)
+        self.assertEqual(result["received"], 1)
+
+    def test_sync_http_error_recorded_without_raising(self):
+        import urllib.error
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._db_settings(
+                tmp,
+                wordpress_sync_enabled=True,
+                wordpress_api_url="https://example.cl/wp-json/alertas-dt/v1",
+                wordpress_api_token="bad-token",
+                wordpress_sync_limit=100,
+            )
+            with mock.patch(
+                "urllib.request.urlopen",
+                side_effect=urllib.error.HTTPError(None, 401, "Unauthorized", {}, None),
+            ):
+                result = wordpress_sync.sync(settings)
+
+        self.assertEqual(result["status"], "error")
+        self.assertIn("401", result["error"])
+
+    def test_sync_missing_token_stays_misconfigured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            settings = self._db_settings(
+                tmp,
+                wordpress_sync_enabled=True,
+                wordpress_api_url="https://example.cl/wp-json/alertas-dt/v1",
+                wordpress_api_token="",
+            )
+        result = wordpress_sync.sync(settings)
+        self.assertEqual(result["status"], "misconfigured")
 
 
 if __name__ == "__main__":

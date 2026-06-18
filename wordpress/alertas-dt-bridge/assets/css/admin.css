@@ -1,0 +1,103 @@
+/* Alertas DT — Admin Styles */
+
+.adt-admin { max-width: 900px; }
+
+.adt-version {
+  font-size: .75rem;
+  color: #666;
+  font-weight: 400;
+  margin-left: 8px;
+}
+
+.adt-cards {
+  display: grid;
+  grid-template-columns: repeat(auto-fill, minmax(220px, 1fr));
+  gap: 16px;
+  margin: 20px 0;
+}
+
+.adt-card {
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 20px;
+}
+
+.adt-card h2 {
+  margin: 0 0 12px;
+  font-size: 1rem;
+  font-weight: 600;
+  color: #1C2833;
+  border: none;
+  padding: 0;
+}
+
+.adt-stat {
+  font-size: 2rem;
+  font-weight: 700;
+  color: #1A5276;
+  margin: 0 0 4px;
+}
+
+.adt-muted { color: #717D7E; font-size: .875rem; margin: 4px 0 0; }
+
+.adt-badge {
+  display: inline-block;
+  padding: 3px 10px;
+  border-radius: 20px;
+  font-size: .75rem;
+  font-weight: 700;
+}
+
+.adt-badge--ok {
+  background: #EAFAF1;
+  color: #1E8449;
+  border: 1px solid #A9DFBF;
+}
+
+.adt-code {
+  display: block;
+  background: #F2F3F4;
+  border: 1px solid #D5D8DC;
+  border-radius: 4px;
+  padding: 8px 12px;
+  font-size: .875rem;
+  margin: 8px 0;
+  user-select: all;
+}
+
+.adt-section {
+  background: #fff;
+  border: 1px solid #ddd;
+  border-radius: 8px;
+  padding: 20px 24px;
+  margin: 20px 0;
+}
+
+.adt-section h2 {
+  margin: 0 0 16px;
+  font-size: 1.1rem;
+  font-weight: 600;
+  border-bottom: 1px solid #eee;
+  padding-bottom: 10px;
+}
+
+.adt-token-masked {
+  font-family: monospace;
+  background: #F2F3F4;
+  border: 1px solid #D5D8DC;
+  border-radius: 4px;
+  padding: 4px 10px;
+}
+
+.adt-pre {
+  background: #1C2833;
+  color: #ECF0F1;
+  border-radius: 6px;
+  padding: 16px;
+  font-size: .825rem;
+  line-height: 1.7;
+  overflow-x: auto;
+}
+
+.adt-pre em { color: #F39C12; font-style: normal; }

@@ -1,0 +1,19 @@
+# Bases SQLite locales (no versionar datos; ver README "Persistencia de suscriptores")
+data/*.sqlite3
+data/*.sqlite3-journal
+data/*.sqlite3-wal
+data/*.sqlite3-shm
+
+# Python
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# Entorno / secretos
+.env
+.env.*
+
+# SO / editor
+.DS_Store
