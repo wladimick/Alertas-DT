@@ -410,6 +410,44 @@ def render_login(error: str | None = None) -> str:
     return render_page("Admin", body, theme="dark")
 
 
+# Traducción de estados técnicos a microcopy ejecutivo (solo presentación;
+# los valores almacenados en la base NO cambian).
+STATUS_LABELS = {
+    # Suscriptores
+    "active": "Activo",
+    "paused": "Pausado",
+    # Documentos
+    "discovered": "Detectado",
+    "baseline": "Línea base",
+    "processed": "Procesado",
+    "ignored": "Ignorado",
+    "error": "Error",
+    # Alertas
+    "pending_review": "Pendiente de revisión",
+    "ready_to_send": "Lista para enviar",
+    "ready": "Lista para enviar",
+    "sent": "Enviada",
+    "failed": "Error",
+    # Jobs
+    "running": "En curso",
+    "success": "Éxito",
+    "partial": "Parcial",
+    # Envíos / deliveries
+    "simulated": "Simulada",
+    "skipped_missing_credentials": "No enviada: faltan credenciales",
+    # Relevancia
+    "alto": "Alta",
+    "medio": "Media",
+    "bajo": "Baja",
+}
+
+
+def status_label(value: Any) -> str:
+    """Etiqueta legible para un estado técnico; si no hay mapeo, devuelve el valor."""
+    v = str(value or "").strip()
+    return STATUS_LABELS.get(v, v or "—")
+
+
 def fmt_dt(value: Any) -> str:
     """Formatea timestamps ISO a algo legible (YYYY-MM-DD HH:MM)."""
     text = str(value or "")
@@ -417,9 +455,14 @@ def fmt_dt(value: Any) -> str:
 
 
 def pill(value: Any, label: Any = None) -> str:
-    """Pill de estado con color semántico via data-status (ver CSS)."""
+    """
+    Pill de estado con color semántico via data-status (ver CSS).
+    El texto se traduce con status_label; el data-status conserva el valor técnico
+    para el color, de modo que la lógica de estados no se ve afectada.
+    """
     v = str(value or "")
-    return f'<span class="eg-pill" data-status="{h(v)}">{h(label if label is not None else v)}</span>'
+    text = label if label is not None else status_label(v)
+    return f'<span class="eg-pill" data-status="{h(v)}">{h(text)}</span>'
 
 
 def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
