@@ -106,6 +106,12 @@ class Settings:
     wordpress_api_token: str
     wordpress_sync_interval_minutes: int
     wordpress_sync_limit: int
+    # IA (desactivada por defecto; no rompe nada si no está configurada)
+    ai_provider: str
+    ai_api_key: str
+    ai_model: str
+    ai_base_url: str
+    ai_summary_temperature: float
 
 
 def get_settings() -> Settings:
@@ -157,4 +163,10 @@ def get_settings() -> Settings:
         wordpress_api_token=os.getenv("WORDPRESS_API_TOKEN", ""),
         wordpress_sync_interval_minutes=env_int("WORDPRESS_SYNC_INTERVAL_MINUTES", 15),
         wordpress_sync_limit=env_int("WORDPRESS_SYNC_LIMIT", 100),
+        # IA (desactivada por defecto; listo para futura integración)
+        ai_provider=os.getenv("AI_PROVIDER", "disabled").strip().lower(),
+        ai_api_key=os.getenv("AI_API_KEY", ""),
+        ai_model=os.getenv("AI_MODEL", ""),
+        ai_base_url=os.getenv("AI_BASE_URL", "").rstrip("/"),
+        ai_summary_temperature=env_float("AI_SUMMARY_TEMPERATURE", 0.2),
     )

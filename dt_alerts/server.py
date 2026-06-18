@@ -16,6 +16,7 @@ from .notifier import (
     dispatch_alert,
     render_alert_email_html,
     render_alert_email_text,
+    send_email as send_notifier_email,
     send_test_alert_email,
     subject_for,
 )
@@ -80,7 +81,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.redirect("/admin", set_admin_cookie=True)
             else:
                 self.respond_html(render_login(settings=self.settings))
-        elif path in {"/admin", "/admin/subscribers", "/admin/alerts", "/admin/documents", "/admin/jobs"}:
+        elif path in {"/admin", "/admin/subscribers", "/admin/alerts", "/admin/documents", "/admin/jobs", "/admin/settings"}:
             if not self.is_admin():
                 self.redirect("/admin/login")
                 return
@@ -153,10 +154,24 @@ class AppHandler(BaseHTTPRequestHandler):
                 return
             with db.connect(self.settings.database_path) as conn:
                 alert = db.get_alert_with_document(conn, alert_id)
+                tmpl = db.get_setting(conn, "email_test_subject_template", "")
             if not alert:
                 self.redirect_flash("/admin/alerts", "Alerta no encontrada.")
                 return
-            result = send_test_alert_email(to_email, alert, self.settings)
+            if tmpl:
+                try:
+                    subject = tmpl.format(title=alert.get("title", "documento"))
+                except Exception:
+                    subject = f"[PRUEBA] {subject_for(alert)}"
+            else:
+                subject = f"[PRUEBA] {subject_for(alert)}"
+            result = send_notifier_email(
+                self.settings,
+                to=to_email,
+                subject=subject,
+                html_body=render_alert_email_html(alert),
+                text_body=render_alert_email_text(alert),
+            )
             self.redirect_flash("/admin/alerts", flash_for_email_result(result))
         elif match := re.match(r"^/admin/documents/(\d+)/regenerate$", path):
             self.require_admin()
@@ -188,6 +203,45 @@ class AppHandler(BaseHTTPRequestHandler):
             else:
                 msg = f"Error sincronizando WordPress: {result['error']}"
             self.redirect_flash("/admin/subscribers", msg)
+        elif path == "/admin/settings":
+            self.require_admin()
+            payload = self.read_payload()
+            editable_keys = {
+                "email_from_name", "email_from", "email_reply_to",
+                "email_subject_template", "email_test_subject_template", "email_footer_legal",
+            }
+            with db.connect(self.settings.database_path) as conn:
+                for key in editable_keys:
+                    if key in payload:
+                        db.set_setting(conn, key, (payload[key] or "").strip())
+            self.redirect_flash("/admin/settings", "Configuracion de email guardada.")
+        elif path == "/admin/settings/test-sendgrid":
+            self.require_admin()
+            to_email = self.settings.test_email_to
+            if not to_email:
+                self.redirect_flash(
+                    "/admin/settings",
+                    "Configura TEST_EMAIL_TO en .env para enviar la prueba SendGrid.",
+                )
+                return
+            result = send_notifier_email(
+                self.settings,
+                to=to_email,
+                subject="[Prueba SendGrid] Alertas DT - Configuracion verificada",
+                html_body=(
+                    "<p>Prueba de configuracion SendGrid desde Alertas DT.</p>"
+                    "<p>Si recibes este correo, el envio de alertas por email funciona correctamente.</p>"
+                ),
+                text_body=(
+                    "Prueba de configuracion SendGrid desde Alertas DT.\n"
+                    "Si recibes este correo, el envio de alertas por email funciona correctamente."
+                ),
+            )
+            self.redirect_flash("/admin/settings", flash_for_email_result(result))
+        elif path == "/admin/settings/test-wordpress":
+            self.require_admin()
+            msg = _test_wordpress_connection(self.settings)
+            self.redirect_flash("/admin/settings", msg)
         else:
             self.respond_not_found()
 
@@ -551,6 +605,28 @@ def fmt_dt(value: Any) -> str:
     return text.replace("T", " ")[:16] if text else "—"
 
 
+def mask_secret(value: str | None, visible_start: int = 6, visible_end: int = 4) -> str:
+    """Enmascara un secreto mostrando solo los primeros/últimos caracteres."""
+    if not value:
+        return "No configurado"
+    v = str(value)
+    if len(v) < 12:
+        return "••••••••"
+    dots = "•" * min(len(v) - visible_start - visible_end, 20)
+    return v[:visible_start] + dots + v[-visible_end:]
+
+
+# Defaults de plantillas de email (fallback si no hay valor en DB)
+EMAIL_SETTINGS_DEFAULTS: dict[str, str] = {
+    "email_subject_template": "Nueva normativa DT: {title}",
+    "email_test_subject_template": "[PRUEBA] Nueva normativa DT: {title}",
+    "email_footer_legal": (
+        "Este resumen es informativo y no reemplaza la lectura del documento oficial "
+        "ni asesoría profesional."
+    ),
+}
+
+
 def empty_row(colspan: int, title: str, hint: str) -> str:
     """Fila de tabla con estado vacío amigable (en vez de 'Sin datos')."""
     return (
@@ -592,6 +668,11 @@ ICONS = {
     "play": '<polygon points="5 3 19 12 5 21 5 3"/>',
     "x-circle": '<circle cx="12" cy="12" r="10"/><line x1="15" y1="9" x2="9" y2="15"/><line x1="9" y1="9" x2="15" y2="15"/>',
     "logout": '<path d="M9 21H5a2 2 0 0 1-2-2V5a2 2 0 0 1 2-2h4"/><polyline points="16 17 21 12 16 7"/><line x1="21" y1="12" x2="9" y2="12"/>',
+    "settings": '<circle cx="12" cy="12" r="3"/><path d="M19.4 15a1.65 1.65 0 0 0 .33 1.82l.06.06a2 2 0 0 1-2.83 2.83l-.06-.06a1.65 1.65 0 0 0-1.82-.33 1.65 1.65 0 0 0-1 1.51V21a2 2 0 0 1-4 0v-.09A1.65 1.65 0 0 0 9 19.4a1.65 1.65 0 0 0-1.82.33l-.06.06a2 2 0 0 1-2.83-2.83l.06-.06A1.65 1.65 0 0 0 4.68 15a1.65 1.65 0 0 0-1.51-1H3a2 2 0 0 1 0-4h.09A1.65 1.65 0 0 0 4.6 9a1.65 1.65 0 0 0-.33-1.82l-.06-.06a2 2 0 0 1 2.83-2.83l.06.06A1.65 1.65 0 0 0 9 4.68a1.65 1.65 0 0 0 1-1.51V3a2 2 0 0 1 4 0v.09a1.65 1.65 0 0 0 1 1.51 1.65 1.65 0 0 0 1.82-.33l.06-.06a2 2 0 0 1 2.83 2.83l-.06.06A1.65 1.65 0 0 0 19.4 9a1.65 1.65 0 0 0 1.51 1H21a2 2 0 0 1 0 4h-.09a1.65 1.65 0 0 0-1.51 1z"/>',
+    "database": '<ellipse cx="12" cy="5" rx="9" ry="3"/><path d="M21 12c0 1.66-4 3-9 3s-9-1.34-9-3"/><path d="M3 5v14c0 1.66 4 3 9 3s9-1.34 9-3V5"/>',
+    "wifi": '<path d="M5 12.55a11 11 0 0 1 14.08 0"/><path d="M1.42 9a16 16 0 0 1 21.16 0"/><path d="M8.53 16.11a6 6 0 0 1 6.95 0"/><circle cx="12" cy="20" r="1"/>',
+    "cpu": '<rect x="4" y="4" width="16" height="16" rx="2"/><rect x="9" y="9" width="6" height="6"/><path d="M9 1v3M15 1v3M9 20v3M15 20v3M1 9h3M1 15h3M20 9h3M20 15h3"/>',
+    "key": '<path d="M21 2l-2 2m-7.61 7.61a5.5 5.5 0 1 1-7.778 7.778 5.5 5.5 0 0 1 7.777-7.777zm0 0L15.5 7.5m0 0l3 3L22 7l-3-3m-3.5 3.5L19 4"/>',
 }
 
 
@@ -610,6 +691,7 @@ SECTION_META = {
     "/admin/documents": ("Documentos detectados", "Publicaciones DT encontradas por el monitoreo."),
     "/admin/alerts": ("Alertas", "Resúmenes generados, listos para revisar y enviar."),
     "/admin/jobs": ("Monitoreo", "Historial de ejecuciones del monitoreo DT."),
+    "/admin/settings": ("Configuración", "Estado técnico e integraciones de la aplicación."),
 }
 
 SIDEBAR_NAV = [
@@ -618,6 +700,7 @@ SIDEBAR_NAV = [
     ("/admin/documents", "Documentos", "document"),
     ("/admin/alerts", "Alertas", "bell"),
     ("/admin/jobs", "Monitoreo", "activity"),
+    ("/admin/settings", "Configuración", "settings"),
 ]
 
 
@@ -777,7 +860,13 @@ def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
     if flash:
         banner += f'<div class="eg-flash" role="status">{h(flash)}</div>'
 
-    if path == "/admin/subscribers":
+    if path == "/admin/settings":
+        title, subtitle = SECTION_META["/admin/settings"]
+        sidebar = render_sidebar(path, settings)
+        topbar = render_topbar(title, subtitle, settings, show_action=False)
+        content = banner + render_settings(settings) + MONITOR_SCRIPT
+        return render_page(title, content, sidebar=sidebar, topbar=topbar)
+    elif path == "/admin/subscribers":
         section = render_db_info(settings, subscribers) + render_subscribers(subscribers)
     elif path == "/admin/documents":
         section = render_documents(documents)
@@ -892,6 +981,286 @@ def render_db_info(settings: Settings, subscribers: list[dict[str, Any]]) -> str
   <p class="eg-muted">En operación local productiva, apunta DATABASE_PATH a una ruta fuera del repo. Ver README.</p>
 </section>
 {wp_section}"""
+
+
+def _test_wordpress_connection(settings: Settings) -> str:
+    """Prueba de conectividad con la API WordPress. Retorna mensaje para flash."""
+    import urllib.request, urllib.error  # noqa: E401
+    if not settings.wordpress_sync_enabled:
+        return "WordPress sync desactivado (WORDPRESS_SYNC_ENABLED=false)."
+    if not settings.wordpress_api_url:
+        return "WORDPRESS_API_URL no configurado."
+    url = f"{settings.wordpress_api_url}/subscribers?limit=1"
+    req = urllib.request.Request(
+        url,
+        headers={
+            "Authorization": f"Bearer {settings.wordpress_api_token}",
+            "Accept": "application/json",
+            "User-Agent": "AlertasDT-Sync/0.1",
+        },
+    )
+    try:
+        with urllib.request.urlopen(req, timeout=10) as resp:  # noqa: S310
+            code = resp.getcode()
+        return f"Conexion WordPress OK (HTTP {code})."
+    except urllib.error.HTTPError as e:
+        return f"Error HTTP {e.code} al conectar con WordPress."
+    except Exception as exc:
+        return f"Error al conectar con WordPress: {exc}"
+
+
+def render_settings(settings: Settings) -> str:
+    """Renderiza la página de Configuración técnica del admin."""
+    import datetime
+    import os
+
+    db_path = settings.database_path
+    db_exists = db_path.exists()
+    db_size = f"{db_path.stat().st_size / 1024:.1f} KB" if db_exists else "—"
+    db_mtime = ""
+    if db_exists:
+        import time
+        db_mtime = datetime.datetime.fromtimestamp(db_path.stat().st_mtime).strftime("%Y-%m-%d %H:%M")
+
+    project_root_str = str(db_path.resolve())
+    db_in_repo = "data/" in project_root_str or str(db_path).startswith("data/")
+
+    with db.connect(db_path) as conn:
+        n_subscribers = db.count_table(conn, "subscribers")
+        n_documents = db.count_table(conn, "documents")
+        n_alerts = db.count_table(conn, "alerts")
+        n_deliveries = db.count_table(conn, "deliveries")
+        n_jobs = db.count_table(conn, "job_runs")
+        last_delivery = db.last_delivery_sent_at(conn)
+        app_cfg = db.get_all_settings(conn)
+        wp_subscribers = db.count_table(conn, "subscribers")
+
+    wp_from_wp = sum(
+        1 for _ in [None]  # computed below via raw query
+    )
+    with db.connect(db_path) as conn:
+        wp_row = conn.execute(
+            "SELECT COUNT(*) AS n FROM subscribers WHERE source_page LIKE '%wordpress%' OR source_page LIKE '%wp%'"
+        ).fetchone()
+        wp_synced_count = int(wp_row["n"]) if wp_row else 0
+        last_wp_sync = conn.execute(
+            "SELECT updated_at FROM subscribers WHERE source_page LIKE '%wordpress%' OR source_page LIKE '%wp%' ORDER BY updated_at DESC LIMIT 1"
+        ).fetchone()
+        last_wp_sync_at = last_wp_sync["updated_at"] if last_wp_sync else None
+
+    # --- Estado general ---
+    auth_label, auth_key = auth_mode(settings)
+    now_str = datetime.datetime.now().strftime("%Y-%m-%d %H:%M:%S")
+    ambiente = os.getenv("APP_ENV", os.getenv("ENVIRONMENT", "development"))
+
+    section_general = f"""
+<section class="eg-card eg-panel">
+  <h2>{icon("cpu", 17)} Estado general</h2>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Modo de ejecucion</dt><dd>Local</dd>
+    <dt>APP_BASE_URL</dt><dd class="mono">{h(settings.app_base_url)}</dd>
+    <dt>APP_HOST</dt><dd class="mono">{h(settings.app_host)}</dd>
+    <dt>APP_PORT</dt><dd class="mono">{h(settings.app_port)}</dd>
+    <dt>Acceso admin</dt><dd>{pill(auth_key, auth_label)}</dd>
+    <dt>Fecha/hora sistema</dt><dd class="mono">{h(now_str)}</dd>
+    <dt>Ambiente</dt><dd class="mono">{h(ambiente)}</dd>
+  </dl>
+</section>
+"""
+
+    # --- SendGrid ---
+    email_label, email_key = email_mode(settings)
+    provider = settings.email_provider
+    if provider == "sendgrid" and settings.sendgrid_api_key:
+        sg_estado = pill("active", "Configurado")
+    elif provider == "sendgrid":
+        sg_estado = pill("error", "Sin credenciales")
+    else:
+        sg_estado = pill("simulated", f"{provider} (no SendGrid)")
+
+    sg_test_btn = ""
+    if settings.test_email_to:
+        sg_test_btn = f"""
+  <form method="post" action="/admin/settings/test-sendgrid" style="margin-top:14px">
+    <button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">
+      {icon("send", 14)}<span>Enviar prueba a {h(settings.test_email_to)}</span>
+    </button>
+  </form>"""
+    else:
+        sg_test_btn = (
+            '<p class="eg-muted" style="margin-top:10px;font-size:13px;">'
+            'Configura TEST_EMAIL_TO en .env para habilitar la prueba de envio.</p>'
+        )
+
+    section_sendgrid = f"""
+<section class="eg-card eg-panel">
+  <h2>{icon("mail", 17)} SendGrid</h2>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Estado</dt><dd>{sg_estado}</dd>
+    <dt>EMAIL_PROVIDER</dt><dd class="mono">{h(provider)}</dd>
+    <dt>SENDGRID_API_KEY</dt><dd class="mono">{h(mask_secret(settings.sendgrid_api_key))}</dd>
+    <dt>EMAIL_FROM</dt><dd class="mono">{h(settings.email_from or '—')}</dd>
+    <dt>EMAIL_FROM_NAME</dt><dd class="mono">{h(settings.email_from_name or '—')}</dd>
+    <dt>EMAIL_REPLY_TO</dt><dd class="mono">{h(settings.email_reply_to or '—')}</dd>
+    <dt>TEST_EMAIL_TO</dt><dd class="mono">{h(settings.test_email_to or '—')}</dd>
+    <dt>Ultimo envio</dt><dd class="mono">{h(fmt_dt(last_delivery) if last_delivery else '—')}</dd>
+  </dl>
+  {sg_test_btn}
+</section>
+"""
+
+    # --- Base de datos ---
+    db_warn = ""
+    if db_in_repo:
+        db_warn = (
+            '<div class="eg-settings-warn">'
+            'Para produccion local se recomienda mover la base de datos fuera del repositorio, '
+            'por ejemplo <code>/Users/Shared/AlertasDT/data/dt_alertas.sqlite3</code>.'
+            '</div>'
+        )
+
+    section_db = f"""
+<section class="eg-card eg-panel">
+  <h2>{icon("database", 17)} Base de datos</h2>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Motor</dt><dd>SQLite</dd>
+    <dt>DATABASE_PATH</dt><dd class="mono eg-muted">{h(str(db_path))}</dd>
+    <dt>Archivo existe</dt><dd>{pill('active','Si') if db_exists else pill('error','No')}</dd>
+    <dt>Tamano</dt><dd class="mono">{h(db_size)}</dd>
+    <dt>Ultima modificacion</dt><dd class="mono">{h(db_mtime or '—')}</dd>
+    <dt>Total suscriptores</dt><dd class="mono">{h(n_subscribers)}</dd>
+    <dt>Total documentos</dt><dd class="mono">{h(n_documents)}</dd>
+    <dt>Total alertas</dt><dd class="mono">{h(n_alerts)}</dd>
+    <dt>Total envios</dt><dd class="mono">{h(n_deliveries)}</dd>
+    <dt>Total jobs</dt><dd class="mono">{h(n_jobs)}</dd>
+  </dl>
+  {db_warn}
+</section>
+"""
+
+    # --- WordPress sync ---
+    if settings.wordpress_sync_enabled:
+        wp_status = pill("active", "Activo")
+    else:
+        wp_status = pill("paused", "Desactivado")
+
+    wp_token_masked = mask_secret(settings.wordpress_api_token)
+    wp_test_btn = (
+        '<form method="post" action="/admin/settings/test-wordpress" style="display:inline">'
+        f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">'
+        f'{icon("wifi", 14)}<span>Probar conexion</span></button></form>'
+        if settings.wordpress_sync_enabled
+        else ""
+    )
+    wp_sync_btn = (
+        '<form method="post" action="/admin/wordpress/sync" style="display:inline">'
+        f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">'
+        f'{icon("refresh", 14)}<span>Sincronizar ahora</span></button></form>'
+        if settings.wordpress_sync_enabled
+        else ""
+    )
+
+    section_wp = f"""
+<section class="eg-card eg-panel">
+  <h2>{icon("wifi", 17)} WordPress Sync</h2>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>WORDPRESS_SYNC_ENABLED</dt><dd>{wp_status}</dd>
+    <dt>WORDPRESS_API_URL</dt><dd class="mono">{h(settings.wordpress_api_url or '—')}</dd>
+    <dt>WORDPRESS_API_TOKEN</dt><dd class="mono">{h(wp_token_masked)}</dd>
+    <dt>Intervalo sync</dt><dd class="mono">{h(settings.wordpress_sync_interval_minutes)} min</dd>
+    <dt>Limite por sync</dt><dd class="mono">{h(settings.wordpress_sync_limit)}</dd>
+    <dt>Ultima sincronizacion</dt><dd class="mono">{h(fmt_dt(last_wp_sync_at) if last_wp_sync_at else '—')}</dd>
+    <dt>Suscriptores sincronizados</dt><dd class="mono">{h(wp_synced_count)}</dd>
+  </dl>
+  <div class="eg-actions" style="margin-top:14px">{wp_test_btn}{wp_sync_btn}</div>
+</section>
+"""
+
+    # --- Conexión IA ---
+    ai_provider = settings.ai_provider
+    if ai_provider == "disabled" or not ai_provider:
+        ai_estado = pill("paused", "Desactivada")
+    elif settings.ai_api_key:
+        ai_estado = pill("active", "Configurada")
+    else:
+        ai_estado = pill("error", "Sin API key")
+
+    section_ai = f"""
+<section class="eg-card eg-panel">
+  <h2>{icon("cpu", 17)} Conexion IA</h2>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Estado</dt><dd>{ai_estado}</dd>
+    <dt>AI_PROVIDER</dt><dd class="mono">{h(ai_provider or 'disabled')}</dd>
+    <dt>AI_MODEL</dt><dd class="mono">{h(settings.ai_model or '—')}</dd>
+    <dt>AI_BASE_URL</dt><dd class="mono">{h(settings.ai_base_url or '—')}</dd>
+    <dt>AI_API_KEY</dt><dd class="mono">{h(mask_secret(settings.ai_api_key))}</dd>
+    <dt>Ultima prueba IA</dt><dd class="mono">—</dd>
+  </dl>
+  <div style="margin-top:14px">
+    <button class="eg-btn eg-btn--secondary eg-btn--sm" type="button" disabled>
+      {icon("cpu", 14)}<span>Probar conexion IA</span>
+    </button>
+    <p class="eg-muted" style="margin-top:8px;font-size:13px;">
+      La prueba de IA se activara en la siguiente etapa.
+    </p>
+  </div>
+</section>
+"""
+
+    # --- Email y plantillas (editable) ---
+    def _field(key: str, label: str, placeholder: str, env_val: str, multiline: bool = False) -> str:
+        stored = app_cfg.get(key, "")
+        val = stored if stored else env_val
+        if multiline:
+            return (
+                f'<div class="eg-field">'
+                f'<label class="eg-label" for="cfg-{h(key)}">{h(label)}'
+                f'<span class="eg-label-hint">{h("desde .env" if not stored else "guardado")}</span>'
+                f'</label>'
+                f'<textarea class="eg-input eg-input--mono" id="cfg-{h(key)}" name="{h(key)}" rows="2"'
+                f' placeholder="{h(placeholder)}">{h(val)}</textarea>'
+                f'</div>'
+            )
+        return (
+            f'<div class="eg-field">'
+            f'<label class="eg-label" for="cfg-{h(key)}">{h(label)}'
+            f'<span class="eg-label-hint">{h("desde .env" if not stored else "guardado")}</span>'
+            f'</label>'
+            f'<input class="eg-input eg-input--mono" id="cfg-{h(key)}" name="{h(key)}" type="text"'
+            f' value="{h(val)}" placeholder="{h(placeholder)}">'
+            f'</div>'
+        )
+
+    tmpl_default = EMAIL_SETTINGS_DEFAULTS["email_subject_template"]
+    test_tmpl_default = EMAIL_SETTINGS_DEFAULTS["email_test_subject_template"]
+    footer_default = EMAIL_SETTINGS_DEFAULTS["email_footer_legal"]
+
+    fields_html = (
+        _field("email_from_name", "Nombre del remitente", "Alertas DT", settings.email_from_name)
+        + _field("email_from", "Email remitente", "alertas@example.com", settings.email_from)
+        + _field("email_reply_to", "Email responder a", "soporte@example.com", settings.email_reply_to)
+        + _field("email_subject_template", "Asunto (correo real)", tmpl_default, tmpl_default)
+        + _field("email_test_subject_template", "Asunto (correo de prueba)", test_tmpl_default, test_tmpl_default)
+        + _field("email_footer_legal", "Texto legal del footer", footer_default, footer_default, multiline=True)
+    )
+
+    section_email = f"""
+<section class="eg-card eg-panel">
+  <h2>{icon("mail", 17)} Email y plantillas</h2>
+  <p class="eg-muted">
+    Estos valores anulan el <code>.env</code> para el envio de emails. Si se dejan en blanco, se usan los valores de las variables de entorno.
+    No guardes API keys en este formulario.
+  </p>
+  <form method="post" action="/admin/settings">
+    {fields_html}
+    <button class="eg-btn eg-btn--primary" type="submit">
+      {icon("check", 15)}<span>Guardar configuracion</span>
+    </button>
+  </form>
+</section>
+"""
+
+    return section_general + section_sendgrid + section_db + section_wp + section_ai + section_email
 
 
 def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
@@ -1796,6 +2165,61 @@ aside.eg-sidebar a.eg-side__link.is-active { color: white; }
   .eg-content { padding: 16px; }
   .eg-preview-grid { grid-template-columns: 1fr; }
 }
+
+/* =====================================================================
+   Pagina de Configuracion (/admin/settings)
+   ===================================================================== */
+.eg-kv--2col {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 0;
+  margin: 0 0 12px;
+}
+.eg-kv--2col dt, .eg-kv--2col dd {
+  padding: 9px 0;
+  border-bottom: 1px solid var(--eg-border);
+  font-size: 13.5px;
+  margin: 0;
+}
+.eg-kv--2col dt {
+  font-weight: 600;
+  color: var(--eg-text);
+  padding-right: 16px;
+}
+.eg-kv--2col dd {
+  color: var(--eg-text-muted);
+}
+.eg-kv--2col dt:last-of-type, .eg-kv--2col dd:last-of-type { border-bottom: 0; }
+.eg-kv--2col .mono { font-family: monospace; font-size: 13px; word-break: break-all; }
+.mono { font-family: monospace; font-size: 13px; }
+
+.eg-settings-warn {
+  margin-top: 12px;
+  background: color-mix(in srgb, #C56A14 12%, transparent);
+  border: 1px solid color-mix(in srgb, #C56A14 35%, transparent);
+  border-radius: 10px;
+  padding: 10px 14px;
+  font-size: 13px;
+  color: #7A3E06;
+  line-height: 1.5;
+}
+.eg-settings-warn code {
+  font-family: monospace;
+  background: rgba(0,0,0,.07);
+  padding: 1px 5px;
+  border-radius: 4px;
+}
+
+.eg-label-hint {
+  margin-left: 8px;
+  font-size: 11px;
+  font-weight: 400;
+  color: var(--eg-text-subtle);
+  text-transform: uppercase;
+  letter-spacing: .04em;
+}
+.eg-input--mono { font-family: monospace; font-size: 13px; }
+textarea.eg-input { resize: vertical; min-height: 56px; }
 """
 
 

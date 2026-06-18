@@ -458,5 +458,188 @@ class WordPressSyncTestCase(unittest.TestCase):
         self.assertEqual(result["status"], "misconfigured")
 
 
+class SettingsTestCase(unittest.TestCase):
+    """Tests para /admin/settings, mask_secret y configuracion de email."""
+
+    def _db_path(self, tmp: str) -> Path:
+        path = Path(tmp) / "t.sqlite3"
+        db.init_db(path)
+        return path
+
+    # -- 1. mask_secret no expone secretos completos --
+    def test_mask_secret_hides_middle_of_key(self):
+        from dt_alerts.server import mask_secret
+        key = "SG.DKEhABCDEFGHIJKLMNOPQRSTUVWXYZXen1"
+        masked = mask_secret(key, visible_start=6, visible_end=4)
+        self.assertFalse(masked.startswith("No configurado"))
+        self.assertNotIn(key, masked)
+        self.assertIn("•", masked)
+        self.assertTrue(masked.startswith(key[:6]))
+        self.assertTrue(masked.endswith(key[-4:]))
+
+    def test_mask_secret_empty_shows_not_configured(self):
+        from dt_alerts.server import mask_secret
+        self.assertEqual(mask_secret(None), "No configurado")
+        self.assertEqual(mask_secret(""), "No configurado")
+
+    def test_mask_secret_short_value_is_fully_hidden(self):
+        from dt_alerts.server import mask_secret
+        self.assertEqual(mask_secret("abc123"), "••••••••")
+
+    # -- 2. /admin/settings requiere login --
+    def test_settings_route_requires_login(self):
+        import http.client, threading
+        from http.server import ThreadingHTTPServer
+        from dt_alerts.server import AppHandler
+
+        class _H(AppHandler):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            _H.settings = settings_for(path, disable_admin_auth=False)
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+            t = threading.Thread(target=server.serve_forever)
+            t.daemon = True
+            t.start()
+            try:
+                port = server.server_address[1]
+                conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn.request("GET", "/admin/settings")
+                resp = conn.getresponse()
+                self.assertIn(resp.status, (302, 303))
+                location = resp.getheader("Location", "")
+                self.assertIn("/admin/login", location)
+            finally:
+                server.shutdown()
+
+    # -- 3. /admin/settings renderiza estados tecnicos --
+    def test_settings_renders_technical_status(self):
+        from dt_alerts.server import render_settings
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path)
+            html = render_settings(s)
+        self.assertIn("Estado general", html)
+        self.assertIn("SendGrid", html)
+        self.assertIn("Base de datos", html)
+        self.assertIn("WordPress", html)
+        self.assertIn("Conexion IA", html)
+        self.assertIn("Email y plantillas", html)
+
+    # -- 4. Sin SendGrid key, muestra "No configurado" --
+    def test_settings_shows_not_configured_when_no_sendgrid_key(self):
+        from dt_alerts.server import render_settings
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, sendgrid_api_key="")
+            html = render_settings(s)
+        self.assertIn("No configurado", html)
+
+    # -- 5. Con SendGrid key, muestra valor enmascarado (no la key completa) --
+    def test_settings_masks_sendgrid_key(self):
+        from dt_alerts.server import render_settings
+        key = "SG.TestKey1234567890Abc"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, sendgrid_api_key=key, email_provider="sendgrid")
+            html = render_settings(s)
+        self.assertNotIn(key, html)
+        self.assertIn("••", html)
+        self.assertIn(key[:6], html)
+
+    # -- 6. Settings de email se guardan y se leen --
+    def test_email_settings_save_and_read(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                db.set_setting(conn, "email_from_name", "Alertas Test")
+                db.set_setting(conn, "email_subject_template", "Test: {title}")
+                db.set_setting(conn, "email_footer_legal", "Solo informativo.")
+
+            with db.connect(path) as conn:
+                all_cfg = db.get_all_settings(conn)
+
+        self.assertEqual(all_cfg["email_from_name"], "Alertas Test")
+        self.assertEqual(all_cfg["email_subject_template"], "Test: {title}")
+        self.assertEqual(all_cfg["email_footer_legal"], "Solo informativo.")
+
+    # -- 7. Asunto de prueba usa template configurado si existe --
+    def test_test_subject_uses_db_template_when_configured(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                db.set_setting(conn, "email_test_subject_template", "[CUSTOM] {title}")
+
+            with db.connect(path) as conn:
+                tmpl = db.get_setting(conn, "email_test_subject_template", "")
+
+        self.assertTrue(tmpl)
+        subject = tmpl.format(title="Circular 42")
+        self.assertEqual(subject, "[CUSTOM] Circular 42")
+
+    def test_test_subject_falls_back_to_default_when_no_db_template(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                tmpl = db.get_setting(conn, "email_test_subject_template", "")
+
+        # Sin template en DB, tmpl es cadena vacia -> se usa el default
+        self.assertEqual(tmpl, "")
+        # El fallback en server.py usa subject_for() -> "Nueva normativa DT: ..."
+        default_subject = f"[PRUEBA] {notifier.subject_for({'title': 'Circular 42'})}"
+        self.assertEqual(default_subject, "[PRUEBA] Nueva normativa DT: Circular 42")
+
+    # -- 8. No se rompe el envio actual si no hay settings en DB --
+    def test_send_alert_not_broken_without_db_settings(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            settings = settings_for(path, email_provider="console")
+            alert = {
+                "title": "Doc sin settings",
+                "category": "Circulares",
+                "publication_date": "01/01/2026",
+                "relevance": "medio",
+                "status": "ready_to_send",
+                "summary": "Resumen del documento.",
+                "key_points_json": "[]",
+                "practical_impacts_json": "[]",
+                "canonical_url": "https://example.com",
+            }
+            result = notifier.send_email(
+                settings,
+                to="test@example.com",
+                subject=notifier.subject_for(alert),
+                html_body=notifier.render_alert_email_html(alert),
+                text_body=notifier.render_alert_email_text(alert),
+            )
+        self.assertEqual(result["status"], "simulated")
+
+    def test_app_settings_table_exists_after_init(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                row = conn.execute(
+                    "SELECT name FROM sqlite_master WHERE type='table' AND name='app_settings'"
+                ).fetchone()
+        self.assertIsNotNone(row)
+
+    def test_get_setting_returns_default_when_missing(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                val = db.get_setting(conn, "nonexistent_key", "default_val")
+        self.assertEqual(val, "default_val")
+
+    def test_set_setting_updates_existing_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                db.set_setting(conn, "my_key", "first")
+                db.set_setting(conn, "my_key", "second")
+                val = db.get_setting(conn, "my_key")
+        self.assertEqual(val, "second")
+
+
 if __name__ == "__main__":
     unittest.main()
