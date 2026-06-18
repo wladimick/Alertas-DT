@@ -113,6 +113,12 @@ def migrate(conn: sqlite3.Connection) -> None:
             error TEXT
         );
 
+        CREATE TABLE IF NOT EXISTS app_settings (
+            key TEXT PRIMARY KEY,
+            value TEXT,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_subscribers_status ON subscribers(status);
         CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
         CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
@@ -549,3 +555,41 @@ def latest_jobs(conn: sqlite3.Connection, limit: int = 10) -> list[dict[str, Any
         "SELECT * FROM job_runs ORDER BY started_at DESC LIMIT ?", (limit,)
     ).fetchall()
     return [dict(row) for row in rows]
+
+
+# --------------------------------------------------------------------------
+# app_settings — configuración operativa no sensible (no API keys)
+# --------------------------------------------------------------------------
+
+def get_setting(conn: sqlite3.Connection, key: str, default: str | None = None) -> str | None:
+    row = conn.execute("SELECT value FROM app_settings WHERE key = ?", (key,)).fetchone()
+    return row["value"] if row else default
+
+
+def set_setting(conn: sqlite3.Connection, key: str, value: str) -> None:
+    now = utcnow()
+    conn.execute(
+        """
+        INSERT INTO app_settings (key, value, updated_at) VALUES (?, ?, ?)
+        ON CONFLICT(key) DO UPDATE SET value = excluded.value, updated_at = excluded.updated_at
+        """,
+        (key, value, now),
+    )
+    conn.commit()
+
+
+def get_all_settings(conn: sqlite3.Connection) -> dict[str, str]:
+    rows = conn.execute("SELECT key, value FROM app_settings").fetchall()
+    return {row["key"]: row["value"] for row in rows}
+
+
+def count_table(conn: sqlite3.Connection, table: str) -> int:
+    row = conn.execute(f"SELECT COUNT(*) AS n FROM {table}").fetchone()  # noqa: S608
+    return int(row["n"])
+
+
+def last_delivery_sent_at(conn: sqlite3.Connection) -> str | None:
+    row = conn.execute(
+        "SELECT sent_at FROM deliveries WHERE status IN ('sent','simulated') ORDER BY sent_at DESC LIMIT 1"
+    ).fetchone()
+    return row["sent_at"] if row else None
