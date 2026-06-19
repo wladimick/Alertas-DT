@@ -22,6 +22,8 @@ from .notifier import (
 )
 from .worker import regenerate_alert, run_check, scheduler_loop
 from . import wordpress_sync
+from .summarizer import _generate_and_save as _ai_generate_direct
+from .notifier import generate_executive_summary_html, generate_detailed_summary_html
 
 
 def h(value: Any) -> str:
@@ -92,6 +94,16 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.redirect("/admin/login")
                 return
             self.respond_html(render_alert_preview(int(match.group(1)), self.settings))
+        elif match := re.match(r"^/admin/alerts/(\d+)/executive-summary$", path):
+            if not self.is_admin():
+                self.redirect("/admin/login")
+                return
+            self._serve_summary_attachment(int(match.group(1)), kind="executive")
+        elif match := re.match(r"^/admin/alerts/(\d+)/detailed-summary$", path):
+            if not self.is_admin():
+                self.redirect("/admin/login")
+                return
+            self._serve_summary_attachment(int(match.group(1)), kind="detailed")
         else:
             self.respond_not_found()
 
@@ -173,6 +185,58 @@ class AppHandler(BaseHTTPRequestHandler):
                 text_body=render_alert_email_text(alert),
             )
             self.redirect_flash("/admin/alerts", flash_for_email_result(result))
+        elif match := re.match(r"^/admin/alerts/(\d+)/generate-ai$", path):
+            self.require_admin()
+            alert_id = int(match.group(1))
+            with db.connect(self.settings.database_path) as conn:
+                alert = db.get_alert_with_document(conn, alert_id)
+            if not alert:
+                self.redirect_flash("/admin/alerts", "Alerta no encontrada.")
+                return
+            document_id = alert["document_id"]
+            try:
+                with db.connect(self.settings.database_path) as conn:
+                    app_settings = db.get_all_settings(conn)
+                    summary = _ai_generate_direct(conn, document_id, self.settings, app_settings, force=False)
+                    db.create_or_update_alert(
+                        conn, document_id,
+                        summary=summary.summary,
+                        key_points=summary.key_points,
+                        practical_impacts=summary.practical_impacts,
+                        relevance=summary.relevance,
+                        status="pending_review",
+                        ai_error=summary.ai_error,
+                    )
+                msg = "Resumen IA generado. Alerta pendiente de revisión."
+            except Exception as exc:
+                msg = f"Error al generar resumen IA: {exc}"
+            self.redirect_flash("/admin/alerts", msg)
+        elif match := re.match(r"^/admin/alerts/(\d+)/regenerate-ai$", path):
+            self.require_admin()
+            alert_id = int(match.group(1))
+            with db.connect(self.settings.database_path) as conn:
+                alert = db.get_alert_with_document(conn, alert_id)
+            if not alert:
+                self.redirect_flash("/admin/alerts", "Alerta no encontrada.")
+                return
+            document_id = alert["document_id"]
+            try:
+                with db.connect(self.settings.database_path) as conn:
+                    app_settings = db.get_all_settings(conn)
+                    summary = _ai_generate_direct(conn, document_id, self.settings, app_settings, force=True)
+                    db.create_or_update_alert(
+                        conn, document_id,
+                        summary=summary.summary,
+                        key_points=summary.key_points,
+                        practical_impacts=summary.practical_impacts,
+                        relevance=summary.relevance,
+                        status="pending_review",
+                        ai_error=summary.ai_error,
+                    )
+                msg = "Resumen IA regenerado. Alerta vuelve a pendiente de revisión."
+            except Exception as exc:
+                msg = f"Error al regenerar resumen IA: {exc}"
+            self.redirect_flash("/admin/alerts", msg)
         elif match := re.match(r"^/admin/documents/(\d+)/regenerate$", path):
             self.require_admin()
             document_id = int(match.group(1))
@@ -209,12 +273,19 @@ class AppHandler(BaseHTTPRequestHandler):
             editable_keys = {
                 "email_from_name", "email_from", "email_reply_to",
                 "email_subject_template", "email_test_subject_template", "email_footer_legal",
+                # IA editable (no sensible — no API keys)
+                "ai_system_prompt", "ai_summary_style", "ai_review_required",
+                "ai_attachments_enabled", "ai_email_intro_template", "ai_footer_disclaimer",
             }
             with db.connect(self.settings.database_path) as conn:
                 for key in editable_keys:
                     if key in payload:
                         db.set_setting(conn, key, (payload[key] or "").strip())
-            self.redirect_flash("/admin/settings", "Configuracion de email guardada.")
+            section = payload.get("_section", "email")
+            if section == "ai":
+                self.redirect_flash("/admin/settings", "Configuracion IA guardada.")
+            else:
+                self.redirect_flash("/admin/settings", "Configuracion de email guardada.")
         elif path == "/admin/settings/test-sendgrid":
             self.require_admin()
             to_email = self.settings.test_email_to
@@ -241,6 +312,14 @@ class AppHandler(BaseHTTPRequestHandler):
         elif path == "/admin/settings/test-wordpress":
             self.require_admin()
             msg = _test_wordpress_connection(self.settings)
+            self.redirect_flash("/admin/settings", msg)
+        elif path == "/admin/settings/test-ai":
+            self.require_admin()
+            with db.connect(self.settings.database_path) as conn:
+                app_settings = db.get_all_settings(conn)
+            msg = _test_ai_connection(self.settings, app_settings)
+            with db.connect(self.settings.database_path) as conn:
+                db.set_setting(conn, "ai_last_test", f"{db.utcnow()} · {msg[:100]}")
             self.redirect_flash("/admin/settings", msg)
         else:
             self.respond_not_found()
@@ -374,6 +453,27 @@ class AppHandler(BaseHTTPRequestHandler):
                 render_page("Error", body),
                 status=HTTPStatus.BAD_REQUEST,
             )
+
+    def _serve_summary_attachment(self, alert_id: int, kind: str) -> None:
+        with db.connect(self.settings.database_path) as conn:
+            alert = db.get_alert_with_document(conn, alert_id)
+        if not alert:
+            self.respond_not_found()
+            return
+        document_id = alert.get("document_id") or alert_id
+        if kind == "executive":
+            content = generate_executive_summary_html(document_id, alert)
+            filename = f"resumen_ejecutivo_{document_id}.html"
+        else:
+            content = generate_detailed_summary_html(document_id, alert)
+            filename = f"resumen_detallado_{document_id}.html"
+        raw = content.encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/html; charset=utf-8")
+        self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
 
     def log_message(self, format: str, *args: Any) -> None:
         print(f"{self.address_string()} - {format % args}")
@@ -1067,6 +1167,32 @@ def _test_wordpress_connection(settings: Settings) -> str:
         return f"Error al conectar con WordPress: {exc}"
 
 
+def _test_ai_connection(settings: Settings, app_settings: dict) -> str:
+    """Test AI connectivity. Returns flash message. Never logs API key."""
+    from .summarizer import call_ai
+    provider = settings.ai_provider.lower()
+    if provider == "disabled" or not provider:
+        return "IA desactivada (AI_PROVIDER=disabled). Configura AI_PROVIDER=openai o azure."
+    if not settings.ai_api_key:
+        return "Sin API key: configura AI_API_KEY en el archivo .env."
+    if provider == "azure" and not settings.ai_base_url:
+        return "Azure requiere AI_BASE_URL configurado en el archivo .env."
+    try:
+        raw = call_ai(
+            "Eres un asistente de prueba.",
+            'Responde solo con este JSON válido: {"ok": true}',
+            settings,
+        )
+        if "ok" in raw.lower() or "true" in raw.lower():
+            return f"Conexión IA OK ({provider}, modelo: {settings.ai_model or 'default'})."
+        return f"Respuesta IA recibida pero inesperada ({provider})."
+    except Exception as exc:
+        error_msg = str(exc)
+        if settings.ai_api_key and settings.ai_api_key in error_msg:
+            error_msg = error_msg.replace(settings.ai_api_key, "[REDACTED]")
+        return f"Error IA: {error_msg[:200]}"
+
+
 def render_settings(settings: Settings) -> str:
     """Renderiza la página de Configuración técnica del admin."""
     import datetime
@@ -1238,10 +1364,77 @@ def render_settings(settings: Settings) -> str:
     ai_provider = settings.ai_provider
     if ai_provider == "disabled" or not ai_provider:
         ai_estado = pill("paused", "Desactivada")
+        ai_estado_key = "paused"
     elif settings.ai_api_key:
         ai_estado = pill("active", "Configurada")
+        ai_estado_key = "active"
     else:
         ai_estado = pill("error", "Sin API key")
+        ai_estado_key = "error"
+
+    ai_last_test = app_cfg.get("ai_last_test", "")
+    ai_test_btn = ""
+    if ai_provider not in ("disabled", "") and settings.ai_api_key:
+        ai_test_btn = f"""
+  <form method="post" action="/admin/settings/test-ai" style="display:inline">
+    <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
+      {icon("cpu", 14)}<span>Probar conexion IA</span>
+    </button>
+  </form>"""
+    else:
+        ai_test_btn = (
+            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="button" disabled>'
+            f'{icon("cpu", 14)}<span>Probar conexion IA</span></button>'
+            f'<p class="eg-muted" style="margin-top:8px;font-size:13px;">'
+            f'Configura AI_PROVIDER y AI_API_KEY en .env para habilitar la prueba.</p>'
+        )
+
+    # Defaults para campos IA editables
+    AI_DEFAULTS = {
+        "ai_summary_style": "Profesional, claro, orientado a contadores y empresas chilenas.",
+        "ai_review_required": "true",
+        "ai_attachments_enabled": "true",
+        "ai_email_intro_template": (
+            "Hemos detectado una nueva publicación normativa relevante. "
+            "A continuación encontrarás un resumen breve y los impactos prácticos "
+            "para la gestión contable."
+        ),
+        "ai_footer_disclaimer": (
+            "Este resumen es informativo y no reemplaza la lectura del documento oficial "
+            "ni asesoría profesional."
+        ),
+    }
+
+    def _ai_field(key: str, label: str, multiline: bool = False, rows: int = 2) -> str:
+        stored = app_cfg.get(key, "")
+        val = stored if stored else AI_DEFAULTS.get(key, "")
+        hint = "guardado" if stored else "por defecto"
+        if multiline:
+            return (
+                f'<div class="eg-field">'
+                f'<label class="eg-label" for="cfg-{h(key)}">{h(label)}'
+                f'<span class="eg-label-hint">{hint}</span></label>'
+                f'<textarea class="eg-input eg-input--mono" id="cfg-{h(key)}" name="{h(key)}" '
+                f'rows="{rows}">{h(val)}</textarea>'
+                f'</div>'
+            )
+        return (
+            f'<div class="eg-field">'
+            f'<label class="eg-label" for="cfg-{h(key)}">{h(label)}'
+            f'<span class="eg-label-hint">{hint}</span></label>'
+            f'<input class="eg-input eg-input--mono" id="cfg-{h(key)}" name="{h(key)}" '
+            f'type="text" value="{h(val)}">'
+            f'</div>'
+        )
+
+    ai_editable_fields = (
+        _ai_field("ai_summary_style", "Estilo editorial", multiline=True, rows=2)
+        + _ai_field("ai_system_prompt", "Instrucciones adicionales al sistema", multiline=True, rows=3)
+        + _ai_field("ai_email_intro_template", "Intro del correo", multiline=True, rows=2)
+        + _ai_field("ai_footer_disclaimer", "Aviso legal del footer", multiline=True, rows=2)
+        + _ai_field("ai_review_required", "Revisión requerida antes de envío (true/false)")
+        + _ai_field("ai_attachments_enabled", "Adjuntos habilitados (true/false)")
+    )
 
     section_ai = f"""
 <section class="eg-card eg-panel">
@@ -1252,16 +1445,27 @@ def render_settings(settings: Settings) -> str:
     <dt>AI_MODEL</dt><dd class="mono">{h(settings.ai_model or '—')}</dd>
     <dt>AI_BASE_URL</dt><dd class="mono">{h(settings.ai_base_url or '—')}</dd>
     <dt>AI_API_KEY</dt><dd class="mono">{h(mask_secret(settings.ai_api_key))}</dd>
-    <dt>Ultima prueba IA</dt><dd class="mono">—</dd>
+    <dt>AI_TIMEOUT_SECONDS</dt><dd class="mono">{h(settings.ai_timeout_seconds)}</dd>
+    <dt>AI_MAX_INPUT_CHARS</dt><dd class="mono">{h(settings.ai_max_input_chars)}</dd>
+    <dt>AI_ATTACHMENTS_ENABLED</dt><dd class="mono">{h(str(settings.ai_attachments_enabled).lower())}</dd>
+    <dt>Ultima prueba IA</dt><dd class="mono">{h(ai_last_test or '—')}</dd>
   </dl>
-  <div style="margin-top:14px">
-    <button class="eg-btn eg-btn--secondary eg-btn--sm" type="button" disabled>
-      {icon("cpu", 14)}<span>Probar conexion IA</span>
+  <div class="eg-actions" style="margin-top:14px">{ai_test_btn}</div>
+</section>
+
+<section class="eg-card eg-panel">
+  <h2>{icon("cpu", 17)} IA · Configuracion editorial</h2>
+  <p class="eg-muted">
+    Estos valores controlan el comportamiento editorial de la IA. No incluyas API keys aquí.
+    Los cambios se guardan en la base de datos y anulan los valores por defecto.
+  </p>
+  <form method="post" action="/admin/settings">
+    <input type="hidden" name="_section" value="ai">
+    {ai_editable_fields}
+    <button class="eg-btn eg-btn--primary" type="submit">
+      {icon("check", 15)}<span>Guardar configuracion IA</span>
     </button>
-    <p class="eg-muted" style="margin-top:8px;font-size:13px;">
-      La prueba de IA se activara en la siguiente etapa.
-    </p>
-  </div>
+  </form>
 </section>
 """
 
@@ -1355,10 +1559,27 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
 """
 
 
+AI_STATUS_LABELS = {
+    "success": ("IA generada", "eg-badge--active"),
+    "fallback": ("Fallback local", "eg-badge--paused"),
+    "error": ("IA con error", "eg-badge--danger"),
+    "pending": ("IA pendiente", "eg-badge--pending"),
+}
+
+
+def ai_status_badge(item: dict[str, Any]) -> str:
+    ai_st = item.get("ai_status") or ""
+    if not ai_st:
+        return ""
+    label, cls = AI_STATUS_LABELS.get(ai_st, (ai_st, "eg-badge--baseline"))
+    return f'<span class="eg-badge {cls} eg-badge--no-dot">{h(label)}</span>'
+
+
 def alert_actions(item: dict[str, Any]) -> str:
     alert_id = item["id"]
     status = item["status"]
-    main_btns = [
+    ai_st = item.get("ai_status") or ""
+    main_btns: list[str] = [
         f'<a class="eg-btn eg-btn--primary eg-btn--sm" href="/admin/alerts/{alert_id}/preview-email">'
         f'{icon("eye", 14)}<span>Vista previa</span></a>'
     ]
@@ -1374,6 +1595,28 @@ def alert_actions(item: dict[str, Any]) -> str:
             f'onsubmit="return confirm(\'¿Enviar esta alerta a los suscriptores activos?\');">'
             f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
             f'{icon("send", 14)}<span>Enviar</span></button></form>'
+        )
+    # AI actions
+    if not ai_st:
+        main_btns.append(
+            f'<form method="post" action="/admin/alerts/{alert_id}/generate-ai">'
+            f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
+            f'{icon("cpu", 14)}<span>Generar con IA</span></button></form>'
+        )
+    else:
+        main_btns.append(
+            f'<form method="post" action="/admin/alerts/{alert_id}/regenerate-ai">'
+            f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
+            f'{icon("refresh", 14)}<span>Regenerar con IA</span></button></form>'
+        )
+    if ai_st in ("success", "fallback"):
+        main_btns.append(
+            f'<a class="eg-btn eg-ghost eg-btn--sm" href="/admin/alerts/{alert_id}/executive-summary" download>'
+            f'{icon("document", 14)}<span>Resumen ejecutivo</span></a>'
+        )
+        main_btns.append(
+            f'<a class="eg-btn eg-ghost eg-btn--sm" href="/admin/alerts/{alert_id}/detailed-summary" download>'
+            f'{icon("document", 14)}<span>Resumen detallado</span></a>'
         )
     test_form = (
         f'<form method="post" action="/admin/alerts/{alert_id}/test" class="eg-test-row">'
@@ -1395,6 +1638,7 @@ def alert_card(item: dict[str, Any]) -> str:
       <div class="eg-alert-chips">
         {rel_badge(item['relevance'])}
         {badge(item['status'])}
+        {ai_status_badge(item)}
       </div>
     </div>
     <h3 class="eg-alert-title">{h(item['title'])}</h3>
@@ -1494,16 +1738,6 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
         or (settings.email_provider == "resend" and settings.resend_api_key)
         or (settings.email_provider == "smtp" and settings.smtp_host)
     )
-    if real_send:
-        send_note = (
-            '<div class="eg-flash">Envío real habilitado '
-            f"({h(settings.email_provider)}). El botón “Enviar prueba” envía un correo de verdad.</div>"
-        )
-    else:
-        send_note = (
-            '<div class="eg-flash">El envío está en modo simulado. '
-            "Configura SendGrid en Render para habilitar correos reales.</div>"
-        )
 
     ready_btn = ""
     if alert["status"] == "pending_review":
@@ -1512,6 +1746,92 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
             f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">'
             f'{icon("check", 15)}<span>Marcar lista</span></button></form>'
         )
+
+    ai_st = alert.get("ai_status") or ""
+    ai_panel = ""
+    if ai_st:
+        ai_label, _ = AI_STATUS_LABELS.get(ai_st, (ai_st, ""))
+        ai_panel = f"""
+<section class="eg-card eg-panel">
+  <p class="eg-eyebrow">Inteligencia Artificial</p>
+  <h2>Estado del resumen IA</h2>
+  <p class="eg-devbanner" style="font-size:13px;font-weight:600;">
+    Contenido generado con apoyo de IA. Debe ser revisado antes de su envío.
+  </p>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Estado IA</dt><dd>{h(ai_label)}</dd>
+    <dt>Proveedor</dt><dd class="mono">{h(alert.get('ai_provider') or '—')}</dd>
+    <dt>Modelo</dt><dd class="mono">{h(alert.get('ai_model') or '—')}</dd>
+    <dt>Calidad</dt><dd class="mono">{h(alert.get('ai_content_quality') or '—')}</dd>
+    <dt>Generado</dt><dd class="mono">{fmt_dt(alert.get('ai_updated_at'))}</dd>
+    <dt>Error</dt><dd class="eg-muted mono" style="font-size:12px;">{h((alert.get('ai_summary_error') or '—')[:120])}</dd>
+  </dl>
+  <div class="eg-actions" style="margin-top:12px;">
+    <a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/alerts/{alert_id}/executive-summary" download>
+      {icon("document", 14)}<span>Descargar resumen ejecutivo</span>
+    </a>
+    <a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/alerts/{alert_id}/detailed-summary" download>
+      {icon("document", 14)}<span>Descargar resumen detallado</span>
+    </a>
+    <form method="post" action="/admin/alerts/{alert_id}/regenerate-ai" style="display:inline;">
+      <button class="eg-btn eg-ghost eg-btn--sm" type="submit">{icon("refresh", 14)}<span>Regenerar con IA</span></button>
+    </form>
+  </div>
+</section>"""
+
+    # Executive summary inline
+    exec_panel = ""
+    raw_exec = alert.get("ai_executive_summary") or ""
+    if raw_exec:
+        try:
+            exec_data = json.loads(raw_exec)
+        except Exception:
+            exec_data = {"title": "Resumen ejecutivo", "body": raw_exec}
+        exec_panel = f"""
+<section class="eg-card eg-panel">
+  <p class="eg-eyebrow">Adjunto</p>
+  <h2>{h(exec_data.get('title') or 'Resumen ejecutivo')}</h2>
+  <p style="font-size:14px;line-height:1.6;color:#3C4A52;">{h((exec_data.get('body') or '')[:1200])}</p>
+</section>"""
+
+    # Detailed summary inline
+    detail_panel = ""
+    raw_detail = alert.get("ai_detailed_summary_json") or ""
+    if raw_detail:
+        try:
+            detail_data = json.loads(raw_detail)
+        except Exception:
+            detail_data = {"title": "Resumen detallado", "sections": []}
+        sections_html = ""
+        for s in (detail_data.get("sections") or [])[:4]:
+            heading = h(s.get("heading") or "")
+            body_t = h((s.get("body") or "")[:600])
+            if heading:
+                sections_html += f'<h3 style="font-size:14px;color:#0A2231;margin:12px 0 4px;">{heading}</h3>'
+            if body_t:
+                sections_html += f'<p style="font-size:14px;color:#3C4A52;margin:0 0 8px;">{body_t}</p>'
+        detail_panel = f"""
+<section class="eg-card eg-panel">
+  <p class="eg-eyebrow">Adjunto</p>
+  <h2>{h(detail_data.get('title') or 'Resumen detallado')}</h2>
+  {sections_html}
+</section>"""
+
+    # Attachments status
+    ai_attach = ""
+    if ai_st in ("success", "fallback") and settings.ai_attachments_enabled:
+        doc_id = alert.get("document_id") or alert_id
+        ai_attach = f"""
+<section class="eg-card eg-panel">
+  <p class="eg-eyebrow">Adjuntos</p>
+  <h2>Estado de adjuntos</h2>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Resumen ejecutivo</dt><dd>{badge('active', 'Preparado')}</dd>
+    <dt>Resumen detallado</dt><dd>{badge('active', 'Preparado')}</dd>
+    <dt>Documento oficial</dt><dd>{badge('simulated', 'Enlace en correo') if not alert.get('pdf_url') else badge('active', 'PDF disponible')}</dd>
+  </dl>
+  <p class="eg-muted">Los adjuntos se incluyen automáticamente en el envío cuando AI_ATTACHMENTS_ENABLED=true.</p>
+</section>"""
 
     topbar = render_topbar(
         "Vista previa de email",
@@ -1564,6 +1884,10 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
     </details>
   </section>
 </div>
+{ai_panel}
+{exec_panel}
+{detail_panel}
+{ai_attach}
 """
     return render_page("Vista previa de email", body, sidebar=sidebar, topbar=topbar)
 

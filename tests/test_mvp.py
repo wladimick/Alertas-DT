@@ -641,5 +641,403 @@ class SettingsTestCase(unittest.TestCase):
         self.assertEqual(val, "second")
 
 
+class AIIntegrationTestCase(unittest.TestCase):
+    """17 tests para la capa de IA (feat/ai-summary-generation)."""
+
+    def _sample_doc_dict(self) -> dict:
+        return {
+            "dt_article_id": "ai-test-777",
+            "canonical_url": "https://www.dt.gob.cl/legislacion/1624/w3-article-ai777.html",
+            "source_url": "https://www.dt.gob.cl/x.html",
+            "category": "Circulares",
+            "title": "Circular sobre registro electronico laboral",
+            "publication_date": "01/01/2026",
+            "abstract": "Instruye criterios sobre el registro electronico laboral.",
+            "detail_text": "Las empresas deben registrar jornadas. Multas por incumplimiento.",
+            "pdf_url": None,
+            "content_hash": None,
+        }
+
+    def _db_path(self, tmp: str) -> Path:
+        path = Path(tmp) / "t.sqlite3"
+        db.init_db(path)
+        return path
+
+    def _insert_doc(self, conn, **overrides) -> int:
+        doc = {**self._sample_doc_dict(), **overrides}
+        doc_id, _ = db.upsert_document(conn, doc)
+        return doc_id
+
+    # --- 1. IA disabled usa fallback y no rompe ---
+    def test_01_ai_disabled_uses_fallback_and_doesnt_break(self):
+        settings = settings_for(Path(":memory:"), ai_provider="disabled", ai_api_key="")
+        result = summarize_document(self._sample_doc_dict(), settings)
+        self.assertIsNotNone(result.summary)
+        self.assertIsInstance(result.key_points, list)
+        self.assertEqual(result.status, "pending_review")
+
+    # --- 2. mask_secret no expone API keys ---
+    def test_02_mask_secret_does_not_expose_ai_key(self):
+        from dt_alerts.server import mask_secret
+        key = "sk-12345678901234567890abcdef"
+        masked = mask_secret(key)
+        self.assertNotIn(key, masked)
+        self.assertIn("•", masked)
+
+    # --- 3. Prompt IA contiene estructura esperada ---
+    def test_03_ai_prompt_contains_expected_structure(self):
+        from dt_alerts.summarizer import build_ai_prompt
+        settings = settings_for(
+            Path(":memory:"),
+            ai_provider="openai",
+            ai_max_input_chars=45000,
+            ai_timeout_seconds=60,
+        )
+        system_prompt, user_prompt = build_ai_prompt(self._sample_doc_dict(), settings, {})
+        for field in ("email_subject", "executive_summary", "detailed_summary",
+                      "key_points", "practical_impacts", "relevance", "JSON"):
+            self.assertIn(field, user_prompt, f"user_prompt should contain '{field}'")
+        self.assertIn("contadores", system_prompt.lower())
+
+    # --- 4. Parser valida JSON correcto ---
+    def test_04_parse_ai_response_valid_json(self):
+        from dt_alerts.summarizer import parse_ai_response, validate_ai_summary
+        raw = json.dumps({
+            "title": "Circular DT",
+            "category": "Circulares",
+            "relevance": "alto",
+            "email_subject": "Nueva normativa DT: Circular",
+            "email_summary": "Resumen breve.",
+            "key_points": ["Punto 1"],
+            "practical_impacts": [{"title": "Impacto", "description": "Desc"}],
+            "recommended_actions": ["Accion 1"],
+            "executive_summary": {"title": "Resumen eje", "body": "Cuerpo."},
+            "detailed_summary": {"title": "Detalle", "sections": []},
+            "tags": ["DT"],
+            "legal_disclaimer": "Informativo.",
+        })
+        parsed = parse_ai_response(raw)
+        self.assertIsInstance(parsed, dict)
+        self.assertEqual(parsed["relevance"], "alto")
+        validated = validate_ai_summary(parsed)
+        self.assertEqual(validated["relevance"], "alto")
+        self.assertEqual(validated["email_subject"], "Nueva normativa DT: Circular")
+
+    # --- 5. Parser maneja JSON invalido sin romper ---
+    def test_05_parse_ai_response_invalid_json_no_crash(self):
+        from dt_alerts.summarizer import parse_ai_response
+        self.assertEqual(parse_ai_response("esto no es json {{{{"), {})
+        self.assertEqual(parse_ai_response(""), {})
+        self.assertEqual(parse_ai_response(None), {})
+
+    # --- 6. Resumen IA se guarda en DB ---
+    def test_06_ai_summary_saved_to_db(self):
+        from dt_alerts.summarizer import generate_ai_summary
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                db.update_document_processed(
+                    conn, doc_id,
+                    status="processed",
+                    detail_text="Texto de prueba.",
+                    pdf_url=None,
+                    content_hash=None,
+                    last_error=None,
+                )
+            settings = settings_for(
+                path, ai_provider="disabled", ai_max_input_chars=45000,
+                ai_timeout_seconds=60, ai_attachments_enabled=True,
+            )
+            generate_ai_summary(doc_id, settings=settings)
+            with db.connect(path) as conn:
+                ai_row = db.get_ai_summary(conn, doc_id)
+        self.assertIsNotNone(ai_row)
+        self.assertIn(ai_row["status"], ("fallback", "success"))
+        self.assertIsNotNone(ai_row["email_summary"])
+
+    # --- 7. Regenerar IA actualiza resumen existente (un solo row por documento) ---
+    def test_07_regenerate_ai_updates_existing(self):
+        from dt_alerts.summarizer import generate_ai_summary, regenerate_ai_summary
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                db.update_document_processed(
+                    conn, doc_id, status="processed", detail_text="Texto.",
+                    pdf_url=None, content_hash=None, last_error=None,
+                )
+            settings = settings_for(
+                path, ai_provider="disabled", ai_max_input_chars=45000,
+                ai_timeout_seconds=60, ai_attachments_enabled=True,
+            )
+            generate_ai_summary(doc_id, settings=settings)
+            regenerate_ai_summary(doc_id, settings=settings)
+            with db.connect(path) as conn:
+                count = conn.execute(
+                    "SELECT COUNT(*) AS n FROM ai_summaries WHERE document_id=?", (doc_id,)
+                ).fetchone()["n"]
+        self.assertEqual(count, 1)
+
+    # --- 8. Alertas quedan pending_review tras generar IA ---
+    def test_08_alerts_stay_pending_review_after_ai_generation(self):
+        from dt_alerts.summarizer import generate_ai_summary
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                db.update_document_processed(
+                    conn, doc_id, status="processed", detail_text="Texto.",
+                    pdf_url=None, content_hash=None, last_error=None,
+                )
+            settings = settings_for(
+                path, ai_provider="disabled", ai_max_input_chars=45000,
+                ai_timeout_seconds=60, ai_attachments_enabled=True,
+            )
+            summary = generate_ai_summary(doc_id, settings=settings)
+            with db.connect(path) as conn:
+                alert_id = db.create_or_update_alert(
+                    conn, doc_id,
+                    summary=summary.summary,
+                    key_points=summary.key_points,
+                    practical_impacts=summary.practical_impacts,
+                    relevance=summary.relevance,
+                    status="pending_review",
+                    ai_error=summary.ai_error,
+                )
+                alert = db.get_alert_with_document(conn, alert_id)
+        self.assertEqual(alert["status"], "pending_review")
+
+    # --- 9. Email usa email_subject generado por IA si existe ---
+    def test_09_email_uses_ai_subject_when_available(self):
+        alert = {
+            "title": "Circular normal",
+            "ai_email_subject": "Nueva normativa DT: Circular especial IA",
+            "ai_status": "success",
+            "summary": "Resumen basico.",
+        }
+        subject = notifier.subject_for(alert)
+        self.assertEqual(subject, "Nueva normativa DT: Circular especial IA")
+
+    # --- 10. Email usa template de fallback si no hay subject IA ---
+    def test_10_email_uses_fallback_subject_when_no_ai_subject(self):
+        alert = {
+            "title": "Circular sin IA",
+            "ai_email_subject": None,
+            "ai_status": None,
+            "summary": "Resumen basico.",
+        }
+        subject = notifier.subject_for(alert)
+        self.assertIn("Circular sin IA", subject)
+        self.assertIn("Nueva normativa DT", subject)
+
+    # --- 11. Adjuntos HTML se generan sin exponer secretos ---
+    def test_11_html_attachments_no_secrets(self):
+        fake_key = "sk-secreto-muy-largo-12345678"
+        alert = {
+            "title": "Circular DT",
+            "category": "Circulares",
+            "publication_date": "01/01/2026",
+            "canonical_url": "https://example.com",
+            "summary": "Resumen.",
+            "ai_status": "success",
+            "ai_executive_summary": json.dumps(
+                {"title": "Resumen ejecutivo", "body": "Cuerpo del ejecutivo."}
+            ),
+            "ai_detailed_summary_json": json.dumps({
+                "title": "Resumen detallado",
+                "sections": [{"heading": "Sec", "body": "Detalle."}],
+            }),
+            "ai_legal_disclaimer": "Solo informativo.",
+            "ai_key_points_json": "[]",
+            "ai_recommended_actions_json": "[]",
+        }
+        exec_html = notifier.generate_executive_summary_html(1, alert)
+        detail_html = notifier.generate_detailed_summary_html(1, alert)
+        self.assertIn("Resumen ejecutivo", exec_html)
+        self.assertIn("Resumen detallado", detail_html)
+        self.assertNotIn(fake_key, exec_html)
+        self.assertNotIn(fake_key, detail_html)
+        self.assertIn("<!doctype html", exec_html.lower())
+
+    # --- 12. Error IA queda registrado en ai_summaries ---
+    def test_12_ai_error_is_recorded(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                db.update_document_processed(
+                    conn, doc_id, status="processed", detail_text="Texto.",
+                    pdf_url=None, content_hash=None, last_error=None,
+                )
+                settings = settings_for(
+                    path,
+                    ai_provider="openai",
+                    ai_api_key="fake-key-that-will-fail",
+                    ai_max_input_chars=45000,
+                    ai_timeout_seconds=5,
+                    ai_attachments_enabled=True,
+                )
+                with mock.patch("urllib.request.urlopen", side_effect=Exception("HTTP 401")):
+                    summary = _generate_and_save(conn, doc_id, settings, {})
+                ai_row = db.get_ai_summary(conn, doc_id)
+        self.assertIsNotNone(ai_row)
+        self.assertIn(ai_row["status"], ("fallback", "error"))
+        self.assertIsNotNone(ai_row["error"])
+        self.assertNotIn("fake-key-that-will-fail", ai_row.get("error") or "")
+
+    # --- 13. /admin/settings muestra estado IA completo ---
+    def test_13_settings_renders_full_ai_section(self):
+        from dt_alerts.server import render_settings
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(
+                path,
+                ai_provider="openai",
+                ai_api_key="sk-test123456789",
+                ai_model="gpt-4o-mini",
+                ai_timeout_seconds=60,
+                ai_max_input_chars=45000,
+                ai_attachments_enabled=True,
+            )
+            html_out = render_settings(s)
+        self.assertIn("AI_PROVIDER", html_out)
+        self.assertIn("AI_MODEL", html_out)
+        self.assertIn("AI_TIMEOUT_SECONDS", html_out)
+        self.assertIn("AI_ATTACHMENTS_ENABLED", html_out)
+        self.assertNotIn("sk-test123456789", html_out)
+
+    # --- 14. /admin/alerts muestra badge de estado IA ---
+    def test_14_alerts_shows_ai_status_badge(self):
+        from dt_alerts.server import render_alerts, ai_status_badge
+        item = {
+            "id": 1,
+            "document_id": 1,
+            "title": "Circular DT",
+            "category": "Circulares",
+            "publication_date": "01/01/2026",
+            "relevance": "alto",
+            "status": "pending_review",
+            "summary": "Resumen.",
+            "key_points_json": "[]",
+            "practical_impacts_json": "[]",
+            "canonical_url": "https://example.com",
+            "created_at": "2026-06-19T10:00:00",
+            "ai_status": "success",
+            "ai_provider": "openai",
+            "ai_content_quality": "full",
+            "ai_email_subject": "Nueva normativa",
+            "ai_summary_error": None,
+        }
+        badge_html = ai_status_badge(item)
+        self.assertTrue(badge_html, "ai_status_badge must return non-empty HTML for status='success'")
+        html_out = render_alerts([item])
+        self.assertIn("IA", html_out)
+
+    # --- 15. Preview muestra resumen ejecutivo y detallado ---
+    def test_15_preview_shows_executive_and_detailed_summary(self):
+        from dt_alerts.server import render_alert_preview
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                db.update_document_processed(
+                    conn, doc_id, status="processed", detail_text="Texto.",
+                    pdf_url=None, content_hash=None, last_error=None,
+                )
+                db.upsert_ai_summary(
+                    conn, doc_id,
+                    provider="openai", model="gpt-4o-mini",
+                    status="success", content_quality="full",
+                    relevance="alto",
+                    email_subject="Nueva normativa DT: Circular",
+                    email_summary="Resumen IA breve.",
+                    key_points_json='["Punto 1"]',
+                    practical_impacts_json='[{"title": "Impacto", "description": "Desc"}]',
+                    recommended_actions_json='["Accion 1"]',
+                    executive_summary=json.dumps(
+                        {"title": "Resumen ejecutivo", "body": "Cuerpo ejecutivo."}
+                    ),
+                    detailed_summary_json=json.dumps({
+                        "title": "Detalle",
+                        "sections": [{"heading": "Sec", "body": "Cuerpo."}],
+                    }),
+                    tags_json='["DT"]',
+                    legal_disclaimer="Solo informativo.",
+                    error=None,
+                )
+                alert_id = db.create_or_update_alert(
+                    conn, doc_id,
+                    summary="Resumen basico.",
+                    key_points=["Punto 1"],
+                    practical_impacts=["Impacto"],
+                    relevance="alto",
+                    status="pending_review",
+                    ai_error=None,
+                )
+            settings = settings_for(path, ai_attachments_enabled=True)
+            html_out = render_alert_preview(alert_id, settings)
+        self.assertIn("Resumen ejecutivo", html_out)
+        self.assertIn("Resumen detallado", html_out)
+        self.assertIn("Inteligencia Artificial", html_out)
+
+    # --- 16. El envio masivo NO se dispara automaticamente tras generar IA ---
+    def test_16_generate_ai_does_not_auto_send(self):
+        from dt_alerts.summarizer import generate_ai_summary
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                db.update_document_processed(
+                    conn, doc_id, status="processed", detail_text="Texto.",
+                    pdf_url=None, content_hash=None, last_error=None,
+                )
+                db.upsert_subscriber(
+                    conn, email="sub@empresa.cl", whatsapp=None,
+                    notify_email=True, notify_whatsapp=False,
+                    source_page="test", consent=True,
+                )
+                alert_id = db.create_or_update_alert(
+                    conn, doc_id,
+                    summary="Resumen.", key_points=[], practical_impacts=[],
+                    relevance="medio", status="pending_review", ai_error=None,
+                )
+            settings = settings_for(
+                path, ai_provider="disabled", ai_max_input_chars=45000,
+                ai_timeout_seconds=60, ai_attachments_enabled=True,
+            )
+            generate_ai_summary(doc_id, settings=settings)
+            with db.connect(path) as conn:
+                deliveries = conn.execute(
+                    "SELECT COUNT(*) AS n FROM deliveries"
+                ).fetchone()["n"]
+                alert = db.get_alert_with_document(conn, alert_id)
+        self.assertEqual(deliveries, 0)
+        self.assertEqual(alert["status"], "pending_review")
+
+    # --- 17. Si no hay PDF oficial, el email incluye link oficial ---
+    def test_17_email_has_official_link_when_no_pdf(self):
+        alert = {
+            "title": "Circular sin PDF",
+            "category": "Circulares",
+            "publication_date": "01/01/2026",
+            "relevance": "medio",
+            "status": "pending_review",
+            "summary": "Resumen sin PDF.",
+            "key_points_json": "[]",
+            "practical_impacts_json": "[]",
+            "canonical_url": "https://www.dt.gob.cl/legislacion/1624/w3-article-999.html",
+            "pdf_url": None,
+            "ai_status": None,
+            "ai_email_subject": None,
+        }
+        html_out = notifier.render_alert_email_html(alert)
+        text_out = notifier.render_alert_email_text(alert)
+        self.assertIn("dt.gob.cl", html_out)
+        self.assertIn("dt.gob.cl", text_out)
+        self.assertIn("Ver documento oficial", html_out)
+
+
 if __name__ == "__main__":
     unittest.main()

@@ -112,6 +112,9 @@ class Settings:
     ai_model: str
     ai_base_url: str
     ai_summary_temperature: float
+    ai_timeout_seconds: int
+    ai_max_input_chars: int
+    ai_attachments_enabled: bool
 
 
 def get_settings() -> Settings:
@@ -163,10 +166,13 @@ def get_settings() -> Settings:
         wordpress_api_token=os.getenv("WORDPRESS_API_TOKEN", ""),
         wordpress_sync_interval_minutes=env_int("WORDPRESS_SYNC_INTERVAL_MINUTES", 15),
         wordpress_sync_limit=env_int("WORDPRESS_SYNC_LIMIT", 100),
-        # IA (desactivada por defecto; listo para futura integración)
+        # IA (desactivada por defecto; listo para integración)
         ai_provider=os.getenv("AI_PROVIDER", "disabled").strip().lower(),
         ai_api_key=os.getenv("AI_API_KEY", ""),
         ai_model=os.getenv("AI_MODEL", ""),
         ai_base_url=os.getenv("AI_BASE_URL", "").rstrip("/"),
         ai_summary_temperature=env_float("AI_SUMMARY_TEMPERATURE", 0.2),
+        ai_timeout_seconds=env_int("AI_TIMEOUT_SECONDS", 60),
+        ai_max_input_chars=env_int("AI_MAX_INPUT_CHARS", 45000),
+        ai_attachments_enabled=env_bool("AI_ATTACHMENTS_ENABLED", True),
     )
