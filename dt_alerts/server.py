@@ -105,6 +105,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.redirect("/admin/login")
                 return
             self._serve_summary_attachment(int(match.group(1)), kind="detailed")
+        elif path == "/admin/settings/ai-usage.csv":
+            if not self.is_admin():
+                self.redirect("/admin/login")
+                return
+            self._serve_ai_usage_csv()
         else:
             self.respond_not_found()
 
@@ -319,12 +324,21 @@ class AppHandler(BaseHTTPRequestHandler):
             self.require_admin()
             msg = _test_wordpress_connection(self.settings)
             self.redirect_flash("/admin/settings", msg)
+        elif path == "/admin/settings/ai-enable":
+            self.require_admin()
+            with db.connect(self.settings.database_path) as conn:
+                db.set_setting(conn, "ai_runtime_enabled", "true")
+            self.redirect_flash("/admin/settings", "Integración IA activada desde el panel.")
+        elif path == "/admin/settings/ai-disable":
+            self.require_admin()
+            with db.connect(self.settings.database_path) as conn:
+                db.set_setting(conn, "ai_runtime_enabled", "false")
+            self.redirect_flash("/admin/settings", "Integración IA apagada desde el panel. No se llamará a la API.")
         elif path == "/admin/settings/test-ai":
             self.require_admin()
             with db.connect(self.settings.database_path) as conn:
                 app_settings = db.get_all_settings(conn)
-            msg = _test_ai_connection(self.settings, app_settings)
-            with db.connect(self.settings.database_path) as conn:
+                msg = _test_ai_connection(self.settings, app_settings, conn)
                 db.set_setting(conn, "ai_last_test", f"{db.utcnow()} · {msg[:100]}")
             self.redirect_flash("/admin/settings", msg)
         else:
@@ -477,6 +491,33 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _serve_ai_usage_csv(self) -> None:
+        import csv
+        import io
+        COLS = ["id", "created_at", "operation", "status", "provider", "model",
+                "input_tokens", "output_tokens", "total_tokens", "error"]
+        with db.connect(self.settings.database_path) as conn:
+            rows = conn.execute(
+                f"SELECT {', '.join(COLS)} FROM ai_usage_logs ORDER BY id DESC LIMIT 1000"  # noqa: S608
+            ).fetchall()
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(COLS)
+        for row in rows:
+            writer.writerow([
+                row["id"], row["created_at"], row["operation"], row["status"],
+                row["provider"] or "", row["model"] or "",
+                row["input_tokens"], row["output_tokens"], row["total_tokens"],
+                (row["error"] or "")[:500],
+            ])
+        raw = buf.getvalue().encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", 'attachment; filename="ai_usage.csv"')
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -1216,30 +1257,139 @@ def _test_wordpress_connection(settings: Settings) -> str:
         return f"Error al conectar con WordPress: {exc}"
 
 
-def _test_ai_connection(settings: Settings, app_settings: dict) -> str:
-    """Test AI connectivity. Returns flash message. Never logs API key."""
-    from .summarizer import call_ai
-    provider = settings.ai_provider.lower()
-    if provider == "disabled" or not provider:
-        return "IA desactivada (AI_PROVIDER=disabled). Configura AI_PROVIDER=openai o azure."
+def _test_ai_connection(settings: Settings, app_settings: dict, conn=None) -> str:
+    """Test AI connectivity. Records usage in ai_usage_logs if conn is provided. Never logs API key."""
+    provider = (settings.ai_provider or "disabled").lower()
+    model = settings.ai_model or ""
+    daily_limit = int(getattr(settings, "ai_daily_token_limit", 50000) or 0)
+    monthly_limit = int(getattr(settings, "ai_monthly_token_limit", 500000) or 0)
+
+    def _record(log_status: str, *, input_tokens: int = 0, output_tokens: int = 0,
+                total_tokens: int = 0, log_error: str | None = None) -> None:
+        if conn is None:
+            return
+        db.record_ai_usage(
+            conn,
+            document_id=None,
+            alert_id=None,
+            provider=provider,
+            model=model,
+            operation="test_connection",
+            status=log_status,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            daily_limit=daily_limit,
+            monthly_limit=monthly_limit,
+            error=log_error,
+        )
+
+    if not bool(getattr(settings, "ai_enabled", False)):
+        msg = "IA bloqueada por AI_ENABLED=false en .env. No se llamará a la API."
+        _record("disabled", log_error=msg)
+        return msg
+
+    runtime = (app_settings.get("ai_runtime_enabled") or "").strip().lower()
+    effective_enabled = False if runtime in {"0", "false", "no", "n", "off"} else True
+
+    if not effective_enabled:
+        msg = "IA apagada desde el panel. Actívala antes de probar conexión."
+        _record("disabled", log_error=msg)
+        return msg
+
+    if provider == "disabled":
+        msg = "IA desactivada (AI_PROVIDER=disabled). Configura AI_PROVIDER=openai o azure."
+        _record("disabled", log_error=msg)
+        return msg
+
     if not settings.ai_api_key:
-        return "Sin API key: configura AI_API_KEY en el archivo .env."
+        msg = "Sin API key: configura AI_API_KEY en el archivo .env."
+        _record("missing_key", log_error=msg)
+        return msg
+
     if provider == "azure" and not settings.ai_base_url:
-        return "Azure requiere AI_BASE_URL configurado en el archivo .env."
+        msg = "Azure requiere AI_BASE_URL configurado en el archivo .env."
+        _record("error", log_error=msg)
+        return msg
+
+    if conn is not None:
+        usage_status = db.get_ai_usage_status(conn, daily_limit=daily_limit, monthly_limit=monthly_limit)
+        if usage_status.get("daily_exceeded") or usage_status.get("monthly_exceeded"):
+            if usage_status.get("daily_exceeded"):
+                msg = f"Límite diario IA alcanzado ({usage_status.get('today_tokens')} / {daily_limit} tokens). No se ejecutará prueba."
+            else:
+                msg = f"Límite mensual IA alcanzado ({usage_status.get('month_tokens')} / {monthly_limit} tokens). No se ejecutará prueba."
+            _record("blocked_limit", log_error=msg)
+            return msg
+
     try:
-        raw = call_ai(
-            "Eres un asistente de prueba.",
-            'Responde solo con este JSON válido: {"ok": true}',
+        from .summarizer import call_ai_with_usage
+
+        ai_response = call_ai_with_usage(
+            "Responde solo con JSON válido.",
+            '{"ok": true, "message": "test"}',
             settings,
         )
-        if "ok" in raw.lower() or "true" in raw.lower():
+        if ai_response.content:
+            _record(
+                "success",
+                input_tokens=ai_response.input_tokens,
+                output_tokens=ai_response.output_tokens,
+                total_tokens=ai_response.total_tokens,
+            )
             return f"Conexión IA OK ({provider}, modelo: {settings.ai_model or 'default'})."
-        return f"Respuesta IA recibida pero inesperada ({provider})."
+        msg = "Conexión IA sin respuesta."
+        _record("error", log_error=msg)
+        return msg
     except Exception as exc:
         error_msg = str(exc)
         if settings.ai_api_key and settings.ai_api_key in error_msg:
             error_msg = error_msg.replace(settings.ai_api_key, "[REDACTED]")
-        return f"Error IA: {error_msg[:200]}"
+        msg = f"Error al probar IA: {error_msg[:300]}"
+        _record("error", log_error=error_msg[:500])
+        return msg
+
+
+def _render_ai_usage_table(logs: list[dict]) -> str:
+    """Tabla compacta 'Últimos usos IA' para el panel de configuración."""
+    csv_btn = (
+        f'<a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/settings/ai-usage.csv" download>'
+        f'{icon("document", 14)}<span>Exportar CSV</span></a>'
+    )
+    if not logs:
+        return (
+            f'<section class="eg-card eg-panel">'
+            f'<div class="eg-card-head"><h2>Últimos usos IA</h2>{csv_btn}</div>'
+            f'<div class="eg-empty"><strong>Sin registros de uso IA aún.</strong>'
+            f'<span>Los registros aparecen tras generar resúmenes o probar conexión.</span></div>'
+            f'</section>'
+        )
+    rows = "".join(
+        f"""<tr>
+  <td class="mono" style="font-size:11px;">{h(fmt_dt(entry.get("created_at")))}</td>
+  <td class="mono" style="font-size:11px;">{h(entry.get("operation") or "—")}</td>
+  <td>{badge(entry.get("status") or "")}</td>
+  <td class="mono" style="font-size:11px;">{h(entry.get("provider") or "—")}</td>
+  <td class="mono" style="font-size:11px;">{h(entry.get("model") or "—")}</td>
+  <td class="mono" style="font-size:11px;">{h(entry.get("input_tokens") or 0)}</td>
+  <td class="mono" style="font-size:11px;">{h(entry.get("output_tokens") or 0)}</td>
+  <td class="mono" style="font-size:11px;">{h(entry.get("total_tokens") or 0)}</td>
+  <td class="eg-muted mono" style="font-size:11px;">{h((entry.get("error") or "")[:60] or "—")}</td>
+</tr>"""
+        for entry in logs
+    )
+    return f"""<section class="eg-card eg-panel">
+  <div class="eg-card-head"><h2>Últimos usos IA</h2>{csv_btn}</div>
+  <div class="eg-table-wrap">
+    <table class="eg-table">
+      <thead><tr>
+        <th>Fecha</th><th>Operación</th><th>Estado</th><th>Proveedor</th>
+        <th>Modelo</th><th>Input</th><th>Output</th><th>Total</th><th>Error</th>
+      </tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+  </div>
+</section>"""
 
 
 def render_settings(settings: Settings) -> str:
@@ -1411,19 +1561,73 @@ def render_settings(settings: Settings) -> str:
 
     # --- Conexión IA ---
     ai_provider = settings.ai_provider
-    if ai_provider == "disabled" or not ai_provider:
+    ai_env_enabled = bool(getattr(settings, "ai_enabled", False))
+    ai_runtime_raw = (app_cfg.get("ai_runtime_enabled") or "").strip().lower()
+    if not ai_env_enabled:
+        ai_runtime_enabled = False
+        ai_runtime_source = ".env bloqueado"
+    elif ai_runtime_raw in {"0", "false", "no", "n", "off"}:
+        ai_runtime_enabled = False
+        ai_runtime_source = "panel"
+    elif ai_runtime_raw in {"1", "true", "yes", "y", "on"}:
+        ai_runtime_enabled = True
+        ai_runtime_source = "panel"
+    else:
+        ai_runtime_enabled = True
+        ai_runtime_source = ".env"
+
+    with db.connect(settings.database_path) as ai_conn:
+        ai_usage = db.get_ai_usage_status(
+            ai_conn,
+            daily_limit=settings.ai_daily_token_limit,
+            monthly_limit=settings.ai_monthly_token_limit,
+        )
+        recent_ai_logs = db.get_recent_ai_usage(ai_conn, limit=5)
+
+    ai_limit_reached = ai_usage.get("daily_exceeded") or ai_usage.get("monthly_exceeded")
+    ai_last_usage = ai_usage.get("last_usage") or {}
+    ai_last_error = ai_usage.get("last_error") or {}
+
+    if not ai_runtime_enabled:
+        ai_estado = pill("paused", "Apagada")
+        ai_estado_key = "paused"
+    elif ai_provider == "disabled" or not ai_provider:
         ai_estado = pill("paused", "Desactivada")
         ai_estado_key = "paused"
+    elif ai_limit_reached:
+        ai_estado = pill("error", "Límite alcanzado")
+        ai_estado_key = "error"
     elif settings.ai_api_key:
-        ai_estado = pill("active", "Configurada")
+        ai_estado = pill("active", "Activa")
         ai_estado_key = "active"
     else:
         ai_estado = pill("error", "Sin API key")
         ai_estado_key = "error"
 
     ai_last_test = app_cfg.get("ai_last_test", "")
+
+    if not ai_env_enabled:
+        ai_toggle_btn = (
+            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="button" disabled>'
+            f'{icon("pause", 14)}<span>IA bloqueada por .env</span></button>'
+        )
+    else:
+        ai_toggle_btn = (
+            f"""<form method="post" action="/admin/settings/ai-disable" style="display:inline">
+    <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
+      {icon("pause", 14)}<span>Apagar IA</span>
+    </button>
+  </form>"""
+            if ai_runtime_enabled
+            else f"""<form method="post" action="/admin/settings/ai-enable" style="display:inline">
+    <button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">
+      {icon("play", 14)}<span>Activar IA</span>
+    </button>
+  </form>"""
+        )
+
     ai_test_btn = ""
-    if ai_provider not in ("disabled", "") and settings.ai_api_key:
+    if ai_runtime_enabled and ai_provider not in ("disabled", "") and settings.ai_api_key and not ai_limit_reached:
         ai_test_btn = f"""
   <form method="post" action="/admin/settings/test-ai" style="display:inline">
     <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
@@ -1431,12 +1635,19 @@ def render_settings(settings: Settings) -> str:
     </button>
   </form>"""
     else:
+        reason = "Activa IA y configura AI_PROVIDER + AI_API_KEY para probar."
+        if ai_limit_reached:
+            reason = "Límite IA alcanzado. No se ejecutará prueba."
         ai_test_btn = (
             f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="button" disabled>'
             f'{icon("cpu", 14)}<span>Probar conexion IA</span></button>'
-            f'<p class="eg-muted" style="margin-top:8px;font-size:13px;">'
-            f'Configura AI_PROVIDER y AI_API_KEY en .env para habilitar la prueba.</p>'
+            f'<p class="eg-muted" style="margin-top:8px;font-size:13px;">{h(reason)}</p>'
         )
+
+    ai_usage_today = f"{ai_usage.get('today_tokens', 0):,}".replace(",", ".")
+    ai_usage_month = f"{ai_usage.get('month_tokens', 0):,}".replace(",", ".")
+    ai_daily_limit = f"{settings.ai_daily_token_limit:,}".replace(",", ".")
+    ai_monthly_limit = f"{settings.ai_monthly_token_limit:,}".replace(",", ".")
 
     # Defaults para campos IA editables
     AI_DEFAULTS = {
@@ -1490,6 +1701,8 @@ def render_settings(settings: Settings) -> str:
   <h2>{icon("cpu", 17)} Conexion IA</h2>
   <dl class="eg-kv eg-kv--2col">
     <dt>Estado</dt><dd>{ai_estado}</dd>
+    <dt>Interruptor efectivo</dt><dd class="mono">{h(str(ai_runtime_enabled).lower())} · {h(ai_runtime_source)}</dd>
+    <dt>AI_ENABLED (.env)</dt><dd class="mono">{h(str(settings.ai_enabled).lower())}</dd>
     <dt>AI_PROVIDER</dt><dd class="mono">{h(ai_provider or 'disabled')}</dd>
     <dt>AI_MODEL</dt><dd class="mono">{h(settings.ai_model or '—')}</dd>
     <dt>AI_BASE_URL</dt><dd class="mono">{h(settings.ai_base_url or '—')}</dd>
@@ -1497,10 +1710,17 @@ def render_settings(settings: Settings) -> str:
     <dt>AI_TIMEOUT_SECONDS</dt><dd class="mono">{h(settings.ai_timeout_seconds)}</dd>
     <dt>AI_MAX_INPUT_CHARS</dt><dd class="mono">{h(settings.ai_max_input_chars)}</dd>
     <dt>AI_ATTACHMENTS_ENABLED</dt><dd class="mono">{h(str(settings.ai_attachments_enabled).lower())}</dd>
+    <dt>Uso hoy</dt><dd class="mono">{h(ai_usage_today)} / {h(ai_daily_limit)} tokens · {h(ai_usage.get('daily_percent', 0))}%</dd>
+    <dt>Uso mes</dt><dd class="mono">{h(ai_usage_month)} / {h(ai_monthly_limit)} tokens · {h(ai_usage.get('monthly_percent', 0))}%</dd>
+    <dt>Advertencia</dt><dd class="mono">{h(settings.ai_warning_percent)}%</dd>
+    <dt>Última llamada IA</dt><dd class="mono">{h((ai_last_usage or {}).get('created_at') or '—')} · {h((ai_last_usage or {}).get('status') or '—')} · {h((ai_last_usage or {}).get('total_tokens') or 0)} tokens</dd>
+    <dt>Último error IA</dt><dd class="mono">{h((ai_last_error or {}).get('error') or '—')}</dd>
     <dt>Ultima prueba IA</dt><dd class="mono">{h(ai_last_test or '—')}</dd>
   </dl>
-  <div class="eg-actions" style="margin-top:14px">{ai_test_btn}</div>
+  <div class="eg-actions" style="margin-top:14px">{ai_toggle_btn}{ai_test_btn}</div>
 </section>
+
+{_render_ai_usage_table(recent_ai_logs)}
 
 <section class="eg-card eg-panel">
   <h2>{icon("cpu", 17)} IA · Configuracion editorial</h2>
@@ -1611,7 +1831,8 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
 AI_STATUS_LABELS = {
     "success": ("IA generada", "eg-badge--active"),
     "fallback": ("Fallback local", "eg-badge--paused"),
-    "error": ("IA con error", "eg-badge--danger"),
+    "error": ("Fallback local", "eg-badge--paused"),   # old data compat — error uses fallback, no red badge
+    "disabled": ("IA desactivada", "eg-badge--paused"),
     "pending": ("IA pendiente", "eg-badge--pending"),
 }
 

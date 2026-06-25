@@ -106,7 +106,8 @@ class Settings:
     wordpress_api_token: str
     wordpress_sync_interval_minutes: int
     wordpress_sync_limit: int
-    # IA (desactivada por defecto; no rompe nada si no está configurada)
+    # IA (segura por defecto; no llama API si AI_ENABLED=false)
+    ai_enabled: bool
     ai_provider: str
     ai_api_key: str
     ai_model: str
@@ -115,6 +116,9 @@ class Settings:
     ai_timeout_seconds: int
     ai_max_input_chars: int
     ai_attachments_enabled: bool
+    ai_daily_token_limit: int
+    ai_monthly_token_limit: int
+    ai_warning_percent: int
 
 
 def get_settings() -> Settings:
@@ -166,7 +170,8 @@ def get_settings() -> Settings:
         wordpress_api_token=os.getenv("WORDPRESS_API_TOKEN", ""),
         wordpress_sync_interval_minutes=env_int("WORDPRESS_SYNC_INTERVAL_MINUTES", 15),
         wordpress_sync_limit=env_int("WORDPRESS_SYNC_LIMIT", 100),
-        # IA (desactivada por defecto; listo para integración)
+        # IA (segura por defecto; AI_ENABLED=false impide llamadas reales)
+        ai_enabled=env_bool("AI_ENABLED", False),
         ai_provider=os.getenv("AI_PROVIDER", "disabled").strip().lower(),
         ai_api_key=os.getenv("AI_API_KEY", ""),
         ai_model=os.getenv("AI_MODEL", ""),
@@ -175,4 +180,7 @@ def get_settings() -> Settings:
         ai_timeout_seconds=env_int("AI_TIMEOUT_SECONDS", 60),
         ai_max_input_chars=env_int("AI_MAX_INPUT_CHARS", 45000),
         ai_attachments_enabled=env_bool("AI_ATTACHMENTS_ENABLED", True),
+        ai_daily_token_limit=env_int("AI_DAILY_TOKEN_LIMIT", 50000),
+        ai_monthly_token_limit=env_int("AI_MONTHLY_TOKEN_LIMIT", 500000),
+        ai_warning_percent=env_int("AI_WARNING_PERCENT", 80),
     )
