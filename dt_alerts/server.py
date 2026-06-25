@@ -105,6 +105,11 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.redirect("/admin/login")
                 return
             self._serve_summary_attachment(int(match.group(1)), kind="detailed")
+        elif path == "/admin/settings/ai-usage.csv":
+            if not self.is_admin():
+                self.redirect("/admin/login")
+                return
+            self._serve_ai_usage_csv()
         else:
             self.respond_not_found()
 
@@ -333,8 +338,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self.require_admin()
             with db.connect(self.settings.database_path) as conn:
                 app_settings = db.get_all_settings(conn)
-            msg = _test_ai_connection(self.settings, app_settings)
-            with db.connect(self.settings.database_path) as conn:
+                msg = _test_ai_connection(self.settings, app_settings, conn)
                 db.set_setting(conn, "ai_last_test", f"{db.utcnow()} · {msg[:100]}")
             self.redirect_flash("/admin/settings", msg)
         else:
@@ -487,6 +491,33 @@ class AppHandler(BaseHTTPRequestHandler):
         self.send_response(200)
         self.send_header("Content-Type", "text/html; charset=utf-8")
         self.send_header("Content-Disposition", f'attachment; filename="{filename}"')
+        self.send_header("Content-Length", str(len(raw)))
+        self.end_headers()
+        self.wfile.write(raw)
+
+    def _serve_ai_usage_csv(self) -> None:
+        import csv
+        import io
+        COLS = ["id", "created_at", "operation", "status", "provider", "model",
+                "input_tokens", "output_tokens", "total_tokens", "error"]
+        with db.connect(self.settings.database_path) as conn:
+            rows = conn.execute(
+                f"SELECT {', '.join(COLS)} FROM ai_usage_logs ORDER BY id DESC LIMIT 1000"  # noqa: S608
+            ).fetchall()
+        buf = io.StringIO()
+        writer = csv.writer(buf)
+        writer.writerow(COLS)
+        for row in rows:
+            writer.writerow([
+                row["id"], row["created_at"], row["operation"], row["status"],
+                row["provider"] or "", row["model"] or "",
+                row["input_tokens"], row["output_tokens"], row["total_tokens"],
+                (row["error"] or "")[:500],
+            ])
+        raw = buf.getvalue().encode("utf-8")
+        self.send_response(200)
+        self.send_header("Content-Type", "text/csv; charset=utf-8")
+        self.send_header("Content-Disposition", 'attachment; filename="ai_usage.csv"')
         self.send_header("Content-Length", str(len(raw)))
         self.end_headers()
         self.wfile.write(raw)
@@ -1226,44 +1257,139 @@ def _test_wordpress_connection(settings: Settings) -> str:
         return f"Error al conectar con WordPress: {exc}"
 
 
-def _test_ai_connection(settings: Settings, app_settings: dict) -> str:
-    """Test AI connectivity. Returns flash message. Never logs API key."""
+def _test_ai_connection(settings: Settings, app_settings: dict, conn=None) -> str:
+    """Test AI connectivity. Records usage in ai_usage_logs if conn is provided. Never logs API key."""
+    provider = (settings.ai_provider or "disabled").lower()
+    model = settings.ai_model or ""
+    daily_limit = int(getattr(settings, "ai_daily_token_limit", 50000) or 0)
+    monthly_limit = int(getattr(settings, "ai_monthly_token_limit", 500000) or 0)
+
+    def _record(log_status: str, *, input_tokens: int = 0, output_tokens: int = 0,
+                total_tokens: int = 0, log_error: str | None = None) -> None:
+        if conn is None:
+            return
+        db.record_ai_usage(
+            conn,
+            document_id=None,
+            alert_id=None,
+            provider=provider,
+            model=model,
+            operation="test_connection",
+            status=log_status,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            daily_limit=daily_limit,
+            monthly_limit=monthly_limit,
+            error=log_error,
+        )
+
     if not bool(getattr(settings, "ai_enabled", False)):
-        return "IA bloqueada por AI_ENABLED=false en .env. No se llamará a la API."
+        msg = "IA bloqueada por AI_ENABLED=false en .env. No se llamará a la API."
+        _record("disabled", log_error=msg)
+        return msg
 
     runtime = (app_settings.get("ai_runtime_enabled") or "").strip().lower()
     effective_enabled = False if runtime in {"0", "false", "no", "n", "off"} else True
 
-    provider = settings.ai_provider.lower()
-
     if not effective_enabled:
-        return "IA apagada desde el panel. Actívala antes de probar conexión."
+        msg = "IA apagada desde el panel. Actívala antes de probar conexión."
+        _record("disabled", log_error=msg)
+        return msg
 
     if provider == "disabled":
-        return "IA desactivada (AI_PROVIDER=disabled). Configura AI_PROVIDER=openai o azure."
+        msg = "IA desactivada (AI_PROVIDER=disabled). Configura AI_PROVIDER=openai o azure."
+        _record("disabled", log_error=msg)
+        return msg
 
     if not settings.ai_api_key:
-        return "Sin API key: configura AI_API_KEY en el archivo .env."
+        msg = "Sin API key: configura AI_API_KEY en el archivo .env."
+        _record("missing_key", log_error=msg)
+        return msg
 
     if provider == "azure" and not settings.ai_base_url:
-        return "Azure requiere AI_BASE_URL configurado en el archivo .env."
+        msg = "Azure requiere AI_BASE_URL configurado en el archivo .env."
+        _record("error", log_error=msg)
+        return msg
+
+    if conn is not None:
+        usage_status = db.get_ai_usage_status(conn, daily_limit=daily_limit, monthly_limit=monthly_limit)
+        if usage_status.get("daily_exceeded") or usage_status.get("monthly_exceeded"):
+            if usage_status.get("daily_exceeded"):
+                msg = f"Límite diario IA alcanzado ({usage_status.get('today_tokens')} / {daily_limit} tokens). No se ejecutará prueba."
+            else:
+                msg = f"Límite mensual IA alcanzado ({usage_status.get('month_tokens')} / {monthly_limit} tokens). No se ejecutará prueba."
+            _record("blocked_limit", log_error=msg)
+            return msg
 
     try:
-        from .summarizer import call_ai
+        from .summarizer import call_ai_with_usage
 
-        raw = call_ai(
+        ai_response = call_ai_with_usage(
             "Responde solo con JSON válido.",
             '{"ok": true, "message": "test"}',
             settings,
         )
-        if raw:
+        if ai_response.content:
+            _record(
+                "success",
+                input_tokens=ai_response.input_tokens,
+                output_tokens=ai_response.output_tokens,
+                total_tokens=ai_response.total_tokens,
+            )
             return f"Conexión IA OK ({provider}, modelo: {settings.ai_model or 'default'})."
-        return "Conexión IA sin respuesta."
+        msg = "Conexión IA sin respuesta."
+        _record("error", log_error=msg)
+        return msg
     except Exception as exc:
         error_msg = str(exc)
         if settings.ai_api_key and settings.ai_api_key in error_msg:
             error_msg = error_msg.replace(settings.ai_api_key, "[REDACTED]")
-        return f"Error al probar IA: {error_msg[:300]}"
+        msg = f"Error al probar IA: {error_msg[:300]}"
+        _record("error", log_error=error_msg[:500])
+        return msg
+
+
+def _render_ai_usage_table(logs: list[dict]) -> str:
+    """Tabla compacta 'Últimos usos IA' para el panel de configuración."""
+    csv_btn = (
+        f'<a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/settings/ai-usage.csv" download>'
+        f'{icon("document", 14)}<span>Exportar CSV</span></a>'
+    )
+    if not logs:
+        return (
+            f'<section class="eg-card eg-panel">'
+            f'<div class="eg-card-head"><h2>Últimos usos IA</h2>{csv_btn}</div>'
+            f'<div class="eg-empty"><strong>Sin registros de uso IA aún.</strong>'
+            f'<span>Los registros aparecen tras generar resúmenes o probar conexión.</span></div>'
+            f'</section>'
+        )
+    rows = "".join(
+        f"""<tr>
+  <td class="mono" style="font-size:11px;">{h(fmt_dt(entry.get("created_at")))}</td>
+  <td class="mono" style="font-size:11px;">{h(entry.get("operation") or "—")}</td>
+  <td>{badge(entry.get("status") or "")}</td>
+  <td class="mono" style="font-size:11px;">{h(entry.get("provider") or "—")}</td>
+  <td class="mono" style="font-size:11px;">{h(entry.get("model") or "—")}</td>
+  <td class="mono" style="font-size:11px;">{h(entry.get("input_tokens") or 0)}</td>
+  <td class="mono" style="font-size:11px;">{h(entry.get("output_tokens") or 0)}</td>
+  <td class="mono" style="font-size:11px;">{h(entry.get("total_tokens") or 0)}</td>
+  <td class="eg-muted mono" style="font-size:11px;">{h((entry.get("error") or "")[:60] or "—")}</td>
+</tr>"""
+        for entry in logs
+    )
+    return f"""<section class="eg-card eg-panel">
+  <div class="eg-card-head"><h2>Últimos usos IA</h2>{csv_btn}</div>
+  <div class="eg-table-wrap">
+    <table class="eg-table">
+      <thead><tr>
+        <th>Fecha</th><th>Operación</th><th>Estado</th><th>Proveedor</th>
+        <th>Modelo</th><th>Input</th><th>Output</th><th>Total</th><th>Error</th>
+      </tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+  </div>
+</section>"""
 
 
 def render_settings(settings: Settings) -> str:
@@ -1456,6 +1582,7 @@ def render_settings(settings: Settings) -> str:
             daily_limit=settings.ai_daily_token_limit,
             monthly_limit=settings.ai_monthly_token_limit,
         )
+        recent_ai_logs = db.get_recent_ai_usage(ai_conn, limit=5)
 
     ai_limit_reached = ai_usage.get("daily_exceeded") or ai_usage.get("monthly_exceeded")
     ai_last_usage = ai_usage.get("last_usage") or {}
@@ -1593,6 +1720,8 @@ def render_settings(settings: Settings) -> str:
   <div class="eg-actions" style="margin-top:14px">{ai_toggle_btn}{ai_test_btn}</div>
 </section>
 
+{_render_ai_usage_table(recent_ai_logs)}
+
 <section class="eg-card eg-panel">
   <h2>{icon("cpu", 17)} IA · Configuracion editorial</h2>
   <p class="eg-muted">
@@ -1702,7 +1831,8 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
 AI_STATUS_LABELS = {
     "success": ("IA generada", "eg-badge--active"),
     "fallback": ("Fallback local", "eg-badge--paused"),
-    "error": ("IA con error", "eg-badge--danger"),
+    "error": ("Fallback local", "eg-badge--paused"),   # old data compat — error uses fallback, no red badge
+    "disabled": ("IA desactivada", "eg-badge--paused"),
     "pending": ("IA pendiente", "eg-badge--pending"),
 }
 

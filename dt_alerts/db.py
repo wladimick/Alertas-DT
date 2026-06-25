@@ -845,6 +845,14 @@ def get_last_ai_error(conn: sqlite3.Connection) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def get_recent_ai_usage(conn: sqlite3.Connection, limit: int = 5) -> list[dict[str, Any]]:
+    """Últimos N registros de uso IA para auditoría en panel de configuración."""
+    rows = conn.execute(
+        "SELECT * FROM ai_usage_logs ORDER BY id DESC LIMIT ?", (limit,)
+    ).fetchall()
+    return [dict(row) for row in rows]
+
+
 def get_ai_usage_status(
     conn: sqlite3.Connection,
     *,

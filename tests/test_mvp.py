@@ -1039,5 +1039,239 @@ class AIIntegrationTestCase(unittest.TestCase):
         self.assertIn("Ver documento oficial", html_out)
 
 
+class AIUsageControlTestCase(unittest.TestCase):
+    """Tests de control de consumo IA: logs, límites, prueba de conexión y CSV."""
+
+    def _db_path(self, tmp: str) -> Path:
+        path = Path(tmp) / "t.sqlite3"
+        db.init_db(path)
+        return path
+
+    def _sample_doc_dict(self) -> dict:
+        return {
+            "dt_article_id": "usage-test-1",
+            "canonical_url": "https://www.dt.gob.cl/legislacion/1624/w3-article-usage1.html",
+            "source_url": "https://www.dt.gob.cl/x.html",
+            "category": "Circulares",
+            "title": "Circular de prueba control IA",
+            "publication_date": "01/01/2026",
+            "abstract": "Instruye criterios de prueba.",
+            "detail_text": "Texto de prueba para control de tokens.",
+            "pdf_url": None,
+            "content_hash": None,
+        }
+
+    def _insert_doc(self, conn) -> int:
+        doc_id, _ = db.upsert_document(conn, self._sample_doc_dict())
+        db.update_document_processed(conn, doc_id, status="processed",
+                                     detail_text="Texto.", pdf_url=None,
+                                     content_hash=None, last_error=None)
+        return doc_id
+
+    # --- 1. AI_ENABLED=false registra 'disabled' con 0 tokens ---
+    def test_01_ai_disabled_registers_disabled_with_zero_tokens(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=False, ai_provider="disabled", ai_api_key="")
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                _generate_and_save(conn, doc_id, s, {})
+                rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertTrue(rows, "Debe haber al menos un registro en ai_usage_logs")
+        self.assertEqual(rows[0]["status"], "disabled")
+        self.assertEqual(rows[0]["total_tokens"], 0)
+
+    # --- 2. Sin API key registra 'missing_key' ---
+    def test_02_missing_api_key_registers_missing_key(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=True, ai_provider="openai", ai_api_key="")
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
+                rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["status"], "missing_key")
+
+    # --- 3. Límite diario alcanzado registra 'blocked_limit' ---
+    def test_03_daily_limit_registers_blocked_limit(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            # Límite de 1 token diario; pre-cargamos 100 tokens de uso
+            s = settings_for(path, ai_enabled=True, ai_provider="openai",
+                             ai_api_key="fake-key", ai_daily_token_limit=1,
+                             ai_monthly_token_limit=500000)
+            with db.connect(path) as conn:
+                db.record_ai_usage(conn, operation="generate_summary",
+                                   status="success", total_tokens=100,
+                                   daily_limit=1, monthly_limit=500000)
+                doc_id = self._insert_doc(conn)
+                _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
+                rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["status"], "blocked_limit")
+
+    # --- 4. Límite mensual alcanzado registra 'blocked_limit' ---
+    def test_04_monthly_limit_registers_blocked_limit(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=True, ai_provider="openai",
+                             ai_api_key="fake-key", ai_daily_token_limit=50000,
+                             ai_monthly_token_limit=1)
+            with db.connect(path) as conn:
+                db.record_ai_usage(conn, operation="generate_summary",
+                                   status="success", total_tokens=100,
+                                   daily_limit=50000, monthly_limit=1)
+                doc_id = self._insert_doc(conn)
+                _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
+                rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["status"], "blocked_limit")
+
+    # --- 5. Mock de respuesta exitosa registra 'success' con tokens ---
+    def test_05_mock_success_registers_success_with_tokens(self):
+        from dt_alerts.summarizer import _generate_and_save, AIResponse
+        fake_json = json.dumps({
+            "title": "Circular DT", "category": "Circulares", "relevance": "medio",
+            "email_subject": "Nueva normativa DT: Circular",
+            "email_summary": "Resumen de prueba.",
+            "key_points": ["Punto 1"], "practical_impacts": [{"title": "Impacto", "description": "Desc"}],
+            "recommended_actions": ["Accion 1"],
+            "executive_summary": {"title": "Resumen ejecutivo", "body": "Cuerpo."},
+            "detailed_summary": {"title": "Detalle", "sections": []},
+            "tags": ["DT"], "legal_disclaimer": "Informativo.",
+        })
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=True, ai_provider="openai",
+                             ai_api_key="fake-key", ai_daily_token_limit=50000,
+                             ai_monthly_token_limit=500000)
+            fake_response = AIResponse(content=fake_json, input_tokens=100,
+                                       output_tokens=200, total_tokens=300)
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch("dt_alerts.summarizer.call_ai_with_usage",
+                                return_value=fake_response):
+                    _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
+                rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertTrue(rows)
+        self.assertEqual(rows[0]["status"], "success")
+        self.assertEqual(rows[0]["total_tokens"], 300)
+        self.assertEqual(rows[0]["input_tokens"], 100)
+        self.assertEqual(rows[0]["output_tokens"], 200)
+
+    # --- 6. 'Probar conexión IA' registra uso o queda bloqueado sin llamar API ---
+    def test_06_test_connection_registers_usage(self):
+        from dt_alerts.server import _test_ai_connection
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            # Caso disabled: debe registrar 'disabled', sin llamar API
+            s = settings_for(path, ai_enabled=False, ai_provider="disabled", ai_api_key="")
+            with db.connect(path) as conn:
+                msg = _test_ai_connection(s, {}, conn)
+                rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertIn("bloqueada", msg.lower())
+        self.assertTrue(rows, "test_connection debe registrar en ai_usage_logs")
+        self.assertEqual(rows[0]["status"], "disabled")
+        self.assertEqual(rows[0]["operation"], "test_connection")
+
+    def test_06b_test_connection_registers_missing_key(self):
+        from dt_alerts.server import _test_ai_connection
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=True, ai_provider="openai", ai_api_key="")
+            with db.connect(path) as conn:
+                msg = _test_ai_connection(s, {"ai_runtime_enabled": "true"}, conn)
+                rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertIn("API key", msg)
+        self.assertEqual(rows[0]["status"], "missing_key")
+        self.assertEqual(rows[0]["operation"], "test_connection")
+
+    def test_06c_test_connection_blocked_limit(self):
+        from dt_alerts.server import _test_ai_connection
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=True, ai_provider="openai",
+                             ai_api_key="sk-fake", ai_daily_token_limit=1,
+                             ai_monthly_token_limit=500000)
+            with db.connect(path) as conn:
+                db.record_ai_usage(conn, operation="test_connection",
+                                   status="success", total_tokens=100,
+                                   daily_limit=1, monthly_limit=500000)
+                msg = _test_ai_connection(s, {"ai_runtime_enabled": "true"}, conn)
+                rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertIn("límite", msg.lower())
+        self.assertEqual(rows[0]["status"], "blocked_limit")
+
+    # --- 7. CSV no expone secretos ---
+    def test_07_csv_does_not_expose_secrets(self):
+        import io, csv as csv_mod
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            fake_key = "sk-super-secret-api-key-12345"
+            # Insertamos un log con error que menciona la key (ya debería estar redactada por el summarizer)
+            with db.connect(path) as conn:
+                db.record_ai_usage(conn, operation="generate_summary", status="error",
+                                   provider="openai", model="gpt-4o-mini",
+                                   total_tokens=0, daily_limit=50000, monthly_limit=500000,
+                                   error=f"HTTP 401: invalid key [REDACTED]")
+                rows = db.get_recent_ai_usage(conn, limit=10)
+        # Simulamos el CSV como lo produce _serve_ai_usage_csv
+        COLS = ["id", "created_at", "operation", "status", "provider", "model",
+                "input_tokens", "output_tokens", "total_tokens", "error"]
+        buf = io.StringIO()
+        writer = csv_mod.writer(buf)
+        writer.writerow(COLS)
+        for row in rows:
+            writer.writerow([
+                row["id"], row["created_at"], row["operation"], row["status"],
+                row["provider"] or "", row["model"] or "",
+                row["input_tokens"], row["output_tokens"], row["total_tokens"],
+                (row["error"] or "")[:500],
+            ])
+        csv_output = buf.getvalue()
+        self.assertNotIn(fake_key, csv_output)
+        self.assertIn("REDACTED", csv_output)
+        self.assertIn("id", csv_output)
+        self.assertIn("operation", csv_output)
+        # Verificar que las columnas sensibles no están presentes
+        self.assertNotIn("ai_api_key", csv_output)
+        self.assertNotIn("sendgrid_api_key", csv_output)
+
+    # --- 8. Regeneración exitosa no deja alerta con badge de error ---
+    def test_08_successful_regeneration_no_error_badge(self):
+        from dt_alerts.server import ai_status_badge, render_alerts
+        # Simular item con ai_status='success' (resultado de regeneración exitosa)
+        item_success = {
+            "id": 99, "document_id": 1,
+            "title": "Circular regenerada", "category": "Circulares",
+            "publication_date": "01/01/2026", "relevance": "alto",
+            "status": "pending_review", "summary": "Resumen regenerado.",
+            "key_points_json": "[]", "practical_impacts_json": "[]",
+            "canonical_url": "https://example.com",
+            "created_at": "2026-06-25T10:00:00",
+            "ai_status": "success", "ai_provider": "azure",
+            "ai_content_quality": "full", "ai_email_subject": "Nueva normativa",
+            "ai_summary_error": None,
+        }
+        badge_html = ai_status_badge(item_success)
+        # No debe mostrar clase peligro (rojo) cuando IA tuvo éxito
+        self.assertNotIn("eg-badge--danger", badge_html)
+        self.assertIn("eg-badge--active", badge_html)
+        self.assertIn("IA generada", badge_html)
+        # Simular item con ai_status='error' (datos viejos): tampoco debe ser rojo
+        item_old_error = {**item_success, "ai_status": "error"}
+        badge_old = ai_status_badge(item_old_error)
+        self.assertNotIn("eg-badge--danger", badge_old,
+                         "Datos viejos con ai_status='error' no deben mostrar badge rojo")
+        # La lista de alertas no debe mostrar badge rojo para ninguno de los dos casos
+        html_out = render_alerts([item_success, item_old_error])
+        self.assertNotIn("eg-badge--danger", html_out)
+
+
 if __name__ == "__main__":
     unittest.main()
