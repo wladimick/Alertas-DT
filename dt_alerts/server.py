@@ -285,8 +285,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 "email_from_name", "email_from", "email_reply_to",
                 "email_subject_template", "email_test_subject_template", "email_footer_legal",
                 # IA editable (no sensible — no API keys)
-                "ai_system_prompt", "ai_summary_style", "ai_review_required",
-                "ai_attachments_enabled", "ai_email_intro_template", "ai_footer_disclaimer",
+                "ai_system_prompt", "ai_summary_style", "ai_analysis_focus",
+                "ai_review_required", "ai_attachments_enabled",
+                "ai_email_intro_template", "ai_footer_disclaimer",
             }
             with db.connect(self.settings.database_path) as conn:
                 for key in editable_keys:
@@ -498,21 +499,27 @@ class AppHandler(BaseHTTPRequestHandler):
     def _serve_ai_usage_csv(self) -> None:
         import csv
         import io
-        COLS = ["id", "created_at", "operation", "status", "provider", "model",
-                "input_tokens", "output_tokens", "total_tokens", "error"]
+        DB_COLS = ["id", "created_at", "operation", "status", "provider", "model",
+                   "input_tokens", "output_tokens", "total_tokens", "error"]
         with db.connect(self.settings.database_path) as conn:
             rows = conn.execute(
-                f"SELECT {', '.join(COLS)} FROM ai_usage_logs ORDER BY id DESC LIMIT 1000"  # noqa: S608
+                f"SELECT {', '.join(DB_COLS)} FROM ai_usage_logs ORDER BY id DESC LIMIT 1000"  # noqa: S608
             ).fetchall()
         buf = io.StringIO()
         writer = csv.writer(buf)
-        writer.writerow(COLS)
+        writer.writerow(DB_COLS + ["estimated_cost_usd", "estimated_cost_clp"])
         for row in rows:
+            cost_usd, cost_clp = _calc_ai_cost(
+                row["input_tokens"] or 0,
+                row["output_tokens"] or 0,
+                self.settings,
+            )
             writer.writerow([
                 row["id"], row["created_at"], row["operation"], row["status"],
                 row["provider"] or "", row["model"] or "",
                 row["input_tokens"], row["output_tokens"], row["total_tokens"],
                 (row["error"] or "")[:500],
+                f"{cost_usd:.6f}", f"{cost_clp:.2f}",
             ])
         raw = buf.getvalue().encode("utf-8")
         self.send_response(200)
@@ -761,6 +768,20 @@ def mask_secret(value: str | None, visible_start: int = 6, visible_end: int = 4)
         return "••••••••"
     dots = "•" * min(len(v) - visible_start - visible_end, 20)
     return v[:visible_start] + dots + v[-visible_end:]
+
+
+def _calc_ai_cost(
+    input_tokens: int,
+    output_tokens: int,
+    settings: Settings,
+) -> tuple[float, float]:
+    """Retorna (cost_usd, cost_clp) estimado para los tokens dados."""
+    input_price = getattr(settings, "ai_input_price_per_1m_usd", 2.00)
+    output_price = getattr(settings, "ai_output_price_per_1m_usd", 8.00)
+    rate = getattr(settings, "ai_usd_clp_rate", 921)
+    cost_usd = (input_tokens / 1_000_000) * input_price + (output_tokens / 1_000_000) * output_price
+    cost_clp = cost_usd * rate
+    return cost_usd, cost_clp
 
 
 # Defaults de plantillas de email (fallback si no hay valor en DB)
@@ -1350,7 +1371,7 @@ def _test_ai_connection(settings: Settings, app_settings: dict, conn=None) -> st
         return msg
 
 
-def _render_ai_usage_table(logs: list[dict]) -> str:
+def _render_ai_usage_table(logs: list[dict], settings: "Settings | None" = None) -> str:
     """Tabla compacta 'Últimos usos IA' para el panel de configuración."""
     csv_btn = (
         f'<a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/settings/ai-usage.csv" download>'
@@ -1364,6 +1385,16 @@ def _render_ai_usage_table(logs: list[dict]) -> str:
             f'<span>Los registros aparecen tras generar resúmenes o probar conexión.</span></div>'
             f'</section>'
         )
+    def _cost_cell(entry: dict) -> str:
+        if settings is None:
+            return "—"
+        _, clp = _calc_ai_cost(
+            entry.get("input_tokens") or 0,
+            entry.get("output_tokens") or 0,
+            settings,
+        )
+        return f"CLP {clp:,.0f}".replace(",", ".")
+
     rows = "".join(
         f"""<tr>
   <td class="mono" style="font-size:11px;">{h(fmt_dt(entry.get("created_at")))}</td>
@@ -1374,6 +1405,7 @@ def _render_ai_usage_table(logs: list[dict]) -> str:
   <td class="mono" style="font-size:11px;">{h(entry.get("input_tokens") or 0)}</td>
   <td class="mono" style="font-size:11px;">{h(entry.get("output_tokens") or 0)}</td>
   <td class="mono" style="font-size:11px;">{h(entry.get("total_tokens") or 0)}</td>
+  <td class="mono" style="font-size:11px;">{_cost_cell(entry)}</td>
   <td class="eg-muted mono" style="font-size:11px;">{h((entry.get("error") or "")[:60] or "—")}</td>
 </tr>"""
         for entry in logs
@@ -1384,7 +1416,7 @@ def _render_ai_usage_table(logs: list[dict]) -> str:
     <table class="eg-table">
       <thead><tr>
         <th>Fecha</th><th>Operación</th><th>Estado</th><th>Proveedor</th>
-        <th>Modelo</th><th>Input</th><th>Output</th><th>Total</th><th>Error</th>
+        <th>Modelo</th><th>Input</th><th>Output</th><th>Total</th><th>Costo est.</th><th>Error</th>
       </tr></thead>
       <tbody>{rows}</tbody>
     </table>
@@ -1583,6 +1615,7 @@ def render_settings(settings: Settings) -> str:
             monthly_limit=settings.ai_monthly_token_limit,
         )
         recent_ai_logs = db.get_recent_ai_usage(ai_conn, limit=5)
+        ai_token_breakdown = db.get_ai_token_breakdown(ai_conn)
 
     ai_limit_reached = ai_usage.get("daily_exceeded") or ai_usage.get("monthly_exceeded")
     ai_last_usage = ai_usage.get("last_usage") or {}
@@ -1649,9 +1682,56 @@ def render_settings(settings: Settings) -> str:
     ai_daily_limit = f"{settings.ai_daily_token_limit:,}".replace(",", ".")
     ai_monthly_limit = f"{settings.ai_monthly_token_limit:,}".replace(",", ".")
 
+    # Costos estimados (Fase 1)
+    last_u = ai_usage.get("last_usage") or {}
+    cost_last_usd, cost_last_clp = _calc_ai_cost(
+        last_u.get("input_tokens") or 0,
+        last_u.get("output_tokens") or 0,
+        settings,
+    )
+    cost_today_usd, cost_today_clp = _calc_ai_cost(
+        ai_token_breakdown.get("today_input", 0),
+        ai_token_breakdown.get("today_output", 0),
+        settings,
+    )
+    cost_month_usd, cost_month_clp = _calc_ai_cost(
+        ai_token_breakdown.get("month_input", 0),
+        ai_token_breakdown.get("month_output", 0),
+        settings,
+    )
+
+    def _fmt_cost(usd: float, clp: float) -> str:
+        return f"USD {usd:.4f} · CLP {clp:,.0f}".replace(",", ".")
+
+    # Advertencia de consumo (Fase 5)
+    _warn_pct = settings.ai_warning_percent
+    _daily_pct = ai_usage.get("daily_percent", 0)
+    _monthly_pct = ai_usage.get("monthly_percent", 0)
+    _ai_warning_banner = ""
+    if ai_usage.get("daily_exceeded") or ai_usage.get("monthly_exceeded"):
+        _ai_warning_banner = (
+            '<div class="eg-devbanner" style="background:var(--eg-danger,#D32F2F);color:#fff;'
+            'padding:10px 14px;border-radius:6px;margin-bottom:12px;font-size:13px;font-weight:600;">'
+            f'{icon("warning", 14)} Límite de tokens IA alcanzado. No se realizarán llamadas a la API. '
+            'Apaga IA o espera que se renueve el límite.'
+            '</div>'
+        )
+    elif _daily_pct >= _warn_pct or _monthly_pct >= _warn_pct:
+        _ai_warning_banner = (
+            '<div class="eg-devbanner" style="background:var(--eg-warning,#F59E0B);'
+            'padding:10px 14px;border-radius:6px;margin-bottom:12px;font-size:13px;">'
+            f'{icon("warning", 14)} Consumo IA cercano al límite configurado ({_warn_pct}%). '
+            'Para evitar consumo accidental, mantén IA apagada cuando no estés probando.'
+            '</div>'
+        )
+
     # Defaults para campos IA editables
     AI_DEFAULTS = {
         "ai_summary_style": "Profesional, claro, orientado a contadores y empresas chilenas.",
+        "ai_analysis_focus": (
+            "Explicar impactos prácticos en cumplimiento laboral, gestión contable, "
+            "auditoría, remuneraciones y obligaciones documentales."
+        ),
         "ai_review_required": "true",
         "ai_attachments_enabled": "true",
         "ai_email_intro_template": (
@@ -1665,15 +1745,23 @@ def render_settings(settings: Settings) -> str:
         ),
     }
 
-    def _ai_field(key: str, label: str, multiline: bool = False, rows: int = 2) -> str:
+    def _ai_field(
+        key: str,
+        label: str,
+        multiline: bool = False,
+        rows: int = 2,
+        help_text: str = "",
+    ) -> str:
         stored = app_cfg.get(key, "")
         val = stored if stored else AI_DEFAULTS.get(key, "")
         hint = "guardado" if stored else "por defecto"
+        help_el = f'<p class="eg-muted" style="font-size:12px;margin:2px 0 6px;">{h(help_text)}</p>' if help_text else ""
         if multiline:
             return (
                 f'<div class="eg-field">'
                 f'<label class="eg-label" for="cfg-{h(key)}">{h(label)}'
                 f'<span class="eg-label-hint">{hint}</span></label>'
+                f'{help_el}'
                 f'<textarea class="eg-input eg-input--mono" id="cfg-{h(key)}" name="{h(key)}" '
                 f'rows="{rows}">{h(val)}</textarea>'
                 f'</div>'
@@ -1682,21 +1770,45 @@ def render_settings(settings: Settings) -> str:
             f'<div class="eg-field">'
             f'<label class="eg-label" for="cfg-{h(key)}">{h(label)}'
             f'<span class="eg-label-hint">{hint}</span></label>'
+            f'{help_el}'
             f'<input class="eg-input eg-input--mono" id="cfg-{h(key)}" name="{h(key)}" '
             f'type="text" value="{h(val)}">'
             f'</div>'
         )
 
     ai_editable_fields = (
-        _ai_field("ai_summary_style", "Estilo editorial", multiline=True, rows=2)
-        + _ai_field("ai_system_prompt", "Instrucciones adicionales al sistema", multiline=True, rows=3)
-        + _ai_field("ai_email_intro_template", "Intro del correo", multiline=True, rows=2)
-        + _ai_field("ai_footer_disclaimer", "Aviso legal del footer", multiline=True, rows=2)
-        + _ai_field("ai_review_required", "Revisión requerida antes de envío (true/false)")
-        + _ai_field("ai_attachments_enabled", "Adjuntos habilitados (true/false)")
+        _ai_field(
+            "ai_summary_style", "Estilo editorial", multiline=True, rows=2,
+            help_text="Tono y voz del resumen. Ej: 'Profesional, claro, orientado a contadores chilenos.'",
+        )
+        + _ai_field(
+            "ai_analysis_focus", "Enfoque del análisis", multiline=True, rows=2,
+            help_text="Áreas que la IA debe priorizar. Ej: cumplimiento laboral, remuneraciones, auditoría.",
+        )
+        + _ai_field(
+            "ai_system_prompt", "Instrucciones adicionales al sistema", multiline=True, rows=3,
+            help_text="Reglas internas adicionales para la IA. No incluir API keys ni datos sensibles.",
+        )
+        + _ai_field(
+            "ai_email_intro_template", "Intro del correo", multiline=True, rows=2,
+            help_text="Texto que aparece al inicio del correo, antes del resumen generado.",
+        )
+        + _ai_field(
+            "ai_footer_disclaimer", "Aviso legal / footer", multiline=True, rows=2,
+            help_text="Disclaimer que aparece al final de los adjuntos y correos.",
+        )
+        + _ai_field(
+            "ai_review_required", "Revisión requerida antes de envío",
+            help_text="true = la alerta queda en revisión manual antes de enviarse. Recomendado: true.",
+        )
+        + _ai_field(
+            "ai_attachments_enabled", "Adjuntos habilitados",
+            help_text="true = se adjuntan resumen ejecutivo y detallado al correo cuando IA genera correctamente.",
+        )
     )
 
     section_ai = f"""
+{_ai_warning_banner}
 <section class="eg-card eg-panel">
   <h2>{icon("cpu", 17)} Conexion IA</h2>
   <dl class="eg-kv eg-kv--2col">
@@ -1712,15 +1824,28 @@ def render_settings(settings: Settings) -> str:
     <dt>AI_ATTACHMENTS_ENABLED</dt><dd class="mono">{h(str(settings.ai_attachments_enabled).lower())}</dd>
     <dt>Uso hoy</dt><dd class="mono">{h(ai_usage_today)} / {h(ai_daily_limit)} tokens · {h(ai_usage.get('daily_percent', 0))}%</dd>
     <dt>Uso mes</dt><dd class="mono">{h(ai_usage_month)} / {h(ai_monthly_limit)} tokens · {h(ai_usage.get('monthly_percent', 0))}%</dd>
-    <dt>Advertencia</dt><dd class="mono">{h(settings.ai_warning_percent)}%</dd>
+    <dt>Advertencia límite</dt><dd class="mono">{h(settings.ai_warning_percent)}%</dd>
     <dt>Última llamada IA</dt><dd class="mono">{h((ai_last_usage or {}).get('created_at') or '—')} · {h((ai_last_usage or {}).get('status') or '—')} · {h((ai_last_usage or {}).get('total_tokens') or 0)} tokens</dd>
     <dt>Último error IA</dt><dd class="mono">{h((ai_last_error or {}).get('error') or '—')}</dd>
     <dt>Ultima prueba IA</dt><dd class="mono">{h(ai_last_test or '—')}</dd>
   </dl>
+  <h3 style="margin:16px 0 8px;font-size:13px;color:var(--eg-subtle);">Costo estimado referencial</h3>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Precio input / 1M tokens</dt><dd class="mono">USD {h(f"{settings.ai_input_price_per_1m_usd:.2f}")}</dd>
+    <dt>Precio output / 1M tokens</dt><dd class="mono">USD {h(f"{settings.ai_output_price_per_1m_usd:.2f}")}</dd>
+    <dt>Tipo de cambio USD/CLP</dt><dd class="mono">{h(settings.ai_usd_clp_rate)}</dd>
+    <dt>Costo última llamada</dt><dd class="mono">{h(_fmt_cost(cost_last_usd, cost_last_clp))}</dd>
+    <dt>Costo estimado hoy</dt><dd class="mono">{h(_fmt_cost(cost_today_usd, cost_today_clp))}</dd>
+    <dt>Costo estimado mes</dt><dd class="mono">{h(_fmt_cost(cost_month_usd, cost_month_clp))}</dd>
+  </dl>
+  <p class="eg-muted" style="font-size:12px;margin-top:6px;">
+    Costo estimado referencial. Puede variar según contrato Azure, modelo y tipo de cambio.
+    Configurable con AI_INPUT_PRICE_PER_1M_USD, AI_OUTPUT_PRICE_PER_1M_USD, AI_USD_CLP_RATE.
+  </p>
   <div class="eg-actions" style="margin-top:14px">{ai_toggle_btn}{ai_test_btn}</div>
 </section>
 
-{_render_ai_usage_table(recent_ai_logs)}
+{_render_ai_usage_table(recent_ai_logs, settings)}
 
 <section class="eg-card eg-panel">
   <h2>{icon("cpu", 17)} IA · Configuracion editorial</h2>

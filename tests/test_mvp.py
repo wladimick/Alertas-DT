@@ -1273,5 +1273,299 @@ class AIUsageControlTestCase(unittest.TestCase):
         self.assertNotIn("eg-badge--danger", html_out)
 
 
+class NewPhasesTestCase(unittest.TestCase):
+    """Tests para Fases 1-5: costos, editorial, prompt, adjuntos, seguridad."""
+
+    def _make_settings(self, tmp_path, **overrides):
+        base = get_settings()
+        data = {**base.__dict__, "database_path": tmp_path}
+        data.update(overrides)
+        return base.__class__(**data)
+
+    # ------------------------------------------------------------------ Fase 1: Costos
+    def test_01_cost_zero_tokens(self):
+        """Costo es 0 cuando tokens son 0."""
+        from dt_alerts.server import _calc_ai_cost
+        settings = self._make_settings(
+            Path(tempfile.mkdtemp()) / "t.db",
+            ai_input_price_per_1m_usd=2.0,
+            ai_output_price_per_1m_usd=8.0,
+            ai_usd_clp_rate=921,
+        )
+        usd, clp = _calc_ai_cost(0, 0, settings)
+        self.assertEqual(usd, 0.0)
+        self.assertEqual(clp, 0.0)
+
+    def test_02_cost_calculation(self):
+        """Cálculo correcto con tokens input=549 output=675."""
+        from dt_alerts.server import _calc_ai_cost
+        settings = self._make_settings(
+            Path(tempfile.mkdtemp()) / "t.db",
+            ai_input_price_per_1m_usd=2.0,
+            ai_output_price_per_1m_usd=8.0,
+            ai_usd_clp_rate=921,
+        )
+        usd, clp = _calc_ai_cost(549, 675, settings)
+        # input: 549/1_000_000 * 2.0 = 0.001098
+        # output: 675/1_000_000 * 8.0 = 0.0054
+        expected_usd = (549 / 1_000_000 * 2.0) + (675 / 1_000_000 * 8.0)
+        self.assertAlmostEqual(usd, expected_usd, places=8)
+        self.assertAlmostEqual(clp, expected_usd * 921, places=4)
+
+    def test_03_csv_includes_cost_columns(self):
+        """CSV incluye columnas estimated_cost_usd y estimated_cost_clp."""
+        import io
+        import csv
+        from dt_alerts.server import _calc_ai_cost
+        from dt_alerts.config import Settings
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db.init_db(db_path)
+            settings = self._make_settings(
+                db_path,
+                ai_input_price_per_1m_usd=2.0,
+                ai_output_price_per_1m_usd=8.0,
+                ai_usd_clp_rate=921,
+            )
+            with db.connect(db_path) as conn:
+                db.record_ai_usage(
+                    conn, document_id=None, alert_id=None,
+                    provider="azure", model="gpt-chat-latest",
+                    operation="generate_summary", status="success",
+                    input_tokens=549, output_tokens=675, total_tokens=1224,
+                    daily_limit=50000, monthly_limit=500000, error=None,
+                )
+                cols = ["id", "created_at", "operation", "status", "provider", "model",
+                        "input_tokens", "output_tokens", "total_tokens", "error"]
+                rows = conn.execute(
+                    f"SELECT {', '.join(cols)} FROM ai_usage_logs ORDER BY id DESC LIMIT 1000"
+                ).fetchall()
+
+            buf = io.StringIO()
+            writer = csv.writer(buf)
+            writer.writerow(cols + ["estimated_cost_usd", "estimated_cost_clp"])
+            for row in rows:
+                cost_usd, cost_clp = _calc_ai_cost(
+                    row["input_tokens"] or 0, row["output_tokens"] or 0, settings
+                )
+                writer.writerow([
+                    row["id"], row["created_at"], row["operation"], row["status"],
+                    row["provider"] or "", row["model"] or "",
+                    row["input_tokens"], row["output_tokens"], row["total_tokens"],
+                    (row["error"] or "")[:500],
+                    f"{cost_usd:.6f}", f"{cost_clp:.2f}",
+                ])
+            content = buf.getvalue()
+            self.assertIn("estimated_cost_usd", content)
+            self.assertIn("estimated_cost_clp", content)
+            # No debe haber API keys
+            self.assertNotIn("sk-", content)
+            self.assertNotIn("AI_API_KEY", content)
+
+    # ------------------------------------------------------------------ Fase 2: Editorial
+    def test_04_ai_analysis_focus_saved(self):
+        """ai_analysis_focus se guarda y se recupera como setting."""
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db.init_db(db_path)
+            with db.connect(db_path) as conn:
+                db.set_setting(conn, "ai_analysis_focus", "Impactos en remuneraciones.")
+                val = db.get_all_settings(conn).get("ai_analysis_focus")
+            self.assertEqual(val, "Impactos en remuneraciones.")
+
+    def test_05_render_settings_no_crash(self):
+        """render_settings no falla con settings mínimos y DB vacía."""
+        from dt_alerts.server import render_settings
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db.init_db(db_path)
+            settings = self._make_settings(db_path)
+            result = render_settings(settings)
+            self.assertIn("Conexion IA", result)
+            self.assertIn("Configuracion editorial", result)
+            self.assertIn("Enfoque del análisis", result)
+
+    # ------------------------------------------------------------------ Fase 3: Prompt
+    def test_06_prompt_includes_analysis_focus(self):
+        """El prompt incluye ai_analysis_focus cuando está definido."""
+        from dt_alerts.summarizer import build_ai_prompt
+        settings = self._make_settings(Path(tempfile.mkdtemp()) / "t.db")
+        doc = {
+            "title": "Circular 1", "category": "Circulares",
+            "detail_text": "Texto de prueba.", "abstract": "",
+            "publication_date": "2026-01-01", "canonical_url": "https://example.com",
+        }
+        app_settings = {"ai_analysis_focus": "Foco en auditoría y RRHH."}
+        sys_p, user_p = build_ai_prompt(doc, settings, app_settings)
+        self.assertIn("Foco en auditoría y RRHH.", user_p)
+
+    def test_07_prompt_default_focus_when_missing(self):
+        """Si no hay ai_analysis_focus, se usa el default."""
+        from dt_alerts.summarizer import build_ai_prompt
+        settings = self._make_settings(Path(tempfile.mkdtemp()) / "t.db")
+        doc = {
+            "title": "Circular 1", "category": "Circulares",
+            "detail_text": "Texto de prueba.", "abstract": "",
+            "publication_date": "2026-01-01", "canonical_url": "https://example.com",
+        }
+        _, user_p = build_ai_prompt(doc, settings, {})
+        self.assertIn("cumplimiento laboral", user_p)
+
+    def test_08_prompt_no_invented_data_instruction(self):
+        """El prompt incluye instrucción de no inventar datos."""
+        from dt_alerts.summarizer import build_ai_prompt
+        settings = self._make_settings(Path(tempfile.mkdtemp()) / "t.db")
+        doc = {"title": "T", "category": "C", "detail_text": "X",
+               "abstract": "", "publication_date": "2026-01-01", "canonical_url": ""}
+        sys_p, _ = build_ai_prompt(doc, settings, {})
+        self.assertIn("No inventes", sys_p)
+
+    # ------------------------------------------------------------------ Fase 4: Adjuntos
+    def test_09_attachment_filename_uses_slug(self):
+        """Los nombres de archivo de adjuntos incluyen slug del título."""
+        from dt_alerts.notifier import _build_attachments
+        settings = self._make_settings(
+            Path(tempfile.mkdtemp()) / "t.db",
+            ai_attachments_enabled=True,
+        )
+        alert = {
+            "id": 5, "document_id": 5,
+            "title": "Circular 99 sobre remuneraciones",
+            "category": "Circulares", "publication_date": "2026-01-01",
+            "canonical_url": "https://example.com",
+            "summary": "Resumen de prueba.",
+            "ai_status": "success",
+            "ai_executive_summary": '{"title": "Eje", "body": "Cuerpo ejecutivo."}',
+            "ai_detailed_summary_json": '{"descripcion": "Desc.", "impacto_contable": "Impacto."}',
+            "ai_key_points_json": "[]", "ai_recommended_actions_json": "[]",
+            "ai_legal_disclaimer": "",
+        }
+        attachments = _build_attachments(alert, settings)
+        self.assertEqual(len(attachments), 2)
+        for att in attachments:
+            self.assertIn("circular_99", att["filename"])
+
+    def test_10_attachment_skipped_when_no_ai_status(self):
+        """No se generan adjuntos si ai_status es None o pending."""
+        from dt_alerts.notifier import _build_attachments
+        settings = self._make_settings(
+            Path(tempfile.mkdtemp()) / "t.db",
+            ai_attachments_enabled=True,
+        )
+        alert = {"id": 1, "document_id": 1, "title": "T", "ai_status": None}
+        self.assertEqual(_build_attachments(alert, settings), [])
+        alert2 = {**alert, "ai_status": "pending"}
+        self.assertEqual(_build_attachments(alert2, settings), [])
+
+    def test_11_send_test_includes_attachments(self):
+        """send_test_alert_email incluye adjuntos cuando ai_status=success."""
+        from dt_alerts.notifier import send_test_alert_email, _build_attachments
+        settings = self._make_settings(
+            Path(tempfile.mkdtemp()) / "t.db",
+            email_provider="console",
+            ai_attachments_enabled=True,
+        )
+        alert = {
+            "id": 1, "document_id": 1,
+            "title": "Circular de prueba",
+            "category": "Circulares", "publication_date": "2026-01-01",
+            "canonical_url": "https://example.com",
+            "summary": "Resumen.", "relevance": "alto",
+            "key_points_json": "[]", "practical_impacts_json": "[]",
+            "ai_status": "success", "ai_provider": "azure", "ai_model": "gpt-chat-latest",
+            "ai_content_quality": "full", "ai_updated_at": "2026-01-01",
+            "ai_email_subject": "Nueva normativa",
+            "ai_executive_summary": '{"title":"Eje","body":"Cuerpo."}',
+            "ai_detailed_summary_json": '{"descripcion":"Desc."}',
+            "ai_key_points_json": "[]", "ai_recommended_actions_json": "[]",
+            "ai_legal_disclaimer": "",
+        }
+        # Verificar que _build_attachments genera 2 adjuntos
+        atts = _build_attachments(alert, settings)
+        self.assertEqual(len(atts), 2, "Deben generarse 2 adjuntos para ai_status=success")
+
+    # ------------------------------------------------------------------ Fase 5: Seguridad
+    def test_12_warning_banner_at_80_percent(self):
+        """render_settings muestra banner de advertencia al 80% del límite."""
+        from dt_alerts.server import render_settings
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db.init_db(db_path)
+            # Límite muy bajo para forzar el 80%
+            settings = self._make_settings(
+                db_path,
+                ai_enabled=False,
+                ai_daily_token_limit=100,
+                ai_monthly_token_limit=1000,
+                ai_warning_percent=80,
+                ai_input_price_per_1m_usd=2.0,
+                ai_output_price_per_1m_usd=8.0,
+                ai_usd_clp_rate=921,
+            )
+            with db.connect(db_path) as conn:
+                # Insertar 82 tokens de hoy para superar el 80%
+                db.record_ai_usage(
+                    conn, document_id=None, alert_id=None,
+                    provider="azure", model="m", operation="generate_summary",
+                    status="success", input_tokens=50, output_tokens=32,
+                    total_tokens=82, daily_limit=100, monthly_limit=1000, error=None,
+                )
+            result = render_settings(settings)
+            self.assertIn("Consumo IA cercano al límite", result)
+
+    def test_13_limit_banner_when_exceeded(self):
+        """render_settings muestra banner de límite alcanzado cuando se supera."""
+        from dt_alerts.server import render_settings
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db.init_db(db_path)
+            settings = self._make_settings(
+                db_path,
+                ai_enabled=False,
+                ai_daily_token_limit=10,
+                ai_monthly_token_limit=1000,
+                ai_warning_percent=80,
+                ai_input_price_per_1m_usd=2.0,
+                ai_output_price_per_1m_usd=8.0,
+                ai_usd_clp_rate=921,
+            )
+            with db.connect(db_path) as conn:
+                db.record_ai_usage(
+                    conn, document_id=None, alert_id=None,
+                    provider="azure", model="m", operation="generate_summary",
+                    status="success", input_tokens=6, output_tokens=6,
+                    total_tokens=12, daily_limit=10, monthly_limit=1000, error=None,
+                )
+            result = render_settings(settings)
+            self.assertIn("Límite de tokens IA alcanzado", result)
+
+    def test_14_detailed_summary_new_format_renders(self):
+        """generate_detailed_summary_html maneja el nuevo formato de dict plano."""
+        from dt_alerts.notifier import generate_detailed_summary_html
+        alert = {
+            "title": "Circular de prueba",
+            "category": "Circulares",
+            "publication_date": "2026-01-01",
+            "canonical_url": "https://example.com",
+            "ai_detailed_summary_json": json.dumps({
+                "descripcion": "Descripción del documento.",
+                "impacto_contable": "Afecta los libros contables.",
+                "impacto_laboral": "Modifica las liquidaciones.",
+                "acciones_recomendadas": "Actualizar plantillas.",
+                "riesgos": "Multas por incumplimiento.",
+                "plazos": "30 días desde publicación.",
+            }),
+            "ai_key_points_json": "[]",
+            "ai_recommended_actions_json": "[]",
+            "ai_legal_disclaimer": "",
+            "summary": "",
+        }
+        html_out = generate_detailed_summary_html(1, alert)
+        self.assertIn("Impacto contable", html_out)
+        self.assertIn("Impacto laboral", html_out)
+        self.assertIn("Acciones recomendadas", html_out)
+        self.assertIn("Afecta los libros contables.", html_out)
+
+
 if __name__ == "__main__":
     unittest.main()

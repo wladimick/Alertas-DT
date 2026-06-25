@@ -119,6 +119,9 @@ class Settings:
     ai_daily_token_limit: int
     ai_monthly_token_limit: int
     ai_warning_percent: int
+    ai_input_price_per_1m_usd: float
+    ai_output_price_per_1m_usd: float
+    ai_usd_clp_rate: int
 
 
 def get_settings() -> Settings:
@@ -183,4 +186,7 @@ def get_settings() -> Settings:
         ai_daily_token_limit=env_int("AI_DAILY_TOKEN_LIMIT", 50000),
         ai_monthly_token_limit=env_int("AI_MONTHLY_TOKEN_LIMIT", 500000),
         ai_warning_percent=env_int("AI_WARNING_PERCENT", 80),
+        ai_input_price_per_1m_usd=env_float("AI_INPUT_PRICE_PER_1M_USD", 2.00),
+        ai_output_price_per_1m_usd=env_float("AI_OUTPUT_PRICE_PER_1M_USD", 8.00),
+        ai_usd_clp_rate=env_int("AI_USD_CLP_RATE", 921),
     )

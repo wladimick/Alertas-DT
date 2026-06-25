@@ -853,6 +853,34 @@ def get_recent_ai_usage(conn: sqlite3.Connection, limit: int = 5) -> list[dict[s
     return [dict(row) for row in rows]
 
 
+def get_ai_token_breakdown(conn: sqlite3.Connection) -> dict[str, int]:
+    """Retorna sumas de input/output tokens para hoy y este mes, para cálculo de costo."""
+    today_row = conn.execute(
+        """
+        SELECT COALESCE(SUM(input_tokens), 0)  AS input_t,
+               COALESCE(SUM(output_tokens), 0) AS output_t
+        FROM ai_usage_logs
+        WHERE status NOT IN ('disabled', 'missing_key', 'blocked_limit')
+          AND date(created_at) = date('now')
+        """
+    ).fetchone()
+    month_row = conn.execute(
+        """
+        SELECT COALESCE(SUM(input_tokens), 0)  AS input_t,
+               COALESCE(SUM(output_tokens), 0) AS output_t
+        FROM ai_usage_logs
+        WHERE status NOT IN ('disabled', 'missing_key', 'blocked_limit')
+          AND strftime('%Y-%m', created_at) = strftime('%Y-%m', 'now')
+        """
+    ).fetchone()
+    return {
+        "today_input": today_row["input_t"] if today_row else 0,
+        "today_output": today_row["output_t"] if today_row else 0,
+        "month_input": month_row["input_t"] if month_row else 0,
+        "month_output": month_row["output_t"] if month_row else 0,
+    }
+
+
 def get_ai_usage_status(
     conn: sqlite3.Connection,
     *,

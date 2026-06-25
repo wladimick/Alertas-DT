@@ -84,45 +84,66 @@ def build_ai_prompt(
         or "Profesional, claro, orientado a contadores y empresas chilenas."
     )
     extra = app_settings.get("ai_system_prompt") or ""
+    analysis_focus = (
+        app_settings.get("ai_analysis_focus")
+        or "Explicar impactos prácticos en cumplimiento laboral, gestión contable, "
+           "auditoría, remuneraciones y obligaciones documentales."
+    )
 
     system_prompt = (
         "Eres un analista legal-laboral chileno especializado en normativa de la "
-        "Dirección del Trabajo. "
+        "Dirección del Trabajo (DT). "
         f"Estilo editorial: {style} "
-        "No inventes obligaciones, fechas, artículos ni efectos que no estén en el texto. "
-        "Si falta información, indica 'no informado en el documento'. "
+        "Tu audiencia son contadores, jefes de RRHH, administradores y empresas chilenas. "
+        "No inventes obligaciones, fechas, artículos, montos ni sanciones que no estén en el texto. "
+        "Si falta información, indica exactamente 'no informado en el documento'. "
+        "No reemplaces la lectura del documento oficial. "
+        "Mantén tono chileno formal, sin exagerar riesgos. "
         "Responde SOLO con JSON válido, sin markdown, sin comentarios, sin texto adicional. "
         + (extra.strip() + " " if extra.strip() else "")
     ).strip()
 
     user_prompt = f"""Analiza este documento de la Dirección del Trabajo de Chile.
-Audiencia: contadores, administradores y empresas.
+Audiencia: contadores, administradores, RRHH y empresas.
+Enfoque del análisis: {analysis_focus}
 
-Explica:
-- Qué informa el documento.
-- A quién afecta.
-- Qué debería revisar el contador.
-- Qué acciones prácticas conviene tomar.
+El correo debe contener un resumen breve y los impactos en el día a día del contador.
+Adjunta resumen ejecutivo y resumen detallado.
 
 Responde ÚNICAMENTE con este JSON (sin markdown, sin texto extra):
 
 {{
-  "title": "Título corregido del documento",
-  "category": "Categoría normativa",
-  "official_date": "Fecha oficial si existe o null",
+  "title": "Título corregido del documento (sin agregar información no presente)",
+  "category": "Categoría normativa (ej: Circular, Dictamen, Resolución, Ordinario)",
+  "official_date": "Fecha oficial del documento si existe, o null",
   "source_institution": "Dirección del Trabajo",
   "relevance": "bajo|medio|alto",
-  "email_subject": "Nueva normativa DT: ...",
-  "email_summary": "Resumen breve de 2 a 4 párrafos para el correo.",
-  "key_points": ["Punto clave 1", "Punto clave 2", "Punto clave 3"],
-  "practical_impacts": [
-    {{"title": "Impacto 1", "description": "Descripción práctica para contadores/empresas."}}
+  "email_subject": "Nueva normativa DT: [título conciso]",
+  "email_summary": "Resumen breve de 2 a 3 párrafos para el cuerpo del correo. Lenguaje claro para contadores.",
+  "key_points": [
+    "Punto clave 1: qué establece el documento",
+    "Punto clave 2: a quién afecta",
+    "Punto clave 3: fecha o vigencia si aplica"
   ],
-  "recommended_actions": ["Acción recomendada 1", "Acción recomendada 2"],
-  "executive_summary": {{"title": "Resumen ejecutivo", "body": "Resumen ejecutivo claro, breve y accionable."}},
+  "practical_impacts": [
+    {{"title": "Impacto en remuneraciones", "description": "Descripción del impacto en el día a día del contador."}},
+    {{"title": "Impacto en cumplimiento laboral", "description": "Qué debe verificar o ajustar la empresa."}}
+  ],
+  "recommended_actions": [
+    "Acción concreta 1 que debe tomar el contador o RRHH",
+    "Acción concreta 2 con plazo si corresponde"
+  ],
+  "executive_summary": {{
+    "title": "Resumen ejecutivo",
+    "body": "Resumen ejecutivo en 1 a 2 párrafos: qué es, por qué importa, qué hacer."
+  }},
   "detailed_summary": {{
-    "title": "Resumen detallado",
-    "sections": [{{"heading": "Sección 1", "body": "Desarrollo detallado."}}]
+    "descripcion": "Descripción detallada del documento y su alcance.",
+    "impacto_contable": "Impacto en registros contables, libros o declaraciones.",
+    "impacto_laboral": "Impacto en contratos, remuneraciones, finiquitos o licencias.",
+    "acciones_recomendadas": "Pasos concretos para cumplir o implementar.",
+    "riesgos": "Riesgos de no cumplir, si el documento los menciona.",
+    "plazos": "Plazos relevantes mencionados en el documento, o 'no informado'."
   }},
   "tags": ["Dirección del Trabajo", "Normativa laboral", "Contadores"],
   "legal_disclaimer": "Este resumen es informativo y no reemplaza la lectura del documento oficial ni asesoría profesional."

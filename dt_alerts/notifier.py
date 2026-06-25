@@ -367,13 +367,29 @@ def generate_detailed_summary_html(document_id: int, alert: dict[str, Any]) -> s
     )
 
     sections_html = ""
-    for section in detailed.get("sections") or []:
-        h_text = html.escape(str(section.get("heading") or ""))
-        b_text = html.escape(str(section.get("body") or ""))
-        if h_text:
-            sections_html += f"<h2>{h_text}</h2>"
-        if b_text:
-            sections_html += f"<p>{b_text}</p>"
+    if "sections" in detailed:
+        # Formato antiguo: {"title": "...", "sections": [{"heading": "...", "body": "..."}]}
+        for section in detailed.get("sections") or []:
+            h_text = html.escape(str(section.get("heading") or ""))
+            b_text = html.escape(str(section.get("body") or ""))
+            if h_text:
+                sections_html += f"<h2>{h_text}</h2>"
+            if b_text:
+                sections_html += f"<p>{b_text}</p>"
+    else:
+        # Formato nuevo: dict plano con claves específicas
+        _SECTION_LABELS = [
+            ("descripcion", "Descripción"),
+            ("impacto_contable", "Impacto contable"),
+            ("impacto_laboral", "Impacto laboral"),
+            ("acciones_recomendadas", "Acciones recomendadas"),
+            ("riesgos", "Riesgos"),
+            ("plazos", "Plazos"),
+        ]
+        for key, label in _SECTION_LABELS:
+            val = str(detailed.get(key) or "").strip()
+            if val and val != "no informado en el documento":
+                sections_html += f"<h2>{label}</h2><p>{html.escape(val)}</p>"
 
     if not sections_html:
         fallback = html.escape(alert.get("summary") or "Sin contenido disponible.")
@@ -649,27 +665,38 @@ def _send_smtp(
 # Helpers de alto nivel
 # --------------------------------------------------------------------------
 
+def _slug_from_title(title: str, max_len: int = 40) -> str:
+    import re
+    slug = re.sub(r"[^\w\s-]", "", (title or "").lower())
+    slug = re.sub(r"[\s_-]+", "_", slug).strip("_")
+    return slug[:max_len] or "doc"
+
+
 def _build_attachments(alert: dict[str, Any], settings: Settings) -> list[dict[str, Any]]:
     """Build HTML attachments for executive and detailed summary."""
     ai_enabled = getattr(settings, "ai_attachments_enabled", True)
     if not ai_enabled:
         return []
-    if not alert.get("ai_status"):
+    ai_status = alert.get("ai_status")
+    if ai_status not in ("success", "fallback"):
         return []
     document_id = alert.get("document_id") or alert.get("id") or 0
+    slug = _slug_from_title(alert.get("title") or "")
     attachments = []
     exec_html = generate_executive_summary_html(document_id, alert)
-    attachments.append({
-        "content": exec_html,
-        "type": "text/html; charset=utf-8",
-        "filename": f"resumen_ejecutivo_{document_id}.html",
-    })
+    if exec_html.strip():
+        attachments.append({
+            "content": exec_html,
+            "type": "text/html; charset=utf-8",
+            "filename": f"resumen_ejecutivo_{slug}_{document_id}.html",
+        })
     detail_html = generate_detailed_summary_html(document_id, alert)
-    attachments.append({
-        "content": detail_html,
-        "type": "text/html; charset=utf-8",
-        "filename": f"resumen_detallado_{document_id}.html",
-    })
+    if detail_html.strip():
+        attachments.append({
+            "content": detail_html,
+            "type": "text/html; charset=utf-8",
+            "filename": f"resumen_detallado_{slug}_{document_id}.html",
+        })
     return attachments
 
 
@@ -694,12 +721,14 @@ def send_test_alert_email(
     alert: dict[str, Any],
     settings: Settings,
 ) -> dict[str, Any]:
+    attachments = _build_attachments(alert, settings)
     return send_email(
         settings,
         to=to_email,
         subject=f"[PRUEBA] {subject_for(alert)}",
         html_body=render_alert_email_html(alert),
         text_body=render_alert_email_text(alert),
+        attachments=attachments or None,
     )
 
 
