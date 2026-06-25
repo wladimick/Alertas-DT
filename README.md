@@ -188,9 +188,15 @@ EMAIL_FROM_NAME=Alertas DT
 EMAIL_REPLY_TO=
 TEST_EMAIL_TO=
 
-# IA (opcional). Sin clave, el resumen usa fallback local y queda pending_review.
-OPENAI_API_KEY=
-OPENAI_MODEL=gpt-4o-mini
+# IA (opcional). Sin clave o con disabled, el resumen usa fallback local y queda pending_review.
+AI_PROVIDER=disabled           # disabled | openai | azure
+AI_API_KEY=                    # Nunca hardcodear. No se guarda en DB ni en logs.
+AI_MODEL=gpt-4o-mini           # Para Azure: nombre del deployment
+AI_BASE_URL=                   # Solo Azure: https://tu-recurso.openai.azure.com
+AI_SUMMARY_TEMPERATURE=0.2
+AI_TIMEOUT_SECONDS=60
+AI_MAX_INPUT_CHARS=45000
+AI_ATTACHMENTS_ENABLED=true    # Adjunta resumen ejecutivo y detallado al email
 
 # Worker
 RUN_WORKER=True
@@ -215,6 +221,53 @@ WORDPRESS_SYNC_LIMIT=100
 - **No usar `DISABLE_ADMIN_AUTH=True` en Render producción.** Producción debe quedar con
   `DISABLE_ADMIN_AUTH=False` (o sin la variable) y un `ADMIN_TOKEN` largo.
 - Para la demo con César se usa **login con `ADMIN_TOKEN`** (admin no abierto).
+
+---
+
+## Integración con IA
+
+La app genera resúmenes profesionales con OpenAI o Azure OpenAI. Si IA está
+desactivada o falla, usa un fallback local sin romper el monitoreo.
+
+### Seguridad
+
+- `AI_API_KEY` nunca se guarda en la base de datos, nunca aparece en logs, y se
+  enmascara en el admin (solo se muestran los primeros 6 y últimos 4 caracteres).
+- Si la clave aparece en un mensaje de error, se reemplaza por `[REDACTED]`.
+- El raw response de la IA se trunca a 10 000 caracteres al guardarlo.
+
+### Proveedores
+
+**OpenAI:**
+```env
+AI_PROVIDER=openai
+AI_API_KEY=sk-...          # Variable de entorno — nunca hardcodear
+AI_MODEL=gpt-4o-mini       # o gpt-4o, gpt-4-turbo, etc.
+```
+
+**Azure OpenAI / Azure AI Foundry:**
+```env
+AI_PROVIDER=azure
+AI_API_KEY=...             # API key del recurso Azure — nunca hardcodear
+AI_MODEL=mi-deployment     # Nombre del deployment en Azure
+AI_BASE_URL=https://mi-recurso.openai.azure.com
+```
+
+**Desactivado (default):**
+```env
+AI_PROVIDER=disabled
+```
+
+### Flujo de revisión
+
+Toda alerta con resumen IA queda en estado `pending_review`. **No hay envío
+automático.** El operador revisa desde `/admin/alerts`, genera o regenera el
+resumen, y luego decide enviar manualmente.
+
+### Adjuntos
+
+Con `AI_ATTACHMENTS_ENABLED=true` y SendGrid, el email incluye dos adjuntos HTML:
+`resumen_ejecutivo_{id}.html` y `resumen_detallado_{id}.html`.
 
 ---
 

@@ -8,7 +8,7 @@ from typing import Any
 from . import db
 from .config import DT_SOURCES, Settings, get_settings
 from .dt_scraper import ScrapedDocument, content_hash, enrich_document_detail, fetch_listing
-from .summarizer import summarize_document
+from .summarizer import _generate_and_save as _ai_generate, summarize_document
 
 
 log = logging.getLogger("dt_alerts.worker")
@@ -113,12 +113,28 @@ def process_new_document(
         enriched = doc
 
     doc_dict = enriched.to_db_dict()
-    summary = summarize_document(doc_dict, settings)
+
+    # Persist document first so generate_ai_summary can load it from DB
+    db.update_document_processed(
+        conn,
+        document_id,
+        status="processed" if not detail_error else "error",
+        detail_text=enriched.detail_text,
+        pdf_url=enriched.pdf_url,
+        content_hash=enriched.content_hash,
+        last_error=detail_error,
+    )
+
+    app_settings = db.get_all_settings(conn)
+    try:
+        summary = _ai_generate(conn, document_id, settings, app_settings)
+    except Exception as exc:
+        summary = summarize_document(doc_dict, settings)
+        summary.ai_error = f"Error generando resumen: {exc}"
     if detail_error:
         summary.ai_error = f"{detail_error} | {summary.ai_error or ''}".strip(" |")
 
-    # Flujo de revisión: toda alerta nueva nace 'pending_review'.
-    # El envío a suscriptores es manual desde el admin (etapa 11), nunca automático.
+    # Toda alerta nueva nace 'pending_review'. El envío es manual desde el admin.
     alert_id = db.create_or_update_alert(
         conn,
         document_id,
@@ -128,15 +144,6 @@ def process_new_document(
         relevance=summary.relevance,
         status="pending_review",
         ai_error=summary.ai_error,
-    )
-    db.update_document_processed(
-        conn,
-        document_id,
-        status="processed" if not detail_error else "error",
-        detail_text=enriched.detail_text,
-        pdf_url=enriched.pdf_url,
-        content_hash=enriched.content_hash,
-        last_error=detail_error,
     )
 
     # No se envía nada en el job: las alertas quedan listas para revisión.
@@ -152,7 +159,12 @@ def regenerate_alert(conn, document_id: int, settings: Settings | None = None) -
     document = db.get_document(conn, document_id)
     if not document:
         return None
-    summary = summarize_document(document, settings)
+    app_settings = db.get_all_settings(conn)
+    try:
+        summary = _ai_generate(conn, document_id, settings, app_settings, force=True)
+    except Exception as exc:
+        summary = summarize_document(document, settings)
+        summary.ai_error = f"Error regenerando resumen: {exc}"
     alert_id = db.create_or_update_alert(
         conn,
         document_id,

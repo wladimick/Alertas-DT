@@ -119,10 +119,35 @@ def migrate(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS ai_summaries (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER NOT NULL UNIQUE,
+            provider TEXT,
+            model TEXT,
+            status TEXT NOT NULL DEFAULT 'pending',
+            input_hash TEXT,
+            content_quality TEXT,
+            relevance TEXT,
+            email_subject TEXT,
+            email_summary TEXT,
+            key_points_json TEXT,
+            practical_impacts_json TEXT,
+            recommended_actions_json TEXT,
+            executive_summary TEXT,
+            detailed_summary_json TEXT,
+            tags_json TEXT,
+            legal_disclaimer TEXT,
+            raw_response_json TEXT,
+            error TEXT,
+            created_at TEXT NOT NULL,
+            updated_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_subscribers_status ON subscribers(status);
         CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
         CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
         CREATE INDEX IF NOT EXISTS idx_deliveries_alert ON deliveries(alert_id);
+        CREATE INDEX IF NOT EXISTS idx_ai_summaries_document ON ai_summaries(document_id);
         """
     )
 
@@ -420,9 +445,15 @@ def list_alerts(conn: sqlite3.Connection, limit: int = 200) -> list[dict[str, An
             documents.title,
             documents.category,
             documents.canonical_url,
-            documents.publication_date
+            documents.publication_date,
+            ai_summaries.status AS ai_status,
+            ai_summaries.provider AS ai_provider,
+            ai_summaries.content_quality AS ai_content_quality,
+            ai_summaries.email_subject AS ai_email_subject,
+            ai_summaries.error AS ai_summary_error
         FROM alerts
         JOIN documents ON documents.id = alerts.document_id
+        LEFT JOIN ai_summaries ON ai_summaries.document_id = alerts.document_id
         ORDER BY alerts.created_at DESC, alerts.id DESC
         LIMIT ?
         """,
@@ -444,9 +475,27 @@ def get_alert_with_document(
             documents.title,
             documents.publication_date,
             documents.abstract,
-            documents.pdf_url
+            documents.pdf_url,
+            ai_summaries.id AS ai_summary_id,
+            ai_summaries.provider AS ai_provider,
+            ai_summaries.model AS ai_model,
+            ai_summaries.status AS ai_status,
+            ai_summaries.content_quality AS ai_content_quality,
+            ai_summaries.relevance AS ai_relevance,
+            ai_summaries.email_subject AS ai_email_subject,
+            ai_summaries.email_summary AS ai_email_summary,
+            ai_summaries.key_points_json AS ai_key_points_json,
+            ai_summaries.practical_impacts_json AS ai_practical_impacts_json,
+            ai_summaries.recommended_actions_json AS ai_recommended_actions_json,
+            ai_summaries.executive_summary AS ai_executive_summary,
+            ai_summaries.detailed_summary_json AS ai_detailed_summary_json,
+            ai_summaries.tags_json AS ai_tags_json,
+            ai_summaries.legal_disclaimer AS ai_legal_disclaimer,
+            ai_summaries.error AS ai_summary_error,
+            ai_summaries.updated_at AS ai_updated_at
         FROM alerts
         JOIN documents ON documents.id = alerts.document_id
+        LEFT JOIN ai_summaries ON ai_summaries.document_id = alerts.document_id
         WHERE alerts.id = ?
         """,
         (alert_id,),
@@ -593,3 +642,82 @@ def last_delivery_sent_at(conn: sqlite3.Connection) -> str | None:
         "SELECT sent_at FROM deliveries WHERE status IN ('sent','simulated') ORDER BY sent_at DESC LIMIT 1"
     ).fetchone()
     return row["sent_at"] if row else None
+
+
+# --------------------------------------------------------------------------
+# ai_summaries — resúmenes generados con IA por documento
+# --------------------------------------------------------------------------
+
+def get_ai_summary(conn: sqlite3.Connection, document_id: int) -> dict[str, Any] | None:
+    row = conn.execute(
+        "SELECT * FROM ai_summaries WHERE document_id = ?", (document_id,)
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def upsert_ai_summary(
+    conn: sqlite3.Connection,
+    document_id: int,
+    *,
+    provider: str | None,
+    model: str | None,
+    status: str,
+    input_hash: str | None = None,
+    content_quality: str | None = None,
+    relevance: str | None = None,
+    email_subject: str | None = None,
+    email_summary: str | None = None,
+    key_points_json: str | None = None,
+    practical_impacts_json: str | None = None,
+    recommended_actions_json: str | None = None,
+    executive_summary: str | None = None,
+    detailed_summary_json: str | None = None,
+    tags_json: str | None = None,
+    legal_disclaimer: str | None = None,
+    raw_response_json: str | None = None,
+    error: str | None = None,
+) -> int:
+    now = utcnow()
+    conn.execute(
+        """
+        INSERT INTO ai_summaries (
+            document_id, provider, model, status, input_hash, content_quality,
+            relevance, email_subject, email_summary, key_points_json,
+            practical_impacts_json, recommended_actions_json, executive_summary,
+            detailed_summary_json, tags_json, legal_disclaimer, raw_response_json,
+            error, created_at, updated_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        ON CONFLICT(document_id) DO UPDATE SET
+            provider = excluded.provider,
+            model = excluded.model,
+            status = excluded.status,
+            input_hash = excluded.input_hash,
+            content_quality = excluded.content_quality,
+            relevance = excluded.relevance,
+            email_subject = excluded.email_subject,
+            email_summary = excluded.email_summary,
+            key_points_json = excluded.key_points_json,
+            practical_impacts_json = excluded.practical_impacts_json,
+            recommended_actions_json = excluded.recommended_actions_json,
+            executive_summary = excluded.executive_summary,
+            detailed_summary_json = excluded.detailed_summary_json,
+            tags_json = excluded.tags_json,
+            legal_disclaimer = excluded.legal_disclaimer,
+            raw_response_json = excluded.raw_response_json,
+            error = excluded.error,
+            updated_at = excluded.updated_at
+        """,
+        (
+            document_id, provider, model, status, input_hash, content_quality,
+            relevance, email_subject, email_summary, key_points_json,
+            practical_impacts_json, recommended_actions_json, executive_summary,
+            detailed_summary_json, tags_json, legal_disclaimer, raw_response_json,
+            error, now, now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute(
+        "SELECT id FROM ai_summaries WHERE document_id = ?", (document_id,)
+    ).fetchone()
+    return int(row["id"])
