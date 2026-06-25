@@ -205,17 +205,26 @@ def _call_openai_api(system_prompt: str, user_prompt: str, settings: Settings) -
     )
 
 
+def _read_http_error(exc: urllib.error.HTTPError) -> str:
+    """Lee el cuerpo de error HTTP sin exponer secretos."""
+    try:
+        body = exc.read().decode("utf-8", errors="replace")
+    except Exception:
+        body = ""
+    detail = body.strip() or str(exc)
+    return f"HTTP {exc.code}: {detail[:1000]}"
+
+
 def _call_azure_api(system_prompt: str, user_prompt: str, settings: Settings) -> AIResponse:
     """
-    Soporta dos estilos Azure:
+    Azure v1 Responses API:
+    AI_BASE_URL=https://DemoTiboxIA.services.ai.azure.com/openai/v1
+    POST {AI_BASE_URL}/responses
 
-    1) Endpoint compatible OpenAI v1:
-       AI_BASE_URL=https://DemoTiboxIA.services.ai.azure.com/openai/v1
-       POST {AI_BASE_URL}/responses
-
-    2) Endpoint Azure OpenAI clásico:
-       AI_BASE_URL=https://recurso.openai.azure.com
-       POST {AI_BASE_URL}/openai/deployments/{AI_MODEL}/chat/completions?api-version=...
+    Nota:
+    El endpoint v1 usa model=deployment_name y no requiere api-version.
+    Para maximizar compatibilidad, no enviamos temperature ni response_format aquí.
+    El JSON se exige por prompt fijo.
     """
     base_url = settings.ai_base_url.rstrip("/")
     deployment = settings.ai_model
@@ -223,23 +232,23 @@ def _call_azure_api(system_prompt: str, user_prompt: str, settings: Settings) ->
     if base_url.endswith("/openai/v1"):
         payload = {
             "model": deployment,
-            "input": f"{system_prompt}\n\n{user_prompt}",
-            "temperature": settings.ai_summary_temperature,
+            "instructions": system_prompt,
+            "input": user_prompt,
         }
         request = urllib.request.Request(
             f"{base_url}/responses",
             data=json.dumps(payload).encode("utf-8"),
             headers={
-                # El endpoint /openai/v1 usado por el SDK OpenAI envía Bearer.
-                # api-key se incluye también para compatibilidad con Azure.
                 "Authorization": f"Bearer {settings.ai_api_key}",
-                "api-key": settings.ai_api_key,
                 "Content-Type": "application/json",
             },
             method="POST",
         )
-        with urllib.request.urlopen(request, timeout=settings.ai_timeout_seconds) as resp:  # noqa: S310
-            body = json.loads(resp.read().decode("utf-8"))
+        try:
+            with urllib.request.urlopen(request, timeout=settings.ai_timeout_seconds) as resp:  # noqa: S310
+                body = json.loads(resp.read().decode("utf-8"))
+        except urllib.error.HTTPError as exc:
+            raise RuntimeError(_read_http_error(exc)) from exc
 
         content = _extract_responses_text(body)
         input_tokens, output_tokens, total_tokens = _usage_from_dict(body.get("usage"))
@@ -250,6 +259,7 @@ def _call_azure_api(system_prompt: str, user_prompt: str, settings: Settings) ->
             total_tokens=total_tokens,
         )
 
+    # Fallback Azure OpenAI clásico /chat/completions
     url = (
         f"{base_url}/openai/deployments/{deployment}"
         "/chat/completions?api-version=2024-02-15-preview"
@@ -271,8 +281,11 @@ def _call_azure_api(system_prompt: str, user_prompt: str, settings: Settings) ->
         },
         method="POST",
     )
-    with urllib.request.urlopen(request, timeout=settings.ai_timeout_seconds) as resp:  # noqa: S310
-        body = json.loads(resp.read().decode("utf-8"))
+    try:
+        with urllib.request.urlopen(request, timeout=settings.ai_timeout_seconds) as resp:  # noqa: S310
+            body = json.loads(resp.read().decode("utf-8"))
+    except urllib.error.HTTPError as exc:
+        raise RuntimeError(_read_http_error(exc)) from exc
 
     content = body["choices"][0]["message"]["content"]
     input_tokens, output_tokens, total_tokens = _usage_from_dict(body.get("usage"))
