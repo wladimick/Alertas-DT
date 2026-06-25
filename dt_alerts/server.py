@@ -93,7 +93,8 @@ class AppHandler(BaseHTTPRequestHandler):
             if not self.is_admin():
                 self.redirect("/admin/login")
                 return
-            self.respond_html(render_alert_preview(int(match.group(1)), self.settings))
+            flash = query.get("flash", [""])[0]
+            self.respond_html(render_alert_preview(int(match.group(1)), self.settings, flash=flash))
         elif match := re.match(r"^/admin/alerts/(\d+)/executive-summary$", path):
             if not self.is_admin():
                 self.redirect("/admin/login")
@@ -242,8 +243,13 @@ class AppHandler(BaseHTTPRequestHandler):
             document_id = int(match.group(1))
             with db.connect(self.settings.database_path) as conn:
                 alert_id = regenerate_alert(conn, document_id, self.settings)
-            msg = "Resumen regenerado (queda pendiente de revisión)." if alert_id else "Documento no encontrado."
-            self.redirect_flash("/admin/documents", msg)
+            if alert_id:
+                self.redirect_flash(
+                    f"/admin/alerts/{alert_id}/preview-email",
+                    "Resumen regenerado. Revisa la vista previa antes de enviarlo.",
+                )
+            else:
+                self.redirect_flash("/admin/documents", "Documento no encontrado.")
         elif match := re.match(r"^/admin/documents/(\d+)/ignore$", path):
             self.require_admin()
             document_id = int(match.group(1))
@@ -883,10 +889,9 @@ def render_sidebar(path: str, settings: Settings) -> str:
     items = "".join(parts)
     return f"""
 <div class="eg-brand">
-  {_EG_LOGO_SVG}
-  <div class="eg-brand-text">
-    <div class="eg-brand-name">EXTERNAL GROUP</div>
-    <div class="eg-brand-sub">ALERTAS DT</div>
+  <div class="eg-brand-logo-wrap">
+    <img src="{EG_LOGO_LIGHT}" alt="External Group" style="display:block;width:120px;height:auto;object-fit:contain;">
+    <div class="eg-brand-sub" style="margin-top:6px;">ALERTAS DT</div>
   </div>
 </div>
 <div class="eg-hairline"></div>
@@ -1045,8 +1050,52 @@ def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
             + metric_card("send", sent_count, "Alertas enviadas", "a suscriptores activos", "success")
             + metric_card("mail", sent_deliveries, "Envíos registrados", "incluye simulados", "muted")
         )
+        # --- Bloque "Siguiente acción recomendada" ---
+        activity_lines: list[str] = []
+        if pending_count:
+            activity_lines.append(
+                f'<span>Tienes <strong>{pending_count}</strong> alerta{"s" if pending_count != 1 else ""} pendiente{"s" if pending_count != 1 else ""} de revisión.</span>'
+            )
+        if ready_count:
+            activity_lines.append(
+                f'<span>Listas para enviar: <strong>{ready_count}</strong>.</span>'
+            )
+        activity_lines.append(
+            f'<span>Suscriptores activos: <strong>{active_count}</strong>.</span>'
+        )
+        if last_job:
+            job_status_label = status_label(last_job.get("status") or "")
+            job_new = last_job.get("discovered_count") or 0
+            activity_lines.append(
+                f'<span>Último monitoreo: {fmt_dt(last_job.get("started_at"))} · {h(job_status_label)}'
+                f'{f" · {job_new} nuevos" if job_new else ""}.</span>'
+            )
+        if pending_count:
+            cta_label = "Revisar alerta pendiente"
+            cta_href = "/admin/alerts"
+            cta_icon = "bell"
+        elif ready_count:
+            cta_label = "Ver alertas listas para enviar"
+            cta_href = "/admin/alerts"
+            cta_icon = "send"
+        else:
+            cta_label = "Ejecutar monitoreo"
+            cta_href = "#run-monitor"
+            cta_icon = "activity"
+        activity_html = (
+            '<section class="eg-card eg-panel" style="margin-bottom:16px;">'
+            '<p class="eg-eyebrow">Actividad</p>'
+            '<h2>Siguiente acción recomendada</h2>'
+            '<div style="display:flex;flex-direction:column;gap:5px;margin:10px 0 14px;font-size:13.5px;color:var(--eg-muted);">'
+            + "".join(f'<div>{line}</div>' for line in activity_lines)
+            + '</div>'
+            f'<a class="eg-btn eg-btn--primary eg-btn--sm" href="{cta_href}">'
+            f'{icon(cta_icon, 15)}<span>{cta_label}</span></a>'
+            '</section>'
+        )
         section = (
             f'<div class="eg-metric-grid">{cards}</div>'
+            + activity_html
             + render_system_status(settings, last_job)
             + render_jobs(jobs[:5])
             + render_alerts(alerts[:6])
@@ -1576,47 +1625,32 @@ def ai_status_badge(item: dict[str, Any]) -> str:
 
 
 def alert_actions(item: dict[str, Any]) -> str:
+    """Acciones esenciales de la card. Acciones secundarias (IA, descargas) van en preview."""
     alert_id = item["id"]
     status = item["status"]
     ai_st = item.get("ai_status") or ""
-    main_btns: list[str] = [
+    btns: list[str] = [
         f'<a class="eg-btn eg-btn--primary eg-btn--sm" href="/admin/alerts/{alert_id}/preview-email">'
         f'{icon("eye", 14)}<span>Vista previa</span></a>'
     ]
     if status == "pending_review":
-        main_btns.append(
+        btns.append(
             f'<form method="post" action="/admin/alerts/{alert_id}/ready">'
             f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
             f'{icon("check", 14)}<span>Marcar lista</span></button></form>'
         )
     if status in {"ready_to_send", "ready"}:
-        main_btns.append(
+        btns.append(
             f'<form method="post" action="/admin/alerts/{alert_id}/send" '
             f'onsubmit="return confirm(\'¿Enviar esta alerta a los suscriptores activos?\');">'
             f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
             f'{icon("send", 14)}<span>Enviar</span></button></form>'
         )
-    # AI actions
     if not ai_st:
-        main_btns.append(
+        btns.append(
             f'<form method="post" action="/admin/alerts/{alert_id}/generate-ai">'
             f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
             f'{icon("cpu", 14)}<span>Generar con IA</span></button></form>'
-        )
-    else:
-        main_btns.append(
-            f'<form method="post" action="/admin/alerts/{alert_id}/regenerate-ai">'
-            f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
-            f'{icon("refresh", 14)}<span>Regenerar con IA</span></button></form>'
-        )
-    if ai_st in ("success", "fallback"):
-        main_btns.append(
-            f'<a class="eg-btn eg-ghost eg-btn--sm" href="/admin/alerts/{alert_id}/executive-summary" download>'
-            f'{icon("document", 14)}<span>Resumen ejecutivo</span></a>'
-        )
-        main_btns.append(
-            f'<a class="eg-btn eg-ghost eg-btn--sm" href="/admin/alerts/{alert_id}/detailed-summary" download>'
-            f'{icon("document", 14)}<span>Resumen detallado</span></a>'
         )
     test_form = (
         f'<form method="post" action="/admin/alerts/{alert_id}/test" class="eg-test-row">'
@@ -1624,30 +1658,32 @@ def alert_actions(item: dict[str, Any]) -> str:
         f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
         f'{icon("mail", 14)}<span>Enviar prueba</span></button></form>'
     )
-    action_row = '<div class="eg-action-row">' + "".join(main_btns) + "</div>"
-    return f'<div class="eg-alert-actions">{action_row}{test_form}</div>'
+    return (
+        f'<div class="eg-alert-actions">'
+        f'<div class="eg-action-row">{"".join(btns)}</div>'
+        f'{test_form}'
+        f'</div>'
+    )
 
 
 def alert_card(item: dict[str, Any]) -> str:
-    return f"""
-<article class="eg-alert-card">
+    return f"""<article class="eg-alert-card">
   <div class="accent"></div>
   <div class="eg-alert-body">
     <div class="eg-alert-meta-top">
-      <div class="eg-alert-cat">{h(item['category'])}</div>
-      <div class="eg-alert-chips">
+      <span class="eg-alert-cat">{h(item['category'])}</span>
+      <span class="eg-alert-chips">
         {rel_badge(item['relevance'])}
         {badge(item['status'])}
         {ai_status_badge(item)}
-      </div>
+      </span>
     </div>
     <h3 class="eg-alert-title">{h(item['title'])}</h3>
     <p class="eg-alert-summary">{h(item['summary'])}</p>
     <div class="eg-alert-date mono">{fmt_dt(item.get('created_at'))}</div>
   </div>
   {alert_actions(item)}
-</article>
-"""
+</article>"""
 
 
 def render_alerts(alerts: list[dict[str, Any]]) -> str:
@@ -1682,7 +1718,7 @@ def render_documents(documents: list[dict[str, Any]]) -> str:
   <td class="mono">{h(item.get('dt_article_id'))}</td>
   <td>{badge(item['status'])}</td>
   <td>
-    <a class="eg-btn eg-btn--primary eg-btn--sm" href="{h(item['canonical_url'])}" target="_blank" rel="noreferrer">
+    <a class="eg-btn eg-btn--primary eg-btn--sm" href="{h(item['canonical_url'])}" target="_blank" rel="noopener noreferrer">
       {icon('external', 14)}<span>Ver en DT</span>
     </a>
   </td>
@@ -1715,7 +1751,7 @@ def render_documents(documents: list[dict[str, Any]]) -> str:
 """
 
 
-def render_alert_preview(alert_id: int, settings: Settings) -> str:
+def render_alert_preview(alert_id: int, settings: Settings, *, flash: str = "") -> str:
     with db.connect(settings.database_path) as conn:
         alert = db.get_alert_with_document(conn, alert_id)
     sidebar = render_sidebar("/admin/alerts", settings)
@@ -1748,90 +1784,120 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
         )
 
     ai_st = alert.get("ai_status") or ""
+
+    # --- Paneles inferiores ---
     ai_panel = ""
+    exec_panel = ""
+    detail_panel = ""
+    ai_attach_card = ""
+
     if ai_st:
         ai_label, _ = AI_STATUS_LABELS.get(ai_st, (ai_st, ""))
-        ai_panel = f"""
-<section class="eg-card eg-panel">
+        ai_error_text = h((alert.get('ai_summary_error') or '—')[:200])
+
+        # Acciones consolidadas
+        dl_exec = (
+            f'<a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/alerts/{alert_id}/executive-summary" download>'
+            f'{icon("document", 14)}<span>Descargar ejecutivo</span></a>'
+            if ai_st in ("success", "fallback") else ""
+        )
+        dl_detail = (
+            f'<a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/alerts/{alert_id}/detailed-summary" download>'
+            f'{icon("document", 14)}<span>Descargar detallado</span></a>'
+            if ai_st in ("success", "fallback") else ""
+        )
+        regen_btn = (
+            f'<form method="post" action="/admin/alerts/{alert_id}/regenerate-ai" style="display:inline;">'
+            f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
+            f'{icon("refresh", 14)}<span>Regenerar con IA</span></button></form>'
+        )
+        canon_btn = (
+            f'<a class="eg-btn eg-ghost eg-btn--sm" href="{h(alert["canonical_url"])}" target="_blank" rel="noopener noreferrer">'
+            f'{icon("external", 14)}<span>Ver documento oficial</span></a>'
+        )
+        actions_html = f'<div class="eg-actions" style="margin-top:12px;">{dl_exec}{dl_detail}{regen_btn}{canon_btn}</div>'
+
+        ai_panel = f"""<section class="eg-card eg-panel">
   <p class="eg-eyebrow">Inteligencia Artificial</p>
   <h2>Estado del resumen IA</h2>
   <p class="eg-devbanner" style="font-size:13px;font-weight:600;">
-    Contenido generado con apoyo de IA. Debe ser revisado antes de su envío.
+    Contenido generado con apoyo de IA. Revisar antes de enviar.
   </p>
   <dl class="eg-kv eg-kv--2col">
-    <dt>Estado IA</dt><dd>{h(ai_label)}</dd>
+    <dt>Estado</dt><dd>{h(ai_label)}</dd>
     <dt>Proveedor</dt><dd class="mono">{h(alert.get('ai_provider') or '—')}</dd>
     <dt>Modelo</dt><dd class="mono">{h(alert.get('ai_model') or '—')}</dd>
     <dt>Calidad</dt><dd class="mono">{h(alert.get('ai_content_quality') or '—')}</dd>
     <dt>Generado</dt><dd class="mono">{fmt_dt(alert.get('ai_updated_at'))}</dd>
-    <dt>Error</dt><dd class="eg-muted mono" style="font-size:12px;">{h((alert.get('ai_summary_error') or '—')[:120])}</dd>
+    <dt>Error</dt><dd class="eg-muted mono" style="font-size:12px;">{ai_error_text}</dd>
   </dl>
-  <div class="eg-actions" style="margin-top:12px;">
-    <a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/alerts/{alert_id}/executive-summary" download>
-      {icon("document", 14)}<span>Descargar resumen ejecutivo</span>
-    </a>
-    <a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/alerts/{alert_id}/detailed-summary" download>
-      {icon("document", 14)}<span>Descargar resumen detallado</span>
-    </a>
-    <form method="post" action="/admin/alerts/{alert_id}/regenerate-ai" style="display:inline;">
-      <button class="eg-btn eg-ghost eg-btn--sm" type="submit">{icon("refresh", 14)}<span>Regenerar con IA</span></button>
-    </form>
-  </div>
+  {actions_html}
 </section>"""
 
-    # Executive summary inline
-    exec_panel = ""
+        # Estado de adjuntos como tarjeta compacta (junto a IA panel)
+        if ai_st in ("success", "fallback") and settings.ai_attachments_enabled:
+            ai_attach_card = f"""<section class="eg-card eg-panel">
+  <p class="eg-eyebrow">Adjuntos</p>
+  <h2>Estado de adjuntos</h2>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Resumen ejecutivo</dt><dd>{badge('active', 'Preparado')}</dd>
+    <dt>Resumen detallado</dt><dd>{badge('active', 'Preparado')}</dd>
+    <dt>Doc. oficial</dt><dd>{badge('simulated', 'Enlace en correo') if not alert.get('pdf_url') else badge('active', 'PDF disponible')}</dd>
+  </dl>
+  <p class="eg-muted" style="font-size:12px;">Se adjuntan automáticamente si AI_ATTACHMENTS_ENABLED=true.</p>
+</section>"""
+
+    # Resumen ejecutivo como <details> colapsable
     raw_exec = alert.get("ai_executive_summary") or ""
     if raw_exec:
         try:
             exec_data = json.loads(raw_exec)
         except Exception:
             exec_data = {"title": "Resumen ejecutivo", "body": raw_exec}
-        exec_panel = f"""
-<section class="eg-card eg-panel">
-  <p class="eg-eyebrow">Adjunto</p>
-  <h2>{h(exec_data.get('title') or 'Resumen ejecutivo')}</h2>
-  <p style="font-size:14px;line-height:1.6;color:#3C4A52;">{h((exec_data.get('body') or '')[:1200])}</p>
-</section>"""
+        exec_title = h(exec_data.get('title') or 'Resumen ejecutivo')
+        exec_body = h((exec_data.get('body') or '')[:1500])
+        exec_panel = f"""<details class="eg-card eg-panel" style="padding:0;">
+  <summary style="padding:18px 20px;cursor:pointer;font-size:13px;font-weight:700;color:var(--eg-text);list-style:none;display:flex;align-items:center;gap:8px;">
+    {icon("document", 15)}<span>{exec_title}</span>
+    <span style="margin-left:auto;font-size:11px;font-weight:400;color:var(--eg-subtle);">Ver contenido</span>
+  </summary>
+  <div style="padding:0 20px 18px;">
+    <p style="font-size:14px;line-height:1.65;color:#3C4A52;margin:0;">{exec_body}</p>
+  </div>
+</details>"""
 
-    # Detailed summary inline
-    detail_panel = ""
+    # Resumen detallado como <details> colapsable
     raw_detail = alert.get("ai_detailed_summary_json") or ""
     if raw_detail:
         try:
             detail_data = json.loads(raw_detail)
         except Exception:
             detail_data = {"title": "Resumen detallado", "sections": []}
+        detail_title = h(detail_data.get('title') or 'Resumen detallado')
         sections_html = ""
-        for s in (detail_data.get("sections") or [])[:4]:
+        for s in (detail_data.get("sections") or [])[:6]:
             heading = h(s.get("heading") or "")
-            body_t = h((s.get("body") or "")[:600])
+            body_t = h((s.get("body") or "")[:800])
             if heading:
-                sections_html += f'<h3 style="font-size:14px;color:#0A2231;margin:12px 0 4px;">{heading}</h3>'
+                sections_html += f'<h3 style="font-size:14px;color:#0A2231;margin:14px 0 4px;">{heading}</h3>'
             if body_t:
-                sections_html += f'<p style="font-size:14px;color:#3C4A52;margin:0 0 8px;">{body_t}</p>'
-        detail_panel = f"""
-<section class="eg-card eg-panel">
-  <p class="eg-eyebrow">Adjunto</p>
-  <h2>{h(detail_data.get('title') or 'Resumen detallado')}</h2>
-  {sections_html}
-</section>"""
+                sections_html += f'<p style="font-size:14px;color:#3C4A52;margin:0 0 10px;">{body_t}</p>'
+        detail_panel = f"""<details class="eg-card eg-panel" style="padding:0;">
+  <summary style="padding:18px 20px;cursor:pointer;font-size:13px;font-weight:700;color:var(--eg-text);list-style:none;display:flex;align-items:center;gap:8px;">
+    {icon("document", 15)}<span>{detail_title}</span>
+    <span style="margin-left:auto;font-size:11px;font-weight:400;color:var(--eg-subtle);">Ver contenido</span>
+  </summary>
+  <div style="padding:0 20px 18px;">{sections_html}</div>
+</details>"""
 
-    # Attachments status
-    ai_attach = ""
-    if ai_st in ("success", "fallback") and settings.ai_attachments_enabled:
-        doc_id = alert.get("document_id") or alert_id
-        ai_attach = f"""
-<section class="eg-card eg-panel">
-  <p class="eg-eyebrow">Adjuntos</p>
-  <h2>Estado de adjuntos</h2>
-  <dl class="eg-kv eg-kv--2col">
-    <dt>Resumen ejecutivo</dt><dd>{badge('active', 'Preparado')}</dd>
-    <dt>Resumen detallado</dt><dd>{badge('active', 'Preparado')}</dd>
-    <dt>Documento oficial</dt><dd>{badge('simulated', 'Enlace en correo') if not alert.get('pdf_url') else badge('active', 'PDF disponible')}</dd>
-  </dl>
-  <p class="eg-muted">Los adjuntos se incluyen automáticamente en el envío cuando AI_ATTACHMENTS_ENABLED=true.</p>
-</section>"""
+    ai_lower_row = ""
+    if ai_panel or ai_attach_card:
+        if ai_attach_card:
+            ai_lower_row = (
+                f'<div class="eg-grid-2" style="align-items:start;">{ai_panel}{ai_attach_card}</div>'
+            )
+        else:
+            ai_lower_row = ai_panel
 
     topbar = render_topbar(
         "Vista previa de email",
@@ -1846,8 +1912,9 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
         '<div class="eg-banner eg-banner--info">El envio esta en modo simulado. '
         "Configura SendGrid para habilitar correos reales.</div>"
     )
+    flash_html = f'<div class="eg-flash" role="status" style="margin-bottom:14px;">{h(flash)}</div>' if flash else ""
     body = f"""
-{real_send_note}
+{flash_html}{real_send_note}
 <div class="eg-preview-grid">
   <section class="eg-card eg-card-pad eg-review-panel">
     <p class="eg-eyebrow">Revisión</p>
@@ -1858,7 +1925,7 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
       <dt>Categoría</dt><dd>{h(alert['category'])}</dd>
       <dt>Fecha doc.</dt><dd class="mono">{h(alert.get('publication_date') or '—')}</dd>
       <dt>Asunto</dt><dd class="mono">{h(subject)}</dd>
-      <dt>Fuente</dt><dd><a class="eg-btn eg-btn--primary eg-btn--sm" href="{h(alert['canonical_url'])}" target="_blank" rel="noreferrer">{icon('external', 14)}<span>Ver en DT</span></a></dd>
+      <dt>Fuente</dt><dd><a class="eg-btn eg-btn--primary eg-btn--sm" href="{h(alert['canonical_url'])}" target="_blank" rel="noopener noreferrer">{icon('external', 14)}<span>Ver en DT</span></a></dd>
     </dl>
     <div class="eg-review-actions">
       <a class="eg-btn eg-ghost eg-btn--sm" href="/admin/alerts">{icon("back", 16)}<span>Volver</span></a>
@@ -1884,10 +1951,9 @@ def render_alert_preview(alert_id: int, settings: Settings) -> str:
     </details>
   </section>
 </div>
-{ai_panel}
+{ai_lower_row}
 {exec_panel}
 {detail_panel}
-{ai_attach}
 """
     return render_page("Vista previa de email", body, sidebar=sidebar, topbar=topbar)
 
@@ -2133,22 +2199,17 @@ body.eg--admin {
 }
 .eg-brand {
   display: flex;
-  align-items: center;
-  gap: 10px;
+  flex-direction: column;
+  align-items: flex-start;
   padding: 2px 4px 4px;
 }
-.eg-brand-text { display: flex; flex-direction: column; gap: 1px; }
-.eg-brand-name {
-  font-size: 10px;
-  font-weight: 700;
-  letter-spacing: .15em;
-  color: rgba(255,255,255,.5);
-}
+.eg-brand-logo-wrap { display: flex; flex-direction: column; }
 .eg-brand-sub {
-  font-size: 13px;
+  font-size: 11px;
   font-weight: 700;
-  letter-spacing: .06em;
-  color: #fff;
+  letter-spacing: .12em;
+  text-transform: uppercase;
+  color: var(--eg-green);
 }
 .eg-hairline {
   height: 1px;
@@ -2483,18 +2544,30 @@ body.eg--admin {
   color: #fff;
 }
 .eg-btn--primary:hover { background: var(--eg-green-deep); color: #fff; }
+/* Forzar color en <a> que hereda color de link */
+a.eg-btn--primary,
+a.eg-btn--primary:link,
+a.eg-btn--primary:visited { color: #fff !important; text-decoration: none; }
+a.eg-btn--primary:hover { color: #fff !important; }
 .eg-btn--secondary {
   background: var(--eg-surface-soft);
   color: var(--eg-text);
   border: 1px solid var(--eg-border);
 }
-.eg-btn--secondary:hover { background: var(--eg-border); }
+.eg-btn--secondary:hover { background: var(--eg-border); color: var(--eg-text); }
+a.eg-btn--secondary,
+a.eg-btn--secondary:link,
+a.eg-btn--secondary:visited { color: var(--eg-text) !important; text-decoration: none; }
 .eg-ghost {
   background: transparent;
   color: var(--eg-muted);
   border: 1px solid var(--eg-border);
 }
-.eg-ghost:hover { color: var(--eg-text); border-color: var(--eg-text); }
+.eg-ghost:hover { color: var(--eg-text); border-color: var(--eg-text); background: transparent; }
+a.eg-ghost,
+a.eg-ghost:link,
+a.eg-ghost:visited { color: var(--eg-muted) !important; text-decoration: none; }
+a.eg-ghost:hover { color: var(--eg-text) !important; }
 .eg-btn--sm { padding: 6px 12px; font-size: 13px; }
 .eg-btn--block { width: 100%; justify-content: center; }
 .eg-btn:disabled { opacity: .45; cursor: not-allowed; }
@@ -2503,7 +2576,7 @@ body.eg--admin {
 .eg-table-wrap { overflow-x: auto; border-radius: var(--radius); }
 .eg-table { width: 100%; border-collapse: collapse; background: var(--eg-surface); }
 .eg-table th, .eg-table td {
-  padding: 11px 14px;
+  padding: 8px 12px;
   border-bottom: 1px solid var(--eg-border);
   text-align: left;
   vertical-align: top;
@@ -2525,7 +2598,16 @@ body.eg--admin {
 .eg-table td form { margin: 0; }
 .eg-table td.mono { font-family: var(--font-mono); font-size: 12.5px; }
 .eg-doc-title { font-weight: 700; color: var(--eg-text); font-size: 13.5px; }
-.eg-doc-desc  { font-size: 12px; color: var(--eg-subtle); margin-top: 3px; }
+.eg-doc-desc  {
+  font-size: 12px;
+  color: var(--eg-subtle);
+  margin-top: 3px;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+  max-width: 380px;
+}
 .eg-cell-cat  { font-size: 12.5px; color: var(--eg-muted); white-space: nowrap; }
 .eg-cell-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .eg-cell-actions form { margin: 0; }
@@ -2533,24 +2615,26 @@ body.eg--admin {
 /* ----- Alert grid ---------------------------------------------------- */
 .eg-alert-grid {
   display: grid;
-  grid-template-columns: repeat(auto-fill, minmax(300px, 1fr));
+  grid-template-columns: repeat(auto-fill, minmax(360px, 1fr));
   gap: 16px;
+  max-width: 1400px;
 }
 .eg-alert-card {
   background: var(--eg-surface);
   border: 1px solid var(--eg-border);
   border-radius: var(--radius-lg);
   display: flex;
+  flex-direction: column;
   overflow: hidden;
 }
 .eg-alert-card .accent {
-  width: 4px;
+  height: 4px;
+  width: 100%;
   flex-shrink: 0;
   background: var(--eg-green);
-  border-radius: 0;
 }
 .eg-alert-body {
-  padding: 16px 16px 14px;
+  padding: 16px 16px 12px;
   display: flex;
   flex-direction: column;
   gap: 6px;
@@ -2579,19 +2663,19 @@ body.eg--admin {
 }
 .eg-alert-date { font-family: var(--font-mono); font-size: 11.5px; color: var(--eg-subtle); }
 .eg-alert-actions {
-  padding: 12px 14px 12px 12px;
+  padding: 10px 14px 12px;
   display: flex;
-  flex-direction: column;
-  gap: 8px;
-  justify-content: flex-end;
-  border-left: 1px solid var(--eg-border);
+  flex-direction: row;
+  flex-wrap: wrap;
+  gap: 7px;
+  align-items: center;
+  border-top: 1px solid var(--eg-border);
   background: var(--eg-surface-soft);
-  min-width: 150px;
-  flex-shrink: 0;
 }
-.eg-action-row { display: flex; flex-direction: column; gap: 6px; }
-.eg-test-row { display: flex; flex-direction: column; gap: 5px; }
-.eg-test-row input { width: 100%; }
+.eg-alert-actions form { margin: 0; }
+.eg-action-row { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
+.eg-test-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; width: 100%; margin-top: 3px; }
+.eg-test-row input { flex: 1; min-width: 160px; }
 
 /* ----- KV (key-value) lists ----------------------------------------- */
 .eg-kv { display: grid; gap: 6px; margin: 0 0 16px; }
@@ -2783,15 +2867,6 @@ textarea.eg-input { resize: vertical; min-height: 56px; }
 }
 @media (max-width: 900px) {
   .eg-preview-grid { grid-template-columns: 1fr; }
-  .eg-alert-actions {
-    border-left: none;
-    border-top: 1px solid var(--eg-border);
-    flex-direction: row;
-    flex-wrap: wrap;
-    min-width: unset;
-    padding: 10px 12px;
-  }
-  .eg-alert-card { flex-direction: column; }
 }
 @media (max-width: 768px) {
   .eg-shell { grid-template-columns: 1fr; }
