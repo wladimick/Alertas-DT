@@ -22,6 +22,14 @@ class SummaryResult:
     email_subject: str | None = None
 
 
+@dataclass
+class AIResponse:
+    content: str
+    input_tokens: int = 0
+    output_tokens: int = 0
+    total_tokens: int = 0
+
+
 # --------------------------------------------------------------------------
 # Construcción de texto de entrada
 # --------------------------------------------------------------------------
@@ -44,6 +52,19 @@ def build_source_text(doc: dict[str, Any], max_chars: int = 45_000) -> str:
 
 def compute_input_hash(text: str) -> str:
     return hashlib.sha256(text.encode("utf-8")).hexdigest()[:16]
+
+
+def is_ai_runtime_enabled(settings: Settings, app_settings: dict[str, str]) -> bool:
+    """Interruptor efectivo: AI_ENABLED=false bloquea siempre; panel solo controla si .env permite."""
+    if not bool(getattr(settings, "ai_enabled", False)):
+        return False
+
+    override = (app_settings.get("ai_runtime_enabled") or "").strip().lower()
+    if override in {"0", "false", "no", "n", "off"}:
+        return False
+    if override in {"1", "true", "yes", "y", "on"}:
+        return True
+    return True
 
 
 # --------------------------------------------------------------------------
@@ -117,7 +138,42 @@ Documento:
 # Clientes IA
 # --------------------------------------------------------------------------
 
-def _call_openai_api(system_prompt: str, user_prompt: str, settings: Settings) -> str:
+def _usage_from_dict(usage: dict[str, Any] | None) -> tuple[int, int, int]:
+    """Normaliza usage de Chat Completions o Responses API."""
+    usage = usage or {}
+    input_tokens = int(
+        usage.get("input_tokens")
+        or usage.get("prompt_tokens")
+        or 0
+    )
+    output_tokens = int(
+        usage.get("output_tokens")
+        or usage.get("completion_tokens")
+        or 0
+    )
+    total_tokens = int(
+        usage.get("total_tokens")
+        or (input_tokens + output_tokens)
+        or 0
+    )
+    return input_tokens, output_tokens, total_tokens
+
+
+def _extract_responses_text(body: dict[str, Any]) -> str:
+    """Extrae texto desde OpenAI/Azure Responses API sin depender del SDK."""
+    if isinstance(body.get("output_text"), str) and body["output_text"].strip():
+        return body["output_text"].strip()
+
+    parts: list[str] = []
+    for item in body.get("output") or []:
+        for content in item.get("content") or []:
+            text = content.get("text") or content.get("output_text")
+            if text:
+                parts.append(str(text))
+    return "\n".join(parts).strip()
+
+
+def _call_openai_api(system_prompt: str, user_prompt: str, settings: Settings) -> AIResponse:
     payload = {
         "model": settings.ai_model or "gpt-4o-mini",
         "messages": [
@@ -138,12 +194,62 @@ def _call_openai_api(system_prompt: str, user_prompt: str, settings: Settings) -
     )
     with urllib.request.urlopen(request, timeout=settings.ai_timeout_seconds) as resp:  # noqa: S310
         body = json.loads(resp.read().decode("utf-8"))
-    return body["choices"][0]["message"]["content"]
+
+    content = body["choices"][0]["message"]["content"]
+    input_tokens, output_tokens, total_tokens = _usage_from_dict(body.get("usage"))
+    return AIResponse(
+        content=content,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
 
 
-def _call_azure_api(system_prompt: str, user_prompt: str, settings: Settings) -> str:
+def _call_azure_api(system_prompt: str, user_prompt: str, settings: Settings) -> AIResponse:
+    """
+    Soporta dos estilos Azure:
+
+    1) Endpoint compatible OpenAI v1:
+       AI_BASE_URL=https://DemoTiboxIA.services.ai.azure.com/openai/v1
+       POST {AI_BASE_URL}/responses
+
+    2) Endpoint Azure OpenAI clásico:
+       AI_BASE_URL=https://recurso.openai.azure.com
+       POST {AI_BASE_URL}/openai/deployments/{AI_MODEL}/chat/completions?api-version=...
+    """
     base_url = settings.ai_base_url.rstrip("/")
     deployment = settings.ai_model
+
+    if base_url.endswith("/openai/v1"):
+        payload = {
+            "model": deployment,
+            "input": f"{system_prompt}\n\n{user_prompt}",
+            "temperature": settings.ai_summary_temperature,
+        }
+        request = urllib.request.Request(
+            f"{base_url}/responses",
+            data=json.dumps(payload).encode("utf-8"),
+            headers={
+                # El endpoint /openai/v1 usado por el SDK OpenAI envía Bearer.
+                # api-key se incluye también para compatibilidad con Azure.
+                "Authorization": f"Bearer {settings.ai_api_key}",
+                "api-key": settings.ai_api_key,
+                "Content-Type": "application/json",
+            },
+            method="POST",
+        )
+        with urllib.request.urlopen(request, timeout=settings.ai_timeout_seconds) as resp:  # noqa: S310
+            body = json.loads(resp.read().decode("utf-8"))
+
+        content = _extract_responses_text(body)
+        input_tokens, output_tokens, total_tokens = _usage_from_dict(body.get("usage"))
+        return AIResponse(
+            content=content,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+        )
+
     url = (
         f"{base_url}/openai/deployments/{deployment}"
         "/chat/completions?api-version=2024-02-15-preview"
@@ -167,16 +273,29 @@ def _call_azure_api(system_prompt: str, user_prompt: str, settings: Settings) ->
     )
     with urllib.request.urlopen(request, timeout=settings.ai_timeout_seconds) as resp:  # noqa: S310
         body = json.loads(resp.read().decode("utf-8"))
-    return body["choices"][0]["message"]["content"]
+
+    content = body["choices"][0]["message"]["content"]
+    input_tokens, output_tokens, total_tokens = _usage_from_dict(body.get("usage"))
+    return AIResponse(
+        content=content,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
 
 
-def call_ai(system_prompt: str, user_prompt: str, settings: Settings) -> str:
+def call_ai_with_usage(system_prompt: str, user_prompt: str, settings: Settings) -> AIResponse:
     provider = settings.ai_provider.lower()
     if provider == "openai":
         return _call_openai_api(system_prompt, user_prompt, settings)
     if provider == "azure":
         return _call_azure_api(system_prompt, user_prompt, settings)
     raise ValueError(f"Proveedor IA no soportado: {provider!r}")
+
+
+def call_ai(system_prompt: str, user_prompt: str, settings: Settings) -> str:
+    """Compatibilidad: mantiene la firma anterior devolviendo solo contenido."""
+    return call_ai_with_usage(system_prompt, user_prompt, settings).content
 
 
 # --------------------------------------------------------------------------
@@ -449,6 +568,15 @@ def _generate_and_save(
     *,
     force: bool = False,
 ) -> SummaryResult:
+    """
+    Generate and save AI summary for a document.
+    Never auto-sends. Alert always stays pending_review.
+
+    Seguridad:
+    - AI_ENABLED=false impide llamadas reales.
+    - Se registran intentos en ai_usage_logs.
+    - Se bloquea por límite diario/mensual.
+    """
     document = db.get_document(conn, document_id)
     if not document:
         raise ValueError(f"Documento {document_id} no encontrado.")
@@ -460,6 +588,19 @@ def _generate_and_save(
 
     provider = settings.ai_provider.lower()
     model = settings.ai_model or ""
+    operation = "regenerate_summary" if force else "generate_summary"
+
+    alert_id: int | None = None
+    try:
+        row = conn.execute(
+            "SELECT id FROM alerts WHERE document_id = ?",
+            (document_id,),
+        ).fetchone()
+        if row:
+            alert_id = int(row["id"])
+    except Exception:
+        alert_id = None
+
     source_text = build_source_text(document, settings.ai_max_input_chars)
     ihash = compute_input_hash(source_text)
 
@@ -469,39 +610,111 @@ def _generate_and_save(
     status = "pending"
     content_quality = "limited"
 
-    if provider in ("openai", "azure"):
-        if not settings.ai_api_key:
-            error = f"AI_API_KEY no configurada para proveedor {provider!r}."
-            validated = generate_fallback_summary(document)
-            status = "fallback"
-        elif provider == "azure" and not settings.ai_base_url:
-            error = "Azure requiere AI_BASE_URL configurado."
-            validated = generate_fallback_summary(document)
-            status = "fallback"
-        else:
-            try:
-                system_prompt, user_prompt = build_ai_prompt(document, settings, app_settings)
-                raw_response = call_ai(system_prompt, user_prompt, settings)
-                parsed = parse_ai_response(raw_response)
-                if parsed:
-                    validated = validate_ai_summary(parsed)
-                    status = "success"
-                    content_quality = "full"
-                else:
-                    raise ValueError("Respuesta IA vacía o no parseable.")
-            except Exception as exc:
-                error_msg = str(exc)
-                if settings.ai_api_key and settings.ai_api_key in error_msg:
-                    error_msg = error_msg.replace(settings.ai_api_key, "[REDACTED]")
-                error = f"Error IA: {error_msg[:500]}"
-                validated = generate_fallback_summary(document)
-                status = "fallback"
-                content_quality = "limited"
-    else:
+    daily_limit = int(getattr(settings, "ai_daily_token_limit", 50000) or 0)
+    monthly_limit = int(getattr(settings, "ai_monthly_token_limit", 500000) or 0)
+    usage_status = db.get_ai_usage_status(
+        conn,
+        daily_limit=daily_limit,
+        monthly_limit=monthly_limit,
+    )
+
+    def _record(
+        log_status: str,
+        *,
+        input_tokens: int = 0,
+        output_tokens: int = 0,
+        total_tokens: int = 0,
+        log_error: str | None = None,
+    ) -> None:
+        db.record_ai_usage(
+            conn,
+            document_id=document_id,
+            alert_id=alert_id,
+            provider=provider,
+            model=model,
+            operation=operation,
+            status=log_status,
+            input_tokens=input_tokens,
+            output_tokens=output_tokens,
+            total_tokens=total_tokens,
+            daily_limit=daily_limit,
+            monthly_limit=monthly_limit,
+            error=log_error,
+        )
+
+    if not is_ai_runtime_enabled(settings, app_settings):
         validated = generate_fallback_summary(document)
         status = "fallback"
         content_quality = "limited"
-        error = "AI_PROVIDER=disabled; resumen generado localmente."
+        error = "AI_ENABLED=false; resumen generado localmente sin usar API."
+        _record("disabled", log_error=error)
+
+    elif provider not in ("openai", "azure"):
+        validated = generate_fallback_summary(document)
+        status = "fallback"
+        content_quality = "limited"
+        error = f"AI_PROVIDER={provider or 'disabled'}; resumen generado localmente."
+        _record("disabled", log_error=error)
+
+    elif not settings.ai_api_key:
+        validated = generate_fallback_summary(document)
+        status = "fallback"
+        content_quality = "limited"
+        error = f"AI_API_KEY no configurada para proveedor {provider!r}."
+        _record("missing_key", log_error=error)
+
+    elif provider == "azure" and not settings.ai_base_url:
+        validated = generate_fallback_summary(document)
+        status = "fallback"
+        content_quality = "limited"
+        error = "Azure requiere AI_BASE_URL configurado."
+        _record("error", log_error=error)
+
+    elif usage_status.get("daily_exceeded") or usage_status.get("monthly_exceeded"):
+        validated = generate_fallback_summary(document)
+        status = "fallback"
+        content_quality = "limited"
+        if usage_status.get("daily_exceeded"):
+            error = (
+                f"Límite diario IA alcanzado: "
+                f"{usage_status.get('today_tokens')} / {daily_limit} tokens."
+            )
+        else:
+            error = (
+                f"Límite mensual IA alcanzado: "
+                f"{usage_status.get('month_tokens')} / {monthly_limit} tokens."
+            )
+        _record("blocked_limit", log_error=error)
+
+    else:
+        try:
+            system_prompt, user_prompt = build_ai_prompt(document, settings, app_settings)
+            ai_response = call_ai_with_usage(system_prompt, user_prompt, settings)
+            raw_response = ai_response.content
+
+            parsed = parse_ai_response(raw_response)
+            if parsed:
+                validated = validate_ai_summary(parsed)
+                status = "success"
+                content_quality = "full"
+                _record(
+                    "success",
+                    input_tokens=ai_response.input_tokens,
+                    output_tokens=ai_response.output_tokens,
+                    total_tokens=ai_response.total_tokens,
+                )
+            else:
+                raise ValueError("Respuesta IA vacía o no parseable.")
+
+        except Exception as exc:
+            error_msg = str(exc)
+            if settings.ai_api_key and settings.ai_api_key in error_msg:
+                error_msg = error_msg.replace(settings.ai_api_key, "[REDACTED]")
+            error = f"Error IA: {error_msg[:500]}"
+            validated = generate_fallback_summary(document)
+            status = "fallback"
+            content_quality = "limited"
+            _record("error", log_error=error)
 
     _save_to_db(
         conn, document_id, validated,

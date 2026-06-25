@@ -143,11 +143,31 @@ def migrate(conn: sqlite3.Connection) -> None:
             updated_at TEXT NOT NULL
         );
 
+        CREATE TABLE IF NOT EXISTS ai_usage_logs (
+            id INTEGER PRIMARY KEY AUTOINCREMENT,
+            document_id INTEGER,
+            alert_id INTEGER,
+            provider TEXT,
+            model TEXT,
+            operation TEXT NOT NULL,
+            status TEXT NOT NULL,
+            input_tokens INTEGER NOT NULL DEFAULT 0,
+            output_tokens INTEGER NOT NULL DEFAULT 0,
+            total_tokens INTEGER NOT NULL DEFAULT 0,
+            daily_limit INTEGER,
+            monthly_limit INTEGER,
+            error TEXT,
+            created_at TEXT NOT NULL
+        );
+
         CREATE INDEX IF NOT EXISTS idx_subscribers_status ON subscribers(status);
         CREATE INDEX IF NOT EXISTS idx_documents_status ON documents(status);
         CREATE INDEX IF NOT EXISTS idx_alerts_status ON alerts(status);
         CREATE INDEX IF NOT EXISTS idx_deliveries_alert ON deliveries(alert_id);
         CREATE INDEX IF NOT EXISTS idx_ai_summaries_document ON ai_summaries(document_id);
+        CREATE INDEX IF NOT EXISTS idx_ai_usage_created ON ai_usage_logs(created_at);
+        CREATE INDEX IF NOT EXISTS idx_ai_usage_status ON ai_usage_logs(status);
+        CREATE INDEX IF NOT EXISTS idx_ai_usage_operation ON ai_usage_logs(operation);
         """
     )
 
@@ -721,3 +741,134 @@ def upsert_ai_summary(
         "SELECT id FROM ai_summaries WHERE document_id = ?", (document_id,)
     ).fetchone()
     return int(row["id"])
+
+
+
+# --------------------------------------------------------------------------
+# ai_usage_logs — auditoría de consumo IA y límites internos
+# --------------------------------------------------------------------------
+
+def record_ai_usage(
+    conn: sqlite3.Connection,
+    *,
+    document_id: int | None = None,
+    alert_id: int | None = None,
+    provider: str | None = None,
+    model: str | None = None,
+    operation: str,
+    status: str,
+    input_tokens: int = 0,
+    output_tokens: int = 0,
+    total_tokens: int = 0,
+    daily_limit: int | None = None,
+    monthly_limit: int | None = None,
+    error: str | None = None,
+) -> int:
+    """Registra un intento de uso IA. No guarda secretos ni API keys."""
+    now = utcnow()
+    conn.execute(
+        """
+        INSERT INTO ai_usage_logs (
+            document_id, alert_id, provider, model, operation, status,
+            input_tokens, output_tokens, total_tokens,
+            daily_limit, monthly_limit, error, created_at
+        )
+        VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)
+        """,
+        (
+            document_id,
+            alert_id,
+            provider,
+            model,
+            operation,
+            status,
+            int(input_tokens or 0),
+            int(output_tokens or 0),
+            int(total_tokens or 0),
+            daily_limit,
+            monthly_limit,
+            error,
+            now,
+        ),
+    )
+    conn.commit()
+    row = conn.execute("SELECT last_insert_rowid() AS id").fetchone()
+    return int(row["id"])
+
+
+def _usage_sum_for_period(conn: sqlite3.Connection, prefix: str) -> int:
+    row = conn.execute(
+        """
+        SELECT COALESCE(SUM(total_tokens), 0) AS total
+        FROM ai_usage_logs
+        WHERE substr(created_at, 1, ?) = ?
+          AND status = 'success'
+        """,
+        (len(prefix), prefix),
+    ).fetchone()
+    return int(row["total"] or 0)
+
+
+def get_ai_usage_today(conn: sqlite3.Connection) -> int:
+    """Tokens usados hoy UTC, solo llamadas exitosas."""
+    return _usage_sum_for_period(conn, utcnow()[:10])
+
+
+def get_ai_usage_month(conn: sqlite3.Connection) -> int:
+    """Tokens usados este mes UTC, solo llamadas exitosas."""
+    return _usage_sum_for_period(conn, utcnow()[:7])
+
+
+def get_last_ai_usage(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT *
+        FROM ai_usage_logs
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_last_ai_error(conn: sqlite3.Connection) -> dict[str, Any] | None:
+    row = conn.execute(
+        """
+        SELECT *
+        FROM ai_usage_logs
+        WHERE status IN ('error', 'blocked_limit', 'missing_key')
+           OR (error IS NOT NULL AND error != '')
+        ORDER BY id DESC
+        LIMIT 1
+        """
+    ).fetchone()
+    return dict(row) if row else None
+
+
+def get_ai_usage_status(
+    conn: sqlite3.Connection,
+    *,
+    daily_limit: int,
+    monthly_limit: int,
+) -> dict[str, Any]:
+    """Resumen de uso para mostrar en Configuración y validar límites."""
+    today = get_ai_usage_today(conn)
+    month = get_ai_usage_month(conn)
+    last = get_last_ai_usage(conn)
+    last_error = get_last_ai_error(conn)
+
+    daily_pct = round((today / daily_limit) * 100, 1) if daily_limit > 0 else 0
+    monthly_pct = round((month / monthly_limit) * 100, 1) if monthly_limit > 0 else 0
+
+    return {
+        "today_tokens": today,
+        "month_tokens": month,
+        "daily_limit": daily_limit,
+        "monthly_limit": monthly_limit,
+        "daily_percent": daily_pct,
+        "monthly_percent": monthly_pct,
+        "daily_exceeded": bool(daily_limit > 0 and today >= daily_limit),
+        "monthly_exceeded": bool(monthly_limit > 0 and month >= monthly_limit),
+        "last_usage": last,
+        "last_error": last_error,
+    }

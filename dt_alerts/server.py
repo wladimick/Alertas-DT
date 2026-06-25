@@ -319,6 +319,16 @@ class AppHandler(BaseHTTPRequestHandler):
             self.require_admin()
             msg = _test_wordpress_connection(self.settings)
             self.redirect_flash("/admin/settings", msg)
+        elif path == "/admin/settings/ai-enable":
+            self.require_admin()
+            with db.connect(self.settings.database_path) as conn:
+                db.set_setting(conn, "ai_runtime_enabled", "true")
+            self.redirect_flash("/admin/settings", "Integración IA activada desde el panel.")
+        elif path == "/admin/settings/ai-disable":
+            self.require_admin()
+            with db.connect(self.settings.database_path) as conn:
+                db.set_setting(conn, "ai_runtime_enabled", "false")
+            self.redirect_flash("/admin/settings", "Integración IA apagada desde el panel. No se llamará a la API.")
         elif path == "/admin/settings/test-ai":
             self.require_admin()
             with db.connect(self.settings.database_path) as conn:
@@ -1218,28 +1228,42 @@ def _test_wordpress_connection(settings: Settings) -> str:
 
 def _test_ai_connection(settings: Settings, app_settings: dict) -> str:
     """Test AI connectivity. Returns flash message. Never logs API key."""
-    from .summarizer import call_ai
+    if not bool(getattr(settings, "ai_enabled", False)):
+        return "IA bloqueada por AI_ENABLED=false en .env. No se llamará a la API."
+
+    runtime = (app_settings.get("ai_runtime_enabled") or "").strip().lower()
+    effective_enabled = False if runtime in {"0", "false", "no", "n", "off"} else True
+
     provider = settings.ai_provider.lower()
-    if provider == "disabled" or not provider:
+
+    if not effective_enabled:
+        return "IA apagada desde el panel. Actívala antes de probar conexión."
+
+    if provider == "disabled":
         return "IA desactivada (AI_PROVIDER=disabled). Configura AI_PROVIDER=openai o azure."
+
     if not settings.ai_api_key:
         return "Sin API key: configura AI_API_KEY en el archivo .env."
+
     if provider == "azure" and not settings.ai_base_url:
         return "Azure requiere AI_BASE_URL configurado en el archivo .env."
+
     try:
+        from .summarizer import call_ai
+
         raw = call_ai(
-            "Eres un asistente de prueba.",
-            'Responde solo con este JSON válido: {"ok": true}',
+            "Responde solo con JSON válido.",
+            '{"ok": true, "message": "test"}',
             settings,
         )
-        if "ok" in raw.lower() or "true" in raw.lower():
+        if raw:
             return f"Conexión IA OK ({provider}, modelo: {settings.ai_model or 'default'})."
-        return f"Respuesta IA recibida pero inesperada ({provider})."
+        return "Conexión IA sin respuesta."
     except Exception as exc:
         error_msg = str(exc)
         if settings.ai_api_key and settings.ai_api_key in error_msg:
             error_msg = error_msg.replace(settings.ai_api_key, "[REDACTED]")
-        return f"Error IA: {error_msg[:200]}"
+        return f"Error al probar IA: {error_msg[:300]}"
 
 
 def render_settings(settings: Settings) -> str:
@@ -1411,19 +1435,72 @@ def render_settings(settings: Settings) -> str:
 
     # --- Conexión IA ---
     ai_provider = settings.ai_provider
-    if ai_provider == "disabled" or not ai_provider:
+    ai_env_enabled = bool(getattr(settings, "ai_enabled", False))
+    ai_runtime_raw = (app_cfg.get("ai_runtime_enabled") or "").strip().lower()
+    if not ai_env_enabled:
+        ai_runtime_enabled = False
+        ai_runtime_source = ".env bloqueado"
+    elif ai_runtime_raw in {"0", "false", "no", "n", "off"}:
+        ai_runtime_enabled = False
+        ai_runtime_source = "panel"
+    elif ai_runtime_raw in {"1", "true", "yes", "y", "on"}:
+        ai_runtime_enabled = True
+        ai_runtime_source = "panel"
+    else:
+        ai_runtime_enabled = True
+        ai_runtime_source = ".env"
+
+    with db.connect(settings.database_path) as ai_conn:
+        ai_usage = db.get_ai_usage_status(
+            ai_conn,
+            daily_limit=settings.ai_daily_token_limit,
+            monthly_limit=settings.ai_monthly_token_limit,
+        )
+
+    ai_limit_reached = ai_usage.get("daily_exceeded") or ai_usage.get("monthly_exceeded")
+    ai_last_usage = ai_usage.get("last_usage") or {}
+    ai_last_error = ai_usage.get("last_error") or {}
+
+    if not ai_runtime_enabled:
+        ai_estado = pill("paused", "Apagada")
+        ai_estado_key = "paused"
+    elif ai_provider == "disabled" or not ai_provider:
         ai_estado = pill("paused", "Desactivada")
         ai_estado_key = "paused"
+    elif ai_limit_reached:
+        ai_estado = pill("error", "Límite alcanzado")
+        ai_estado_key = "error"
     elif settings.ai_api_key:
-        ai_estado = pill("active", "Configurada")
+        ai_estado = pill("active", "Activa")
         ai_estado_key = "active"
     else:
         ai_estado = pill("error", "Sin API key")
         ai_estado_key = "error"
 
     ai_last_test = app_cfg.get("ai_last_test", "")
+
+    if not ai_env_enabled:
+        ai_toggle_btn = (
+            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="button" disabled>'
+            f'{icon("pause", 14)}<span>IA bloqueada por .env</span></button>'
+        )
+    else:
+        ai_toggle_btn = (
+            f"""<form method="post" action="/admin/settings/ai-disable" style="display:inline">
+    <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
+      {icon("pause", 14)}<span>Apagar IA</span>
+    </button>
+  </form>"""
+            if ai_runtime_enabled
+            else f"""<form method="post" action="/admin/settings/ai-enable" style="display:inline">
+    <button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">
+      {icon("play", 14)}<span>Activar IA</span>
+    </button>
+  </form>"""
+        )
+
     ai_test_btn = ""
-    if ai_provider not in ("disabled", "") and settings.ai_api_key:
+    if ai_runtime_enabled and ai_provider not in ("disabled", "") and settings.ai_api_key and not ai_limit_reached:
         ai_test_btn = f"""
   <form method="post" action="/admin/settings/test-ai" style="display:inline">
     <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
@@ -1431,12 +1508,19 @@ def render_settings(settings: Settings) -> str:
     </button>
   </form>"""
     else:
+        reason = "Activa IA y configura AI_PROVIDER + AI_API_KEY para probar."
+        if ai_limit_reached:
+            reason = "Límite IA alcanzado. No se ejecutará prueba."
         ai_test_btn = (
             f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="button" disabled>'
             f'{icon("cpu", 14)}<span>Probar conexion IA</span></button>'
-            f'<p class="eg-muted" style="margin-top:8px;font-size:13px;">'
-            f'Configura AI_PROVIDER y AI_API_KEY en .env para habilitar la prueba.</p>'
+            f'<p class="eg-muted" style="margin-top:8px;font-size:13px;">{h(reason)}</p>'
         )
+
+    ai_usage_today = f"{ai_usage.get('today_tokens', 0):,}".replace(",", ".")
+    ai_usage_month = f"{ai_usage.get('month_tokens', 0):,}".replace(",", ".")
+    ai_daily_limit = f"{settings.ai_daily_token_limit:,}".replace(",", ".")
+    ai_monthly_limit = f"{settings.ai_monthly_token_limit:,}".replace(",", ".")
 
     # Defaults para campos IA editables
     AI_DEFAULTS = {
@@ -1490,6 +1574,8 @@ def render_settings(settings: Settings) -> str:
   <h2>{icon("cpu", 17)} Conexion IA</h2>
   <dl class="eg-kv eg-kv--2col">
     <dt>Estado</dt><dd>{ai_estado}</dd>
+    <dt>Interruptor efectivo</dt><dd class="mono">{h(str(ai_runtime_enabled).lower())} · {h(ai_runtime_source)}</dd>
+    <dt>AI_ENABLED (.env)</dt><dd class="mono">{h(str(settings.ai_enabled).lower())}</dd>
     <dt>AI_PROVIDER</dt><dd class="mono">{h(ai_provider or 'disabled')}</dd>
     <dt>AI_MODEL</dt><dd class="mono">{h(settings.ai_model or '—')}</dd>
     <dt>AI_BASE_URL</dt><dd class="mono">{h(settings.ai_base_url or '—')}</dd>
@@ -1497,9 +1583,14 @@ def render_settings(settings: Settings) -> str:
     <dt>AI_TIMEOUT_SECONDS</dt><dd class="mono">{h(settings.ai_timeout_seconds)}</dd>
     <dt>AI_MAX_INPUT_CHARS</dt><dd class="mono">{h(settings.ai_max_input_chars)}</dd>
     <dt>AI_ATTACHMENTS_ENABLED</dt><dd class="mono">{h(str(settings.ai_attachments_enabled).lower())}</dd>
+    <dt>Uso hoy</dt><dd class="mono">{h(ai_usage_today)} / {h(ai_daily_limit)} tokens · {h(ai_usage.get('daily_percent', 0))}%</dd>
+    <dt>Uso mes</dt><dd class="mono">{h(ai_usage_month)} / {h(ai_monthly_limit)} tokens · {h(ai_usage.get('monthly_percent', 0))}%</dd>
+    <dt>Advertencia</dt><dd class="mono">{h(settings.ai_warning_percent)}%</dd>
+    <dt>Última llamada IA</dt><dd class="mono">{h((ai_last_usage or {}).get('created_at') or '—')} · {h((ai_last_usage or {}).get('status') or '—')} · {h((ai_last_usage or {}).get('total_tokens') or 0)} tokens</dd>
+    <dt>Último error IA</dt><dd class="mono">{h((ai_last_error or {}).get('error') or '—')}</dd>
     <dt>Ultima prueba IA</dt><dd class="mono">{h(ai_last_test or '—')}</dd>
   </dl>
-  <div class="eg-actions" style="margin-top:14px">{ai_test_btn}</div>
+  <div class="eg-actions" style="margin-top:14px">{ai_toggle_btn}{ai_test_btn}</div>
 </section>
 
 <section class="eg-card eg-panel">
