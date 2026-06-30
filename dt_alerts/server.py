@@ -23,7 +23,7 @@ from .notifier import (
 from .worker import regenerate_alert, run_check, scheduler_loop
 from . import wordpress_sync
 from .summarizer import _generate_and_save as _ai_generate_direct
-from .notifier import generate_executive_summary_html, generate_detailed_summary_html
+from .notifier import generate_executive_summary_html, generate_detailed_summary_html, _build_attachments
 
 
 def h(value: Any) -> str:
@@ -183,12 +183,14 @@ class AppHandler(BaseHTTPRequestHandler):
                     subject = f"[PRUEBA] {subject_for(alert)}"
             else:
                 subject = f"[PRUEBA] {subject_for(alert)}"
+            attachments = _build_attachments(alert, self.settings)
             result = send_notifier_email(
                 self.settings,
                 to=to_email,
                 subject=subject,
                 html_body=render_alert_email_html(alert),
                 text_body=render_alert_email_text(alert),
+                attachments=attachments or None,
             )
             self.redirect_flash("/admin/alerts", flash_for_email_result(result))
         elif match := re.match(r"^/admin/alerts/(\d+)/generate-ai$", path):

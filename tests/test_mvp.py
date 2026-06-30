@@ -1661,5 +1661,138 @@ class NewPhasesTestCase(unittest.TestCase):
         self.assertIn("última", html_out.lower())
 
 
+    def test_20_send_test_alert_email_includes_attachments(self):
+        """send_test_alert_email (función aislada) construye y pasa adjuntos a send_email."""
+        from unittest.mock import patch
+        from dt_alerts.notifier import send_test_alert_email
+        settings = self._make_settings(
+            Path(tempfile.mkdtemp()) / "t.db",
+            email_provider="console",
+            ai_attachments_enabled=True,
+        )
+        alert = {
+            "id": 7, "document_id": 7,
+            "title": "Circular endpoint test",
+            "category": "Circulares", "publication_date": "2026-01-01",
+            "canonical_url": "https://example.com",
+            "summary": "Resumen.", "relevance": "alto",
+            "key_points_json": "[]", "practical_impacts_json": "[]",
+            "ai_status": "success", "ai_provider": "azure", "ai_model": "gpt-chat-latest",
+            "ai_content_quality": "full", "ai_updated_at": "2026-01-01",
+            "ai_email_subject": "Test endpoint",
+            "ai_executive_summary": '{"title":"Eje","body":"Cuerpo."}',
+            "ai_detailed_summary_json": '{"descripcion":"Desc."}',
+            "ai_key_points_json": "[]", "ai_recommended_actions_json": "[]",
+            "ai_legal_disclaimer": "",
+        }
+        mock_result = {"ok": True, "provider": "console", "status": "simulated"}
+        with patch("dt_alerts.notifier.send_email", return_value=mock_result) as mock_send:
+            send_test_alert_email("qa@example.com", alert, settings)
+        attachments_passed = mock_send.call_args.kwargs.get("attachments")
+        self.assertIsNotNone(attachments_passed, "send_email no recibió adjuntos")
+        self.assertEqual(len(attachments_passed), 2)
+        filenames = [a["filename"] for a in attachments_passed]
+        self.assertTrue(any("resumen_ejecutivo" in f for f in filenames))
+        self.assertTrue(any("resumen_detallado" in f for f in filenames))
+
+
+    def test_21_test_endpoint_subject_template_and_attachments(self):
+        """POST /admin/alerts/{id}/test: respeta email_test_subject_template y adjunta archivos."""
+        import http.client
+        import threading
+        import urllib.parse
+        from http.server import ThreadingHTTPServer
+        from unittest.mock import patch
+        from dt_alerts.server import AppHandler
+
+        class _H(AppHandler):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db.init_db(db_path)
+
+            with db.connect(db_path) as conn:
+                doc_id, _ = db.upsert_document(conn, {
+                    "dt_article_id": "art-test21",
+                    "canonical_url": "https://example.com/art21",
+                    "source_url": "https://example.com/list",
+                    "category": "Circulares",
+                    "title": "Circular test_21",
+                    "publication_date": "2026-01-01",
+                    "abstract": "Resumen breve.",
+                    "detail_text": "Texto completo.",
+                    "pdf_url": None, "content_hash": None,
+                })
+                db.update_document_processed(conn, doc_id, status="processed",
+                                             detail_text="Texto.", pdf_url=None,
+                                             content_hash=None, last_error=None)
+                alert_id = db.create_or_update_alert(
+                    conn, doc_id,
+                    summary="Resumen test_21.", key_points=[], practical_impacts=[],
+                    relevance="alto", status="pending_review", ai_error=None,
+                )
+                db.upsert_ai_summary(
+                    conn, doc_id,
+                    provider="azure", model="gpt-chat-latest", status="success",
+                    content_quality="full", relevance="alto",
+                    email_subject="Normativa test_21",
+                    email_summary="Resumen ejecutivo.",
+                    executive_summary='{"title":"Eje","body":"Cuerpo."}',
+                    detailed_summary_json='{"descripcion":"Desc."}',
+                    key_points_json="[]", practical_impacts_json="[]",
+                    recommended_actions_json="[]", tags_json="[]",
+                    legal_disclaimer="", raw_response_json="{}",
+                    input_hash="abc",
+                )
+                db.set_setting(conn, "email_test_subject_template",
+                               "[TEST CUSTOM] {title}")
+
+            _H.settings = settings_for(
+                db_path,
+                disable_admin_auth=True,
+                email_provider="console",
+                ai_attachments_enabled=True,
+            )
+
+            captured = {}
+            mock_result = {"ok": True, "provider": "console", "status": "simulated"}
+
+            def fake_send(settings, *, to, subject, html_body, text_body,
+                          attachments=None):
+                captured["subject"] = subject
+                captured["attachments"] = attachments
+                return mock_result
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+            t = threading.Thread(target=server.serve_forever)
+            t.daemon = True
+            t.start()
+            try:
+                port = server.server_address[1]
+                body = urllib.parse.urlencode({"to": "qa@example.com"}).encode()
+                with patch("dt_alerts.server.send_notifier_email", side_effect=fake_send):
+                    conn2 = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    conn2.request(
+                        "POST", f"/admin/alerts/{alert_id}/test",
+                        body=body,
+                        headers={"Content-Type": "application/x-www-form-urlencoded",
+                                 "Content-Length": str(len(body))},
+                    )
+                    resp = conn2.getresponse()
+                    resp.read()
+            finally:
+                server.shutdown()
+
+        # Subject template personalizado fue respetado
+        self.assertEqual(captured.get("subject"), "[TEST CUSTOM] Circular test_21")
+        # Adjuntos presentes (2 archivos HTML)
+        atts = captured.get("attachments") or []
+        self.assertEqual(len(atts), 2)
+        filenames = [a["filename"] for a in atts]
+        self.assertTrue(any("resumen_ejecutivo" in f for f in filenames))
+        self.assertTrue(any("resumen_detallado" in f for f in filenames))
+
+
 if __name__ == "__main__":
     unittest.main()
