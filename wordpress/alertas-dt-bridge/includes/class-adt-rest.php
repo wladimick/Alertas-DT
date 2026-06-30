@@ -61,16 +61,19 @@ class ADT_REST {
 
         $subscribers = array_map( function ( array $row ): array {
             return [
-                'id'          => (int) $row['id'],
-                'email'       => $row['email'],
-                'status'      => $row['status'],
-                'consent'     => (bool) $row['consent'],
-                'consent_at'  => $row['consent_at'] ?? null,
-                'source_page' => $row['source_page'] ?? null,
-                'source_url'  => $row['source_url']  ?? null,
-                'created_at'  => $row['created_at'],
-                'updated_at'  => $row['updated_at'],
-                'synced_at'   => $row['synced_at'] ?? null,
+                'id'               => (int) $row['id'],
+                'email'            => $row['email'],
+                'status'           => $row['status'],
+                'consent'          => (bool) $row['consent'],
+                'consent_at'       => $row['consent_at'] ?? null,
+                'source_page'      => $row['source_page'] ?? null,
+                'source_url'       => $row['source_url']  ?? null,
+                'created_at'       => $row['created_at'],
+                'updated_at'       => $row['updated_at'],
+                'synced_at'        => $row['synced_at'] ?? null,
+                'subscriber_name'  => $row['subscriber_name'] ?? null,
+                'phone'            => $row['phone'] ?? null,
+                'whatsapp_consent' => (bool) ( $row['whatsapp_consent'] ?? false ),
             ];
         }, $rows );
 

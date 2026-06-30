@@ -36,6 +36,12 @@ def init_db(database_path: Path | str) -> None:
         migrate(conn)
 
 
+def _add_column_if_missing(conn: sqlite3.Connection, table: str, column: str, definition: str) -> None:
+    cols = {row[1] for row in conn.execute(f"PRAGMA table_info({table})")}
+    if column not in cols:
+        conn.execute(f"ALTER TABLE {table} ADD COLUMN {column} {definition}")
+
+
 def migrate(conn: sqlite3.Connection) -> None:
     conn.executescript(
         """
@@ -170,6 +176,11 @@ def migrate(conn: sqlite3.Connection) -> None:
         CREATE INDEX IF NOT EXISTS idx_ai_usage_operation ON ai_usage_logs(operation);
         """
     )
+    # Columnas añadidas después del schema inicial: se agregan si no existen.
+    _add_column_if_missing(conn, "subscribers", "subscriber_name", "TEXT")
+    _add_column_if_missing(conn, "subscribers", "phone",           "TEXT")
+    _add_column_if_missing(conn, "subscribers", "whatsapp_consent","INTEGER NOT NULL DEFAULT 0")
+    conn.commit()
 
 
 def as_dict(row: sqlite3.Row | None) -> dict[str, Any] | None:
@@ -200,6 +211,9 @@ def upsert_subscriber(
     notify_whatsapp: bool,
     source_page: str | None,
     consent: bool,
+    subscriber_name: str | None = None,
+    phone: str | None = None,
+    whatsapp_consent: bool = False,
 ) -> dict[str, Any]:
     email = normalize_email(email)
     if not validate_email(email):
@@ -207,16 +221,18 @@ def upsert_subscriber(
     if not consent:
         raise ValueError("Debes aceptar recibir alertas para suscribirte.")
 
-    phone = normalize_whatsapp(whatsapp)
-    wants_whatsapp = bool(notify_whatsapp and phone)
+    wa_phone = normalize_whatsapp(whatsapp)
+    wants_whatsapp = bool(notify_whatsapp and wa_phone)
+    clean_phone = normalize_whatsapp(phone) if phone else None
     now = utcnow()
     conn.execute(
         """
         INSERT INTO subscribers (
             email, whatsapp, notify_email, notify_whatsapp, whatsapp_opt_in,
-            consent, source_page, status, created_at, updated_at
+            consent, source_page, status, created_at, updated_at,
+            subscriber_name, phone, whatsapp_consent
         )
-        VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?)
+        VALUES (?, ?, ?, ?, ?, ?, ?, 'active', ?, ?, ?, ?, ?)
         ON CONFLICT(email) DO UPDATE SET
             whatsapp = excluded.whatsapp,
             notify_email = excluded.notify_email,
@@ -226,11 +242,14 @@ def upsert_subscriber(
             -- Conserva el origen original si la nueva suscripción no trae source_page.
             source_page = COALESCE(excluded.source_page, subscribers.source_page),
             status = 'active',
-            updated_at = excluded.updated_at
+            updated_at = excluded.updated_at,
+            subscriber_name = COALESCE(excluded.subscriber_name, subscribers.subscriber_name),
+            phone = COALESCE(excluded.phone, subscribers.phone),
+            whatsapp_consent = excluded.whatsapp_consent
         """,
         (
             email,
-            phone or None,
+            wa_phone or None,
             int(notify_email),
             int(wants_whatsapp),
             int(wants_whatsapp),
@@ -238,6 +257,9 @@ def upsert_subscriber(
             source_page,
             now,
             now,
+            (subscriber_name or "").strip() or None,
+            clean_phone or None,
+            int(whatsapp_consent),
         ),
     )
     conn.commit()

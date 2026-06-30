@@ -14,19 +14,22 @@ class ADT_Database {
         $charset    = $wpdb->get_charset_collate();
 
         $sql = "CREATE TABLE IF NOT EXISTS {$table} (
-            id          BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
-            email       VARCHAR(190)    NOT NULL,
-            status      VARCHAR(30)     NOT NULL DEFAULT 'active',
-            consent     TINYINT(1)      NOT NULL DEFAULT 0,
-            consent_at  DATETIME        NULL,
-            source_page TEXT            NULL,
-            source_url  TEXT            NULL,
-            ip_hash     VARCHAR(128)    NULL,
-            user_agent  TEXT            NULL,
-            created_at  DATETIME        NOT NULL,
-            updated_at  DATETIME        NOT NULL,
-            synced_at   DATETIME        NULL,
-            last_error  TEXT            NULL,
+            id               BIGINT UNSIGNED NOT NULL AUTO_INCREMENT,
+            email            VARCHAR(190)    NOT NULL,
+            status           VARCHAR(30)     NOT NULL DEFAULT 'active',
+            consent          TINYINT(1)      NOT NULL DEFAULT 0,
+            consent_at       DATETIME        NULL,
+            source_page      TEXT            NULL,
+            source_url       TEXT            NULL,
+            ip_hash          VARCHAR(128)    NULL,
+            user_agent       TEXT            NULL,
+            created_at       DATETIME        NOT NULL,
+            updated_at       DATETIME        NOT NULL,
+            synced_at        DATETIME        NULL,
+            last_error       TEXT            NULL,
+            subscriber_name  VARCHAR(255)    NULL,
+            phone            VARCHAR(30)     NULL,
+            whatsapp_consent TINYINT(1)      NOT NULL DEFAULT 0,
             PRIMARY KEY (id),
             UNIQUE KEY email_unique (email)
         ) {$charset};";
@@ -63,19 +66,26 @@ class ADT_Database {
             ARRAY_A
         );
 
+        $subscriber_name  = isset( $data['subscriber_name'] ) ? sanitize_text_field( $data['subscriber_name'] ) : null;
+        $phone            = isset( $data['phone'] )           ? sanitize_text_field( $data['phone'] )           : null;
+        $whatsapp_consent = ! empty( $data['whatsapp_consent'] ) ? 1 : 0;
+
         if ( $existing ) {
             $wpdb->update(
                 $table,
                 [
-                    'status'     => 'active',
-                    'consent'    => 1,
-                    'consent_at' => $now,
-                    'source_page' => $data['source_page'] ?? null,
-                    'source_url'  => $data['source_url']  ?? null,
-                    'updated_at'  => $now,
+                    'status'           => 'active',
+                    'consent'          => 1,
+                    'consent_at'       => $now,
+                    'source_page'      => $data['source_page'] ?? null,
+                    'source_url'       => $data['source_url']  ?? null,
+                    'updated_at'       => $now,
+                    'subscriber_name'  => $subscriber_name,
+                    'phone'            => $phone,
+                    'whatsapp_consent' => $whatsapp_consent,
                 ],
                 [ 'id' => $existing['id'] ],
-                [ '%s', '%d', '%s', '%s', '%s', '%s' ],
+                [ '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%d' ],
                 [ '%d' ]
             );
             return [ 'id' => (int) $existing['id'], 'created' => false ];
@@ -86,18 +96,21 @@ class ADT_Database {
         $wpdb->insert(
             $table,
             [
-                'email'      => $email,
-                'status'     => 'active',
-                'consent'    => 1,
-                'consent_at' => $now,
-                'source_page' => $data['source_page'] ?? null,
-                'source_url'  => $data['source_url']  ?? null,
-                'ip_hash'    => $ip_hash,
-                'user_agent' => isset( $data['user_agent'] ) ? substr( $data['user_agent'], 0, 512 ) : null,
-                'created_at' => $now,
-                'updated_at' => $now,
+                'email'            => $email,
+                'status'           => 'active',
+                'consent'          => 1,
+                'consent_at'       => $now,
+                'source_page'      => $data['source_page'] ?? null,
+                'source_url'       => $data['source_url']  ?? null,
+                'ip_hash'          => $ip_hash,
+                'user_agent'       => isset( $data['user_agent'] ) ? substr( $data['user_agent'], 0, 512 ) : null,
+                'created_at'       => $now,
+                'updated_at'       => $now,
+                'subscriber_name'  => $subscriber_name,
+                'phone'            => $phone,
+                'whatsapp_consent' => $whatsapp_consent,
             ],
-            [ '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s' ]
+            [ '%s', '%s', '%d', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%s', '%d' ]
         );
         return [ 'id' => (int) $wpdb->insert_id, 'created' => true ];
     }
@@ -132,7 +145,7 @@ class ADT_Database {
         $limit  = min( (int) ( $args['limit'] ?? 100 ), 500 );
         $offset = ( max( 1, (int) ( $args['page'] ?? 1 ) ) - 1 ) * $limit;
 
-        $sql = "SELECT id, email, status, consent, consent_at, source_page, source_url, created_at, updated_at, synced_at FROM {$table}"; // phpcs:ignore
+        $sql = "SELECT id, email, status, consent, consent_at, source_page, source_url, created_at, updated_at, synced_at, subscriber_name, phone, whatsapp_consent FROM {$table}"; // phpcs:ignore
         if ( $where ) {
             $sql .= ' WHERE ' . implode( ' AND ', $where );
         }

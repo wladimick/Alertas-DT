@@ -1567,5 +1567,159 @@ class NewPhasesTestCase(unittest.TestCase):
         self.assertIn("Afecta los libros contables.", html_out)
 
 
+class SubscriberNamePhoneTestCase(unittest.TestCase):
+    """Tests para subscriber_name, phone y whatsapp_consent (feat/subscriber-name-phone)."""
+
+    def setUp(self):
+        self.tmp = tempfile.mkdtemp()
+        self.db_path = Path(self.tmp) / "test.db"
+        db.init_db(self.db_path)
+
+    def _conn(self):
+        return db.connect(self.db_path)
+
+    # --- test_01: migración añade las tres columnas ---
+    def test_01_migration_adds_new_columns(self):
+        with self._conn() as conn:
+            cols = {row[1] for row in conn.execute("PRAGMA table_info(subscribers)")}
+        self.assertIn("subscriber_name",  cols)
+        self.assertIn("phone",            cols)
+        self.assertIn("whatsapp_consent", cols)
+
+    # --- test_02: upsert guarda los nuevos campos ---
+    def test_02_upsert_saves_name_phone_whatsapp_consent(self):
+        with self._conn() as conn:
+            sub = db.upsert_subscriber(
+                conn,
+                email="test@example.com",
+                whatsapp=None,
+                notify_email=True,
+                notify_whatsapp=False,
+                source_page="web",
+                consent=True,
+                subscriber_name="Ana Pérez",
+                phone="+56912345678",
+                whatsapp_consent=True,
+            )
+        self.assertEqual(sub["subscriber_name"], "Ana Pérez")
+        self.assertEqual(sub["phone"], "+56912345678")
+        self.assertEqual(sub["whatsapp_consent"], 1)
+
+    # --- test_03: llamada sin nuevos campos no rompe compatibilidad ---
+    def test_03_upsert_backward_compat_without_new_fields(self):
+        with self._conn() as conn:
+            sub = db.upsert_subscriber(
+                conn,
+                email="legacy@example.com",
+                whatsapp=None,
+                notify_email=True,
+                notify_whatsapp=False,
+                source_page="wordpress",
+                consent=True,
+            )
+        self.assertIsNone(sub["subscriber_name"])
+        self.assertIsNone(sub["phone"])
+        self.assertEqual(sub["whatsapp_consent"], 0)
+
+    # --- test_04: ON CONFLICT preserva subscriber_name si el update no trae uno ---
+    def test_04_upsert_on_conflict_preserves_name_if_not_provided(self):
+        with self._conn() as conn:
+            db.upsert_subscriber(
+                conn,
+                email="update@example.com",
+                whatsapp=None,
+                notify_email=True,
+                notify_whatsapp=False,
+                source_page="web",
+                consent=True,
+                subscriber_name="Carlos",
+            )
+            sub = db.upsert_subscriber(
+                conn,
+                email="update@example.com",
+                whatsapp=None,
+                notify_email=True,
+                notify_whatsapp=False,
+                source_page="web",
+                consent=True,
+                # subscriber_name omitido → debe conservar "Carlos"
+            )
+        self.assertEqual(sub["subscriber_name"], "Carlos")
+
+    # --- test_05: wordpress_sync mapea los nuevos campos desde el payload ---
+    def test_05_wordpress_sync_maps_new_fields(self):
+        fake_page = {
+            "ok": True,
+            "total": 1,
+            "limit": 100,
+            "subscribers": [
+                {
+                    "id": 42,
+                    "email": "sync@example.com",
+                    "consent": True,
+                    "source_page": "wordpress",
+                    "subscriber_name": "María",
+                    "phone": "+56987654321",
+                    "whatsapp_consent": True,
+                }
+            ],
+        }
+        settings = settings_for(
+            self.db_path,
+            wordpress_sync_enabled=True,
+            wordpress_api_url="http://fake",
+            wordpress_api_token="tok",
+        )
+        with mock.patch("dt_alerts.wordpress_sync._fetch_subscribers", return_value=fake_page), \
+             mock.patch("dt_alerts.wordpress_sync._mark_synced"):
+            result = wordpress_sync.sync(settings)
+
+        self.assertEqual(result["status"], "ok")
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT subscriber_name, phone, whatsapp_consent FROM subscribers WHERE email = ?",
+                ("sync@example.com",)
+            ).fetchone()
+        self.assertEqual(row["subscriber_name"], "María")
+        self.assertEqual(row["phone"], "+56987654321")
+        self.assertEqual(row["whatsapp_consent"], 1)
+
+    # --- test_06: wordpress_sync funciona si el payload no trae los nuevos campos ---
+    def test_06_wordpress_sync_backward_compat_missing_new_fields(self):
+        fake_page = {
+            "ok": True,
+            "total": 1,
+            "limit": 100,
+            "subscribers": [
+                {
+                    "id": 99,
+                    "email": "old@example.com",
+                    "consent": True,
+                    "source_page": "wordpress",
+                    # sin subscriber_name, phone, whatsapp_consent
+                }
+            ],
+        }
+        settings = settings_for(
+            self.db_path,
+            wordpress_sync_enabled=True,
+            wordpress_api_url="http://fake",
+            wordpress_api_token="tok",
+        )
+        with mock.patch("dt_alerts.wordpress_sync._fetch_subscribers", return_value=fake_page), \
+             mock.patch("dt_alerts.wordpress_sync._mark_synced"):
+            result = wordpress_sync.sync(settings)
+
+        self.assertEqual(result["status"], "ok")
+        with self._conn() as conn:
+            row = conn.execute(
+                "SELECT subscriber_name, phone, whatsapp_consent FROM subscribers WHERE email = ?",
+                ("old@example.com",)
+            ).fetchone()
+        self.assertIsNone(row["subscriber_name"])
+        self.assertIsNone(row["phone"])
+        self.assertEqual(row["whatsapp_consent"], 0)
+
+
 if __name__ == "__main__":
     unittest.main()
