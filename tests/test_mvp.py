@@ -1567,5 +1567,99 @@ class NewPhasesTestCase(unittest.TestCase):
         self.assertIn("Afecta los libros contables.", html_out)
 
 
+    # ------------------------------------------------------------------ Punto E gap
+    def test_17_csv_error_field_truncated_to_500_chars(self):
+        """El campo error en el CSV queda truncado a 500 chars (server.py:522 [:500])."""
+        import io
+        import csv as csv_mod
+        long_error = "x" * 1000  # 1000 chars — debe quedar en 500 en el CSV
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tempfile.mkdtemp()) / "t.db"
+            db.init_db(db_path)
+            with db.connect(db_path) as conn:
+                db.record_ai_usage(
+                    conn, operation="generate_summary", status="error",
+                    provider="azure", model="gpt-chat-latest",
+                    total_tokens=0, daily_limit=50000, monthly_limit=500000,
+                    error=long_error,
+                )
+                rows = db.get_recent_ai_usage(conn, limit=10)
+        COLS = ["id", "created_at", "operation", "status", "provider", "model",
+                "input_tokens", "output_tokens", "total_tokens", "error"]
+        buf = io.StringIO()
+        writer = csv_mod.writer(buf)
+        writer.writerow(COLS + ["estimated_cost_usd", "estimated_cost_clp"])
+        settings = self._make_settings(
+            db_path,
+            ai_input_price_per_1m_usd=2.0,
+            ai_output_price_per_1m_usd=8.0,
+            ai_usd_clp_rate=921,
+        )
+        from dt_alerts.server import _calc_ai_cost
+        for row in rows:
+            cost_usd, cost_clp = _calc_ai_cost(
+                row["input_tokens"] or 0, row["output_tokens"] or 0, settings
+            )
+            writer.writerow([
+                row["id"], row["created_at"], row["operation"], row["status"],
+                row["provider"] or "", row["model"] or "",
+                row["input_tokens"], row["output_tokens"], row["total_tokens"],
+                (row["error"] or "")[:500],
+                f"{cost_usd:.6f}", f"{cost_clp:.2f}",
+            ])
+        csv_output = buf.getvalue()
+        # El campo error truncado nunca debe superar 500 chars
+        reader = csv_mod.reader(io.StringIO(csv_output))
+        header = next(reader)
+        error_col = header.index("error")
+        for data_row in reader:
+            self.assertLessEqual(len(data_row[error_col]), 500)
+        # Verificar que se insertaron exactamente 500 'x' (no 1000)
+        self.assertIn("x" * 500, csv_output)
+        self.assertNotIn("x" * 501, csv_output)
+
+    # ------------------------------------------------------------------ Punto H gaps
+    def test_18_render_settings_shows_referencial_text(self):
+        """render_settings incluye texto 'Costo estimado referencial'."""
+        from dt_alerts.server import render_settings
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db.init_db(db_path)
+            settings = self._make_settings(
+                db_path,
+                ai_enabled=False,
+                ai_input_price_per_1m_usd=2.0,
+                ai_output_price_per_1m_usd=8.0,
+                ai_usd_clp_rate=921,
+                ai_daily_token_limit=50000,
+                ai_monthly_token_limit=500000,
+                ai_warning_percent=80,
+            )
+            html_out = render_settings(settings)
+        self.assertIn("referencial", html_out.lower())
+
+    def test_19_render_settings_shows_cost_labels(self):
+        """render_settings incluye etiquetas de costo hoy y mes."""
+        from dt_alerts.server import render_settings
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db.init_db(db_path)
+            settings = self._make_settings(
+                db_path,
+                ai_enabled=False,
+                ai_input_price_per_1m_usd=2.0,
+                ai_output_price_per_1m_usd=8.0,
+                ai_usd_clp_rate=921,
+                ai_daily_token_limit=50000,
+                ai_monthly_token_limit=500000,
+                ai_warning_percent=80,
+            )
+            html_out = render_settings(settings)
+        self.assertIn("hoy", html_out.lower())
+        self.assertIn("mes", html_out.lower())
+        # Costo última llamada también presente
+        self.assertIn("última", html_out.lower())
+
+
 if __name__ == "__main__":
     unittest.main()
