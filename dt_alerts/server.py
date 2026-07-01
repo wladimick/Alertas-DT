@@ -753,10 +753,8 @@ def flash_for_email_result(result: dict[str, Any]) -> str:
     if status == "skipped_missing_credentials":
         return "No se envió: faltan credenciales de SendGrid. Configúralas en Render (Mail Send)."
     if status == "failed":
-        return (
-            "No se pudo enviar el correo con SendGrid. Revisa que la API key esté activa "
-            "y tenga permiso Mail Send."
-        )
+        err = result.get("error") or "desconocido"
+        return f"Error SendGrid: {err}. Revisa API key y permisos Mail Send."
     return result.get("message") or "Prueba procesada."
 
 

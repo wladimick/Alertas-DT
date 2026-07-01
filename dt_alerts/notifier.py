@@ -4,6 +4,7 @@ import base64
 import html
 import json
 import smtplib
+import urllib.error
 import urllib.request
 from email.message import EmailMessage
 from email.utils import formataddr
@@ -542,7 +543,7 @@ def _send_sendgrid(
                 content_bytes = content_bytes.encode("utf-8")
             payload["attachments"].append({
                 "content": base64.b64encode(content_bytes).decode("ascii"),
-                "type": att.get("type", "text/html; charset=utf-8"),
+                "type": att.get("type", "text/html").split(";")[0].strip(),
                 "filename": att["filename"],
                 "disposition": "attachment",
             })
@@ -562,6 +563,13 @@ def _send_sendgrid(
             "ok": True, "provider": "sendgrid", "status": "sent",
             "provider_message_id": message_id, "error": None,
             "message": "Email enviado con SendGrid.",
+        }
+    except urllib.error.HTTPError as exc:
+        body = exc.read().decode("utf-8", errors="replace")
+        return {
+            "ok": False, "provider": "sendgrid", "status": "failed",
+            "provider_message_id": None, "error": f"HTTP {exc.code}: {body}",
+            "message": f"Error al enviar con SendGrid: HTTP {exc.code}: {body}",
         }
     except Exception as exc:
         return {
