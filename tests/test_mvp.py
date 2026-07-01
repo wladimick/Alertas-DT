@@ -1567,5 +1567,114 @@ class NewPhasesTestCase(unittest.TestCase):
         self.assertIn("Afecta los libros contables.", html_out)
 
 
+    def test_13_attachments_disabled_by_flag(self):
+        """AI_ATTACHMENTS_ENABLED=False → _build_attachments devuelve lista vacía."""
+        from dt_alerts.notifier import _build_attachments
+        settings = self._make_settings(
+            Path(tempfile.mkdtemp()) / "t.db",
+            ai_attachments_enabled=False,
+        )
+        alert = {
+            "id": 1, "document_id": 1,
+            "title": "Circular 1",
+            "ai_status": "success",
+            "ai_executive_summary": '{"title":"Eje","body":"Cuerpo."}',
+            "ai_detailed_summary_json": '{"descripcion":"Desc."}',
+            "ai_key_points_json": "[]", "ai_recommended_actions_json": "[]",
+            "ai_legal_disclaimer": "",
+        }
+        self.assertEqual(_build_attachments(alert, settings), [])
+
+    def test_14_attachments_included_when_fallback(self):
+        """_build_attachments genera adjuntos cuando ai_status='fallback'."""
+        from dt_alerts.notifier import _build_attachments
+        settings = self._make_settings(
+            Path(tempfile.mkdtemp()) / "t.db",
+            ai_attachments_enabled=True,
+        )
+        alert = {
+            "id": 2, "document_id": 2,
+            "title": "Ordinario 50",
+            "category": "Ordinarios", "publication_date": "2026-01-01",
+            "canonical_url": "https://example.com",
+            "summary": "Resumen de respaldo.",
+            "ai_status": "fallback",
+            "ai_executive_summary": '{"title":"Eje fallback","body":"Cuerpo."}',
+            "ai_detailed_summary_json": '{"descripcion":"Desc fallback."}',
+            "ai_key_points_json": "[]", "ai_recommended_actions_json": "[]",
+            "ai_legal_disclaimer": "",
+        }
+        atts = _build_attachments(alert, settings)
+        self.assertEqual(len(atts), 2)
+        self.assertTrue(all(a["filename"].endswith(".html") for a in atts))
+
+    def test_15_send_alert_email_passes_attachments(self):
+        """send_alert_email propaga adjuntos al proveedor console sin error."""
+        from dt_alerts.notifier import send_alert_email
+        settings = self._make_settings(
+            Path(tempfile.mkdtemp()) / "t.db",
+            email_provider="console",
+            ai_attachments_enabled=True,
+        )
+        alert = {
+            "id": 3, "document_id": 3,
+            "title": "Circular de test send_alert_email",
+            "category": "Circulares", "publication_date": "2026-01-01",
+            "canonical_url": "https://example.com",
+            "summary": "Resumen.", "relevance": "alto",
+            "key_points_json": "[]", "practical_impacts_json": "[]",
+            "ai_status": "success", "ai_provider": "azure", "ai_model": "gpt-chat-latest",
+            "ai_content_quality": "full", "ai_updated_at": "2026-01-01",
+            "ai_email_subject": "Nueva normativa",
+            "ai_executive_summary": '{"title":"Eje","body":"Cuerpo."}',
+            "ai_detailed_summary_json": '{"descripcion":"Desc."}',
+            "ai_key_points_json": "[]", "ai_recommended_actions_json": "[]",
+            "ai_legal_disclaimer": "",
+        }
+        subscriber = {"email": "qa@example.com", "name": "QA Tester"}
+        result = send_alert_email(subscriber, alert, settings)
+        self.assertIsNotNone(result)
+        self.assertNotIn("error", (result.get("status") or "").lower())
+
+
+    def test_16_send_test_alert_email_passes_attachments(self):
+        """send_test_alert_email propaga adjuntos al proveedor (end-to-end con mock)."""
+        from unittest.mock import patch, MagicMock
+        from dt_alerts.notifier import send_test_alert_email
+        settings = self._make_settings(
+            Path(tempfile.mkdtemp()) / "t.db",
+            email_provider="console",
+            ai_attachments_enabled=True,
+        )
+        alert = {
+            "id": 4, "document_id": 4,
+            "title": "Circular end-to-end test",
+            "category": "Circulares", "publication_date": "2026-01-01",
+            "canonical_url": "https://example.com",
+            "summary": "Resumen.", "relevance": "alto",
+            "key_points_json": "[]", "practical_impacts_json": "[]",
+            "ai_status": "success", "ai_provider": "azure", "ai_model": "gpt-chat-latest",
+            "ai_content_quality": "full", "ai_updated_at": "2026-01-01",
+            "ai_email_subject": "Test adjuntos",
+            "ai_executive_summary": '{"title":"Eje","body":"Cuerpo."}',
+            "ai_detailed_summary_json": '{"descripcion":"Desc."}',
+            "ai_key_points_json": "[]", "ai_recommended_actions_json": "[]",
+            "ai_legal_disclaimer": "",
+        }
+        mock_result = {"ok": True, "provider": "console", "status": "simulated"}
+        with patch("dt_alerts.notifier.send_email", return_value=mock_result) as mock_send:
+            result = send_test_alert_email("qa@example.com", alert, settings)
+        self.assertTrue(result["ok"])
+        _call_kwargs = mock_send.call_args
+        attachments_passed = _call_kwargs.kwargs.get("attachments") or (
+            _call_kwargs.args[5] if len(_call_kwargs.args) > 5 else None
+        )
+        self.assertIsNotNone(attachments_passed, "send_email no recibió adjuntos")
+        self.assertEqual(len(attachments_passed), 2)
+        filenames = [a["filename"] for a in attachments_passed]
+        self.assertTrue(any("resumen_ejecutivo" in f for f in filenames))
+        self.assertTrue(any("resumen_detallado" in f for f in filenames))
+
+
 if __name__ == "__main__":
     unittest.main()
