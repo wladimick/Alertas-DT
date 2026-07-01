@@ -1636,7 +1636,6 @@ class NewPhasesTestCase(unittest.TestCase):
         self.assertIsNotNone(result)
         self.assertNotIn("error", (result.get("status") or "").lower())
 
-
     def test_16_send_test_alert_email_passes_attachments(self):
         """send_test_alert_email propaga adjuntos al proveedor (end-to-end con mock)."""
         from unittest.mock import patch, MagicMock
@@ -1672,6 +1671,230 @@ class NewPhasesTestCase(unittest.TestCase):
         self.assertIsNotNone(attachments_passed, "send_email no recibió adjuntos")
         self.assertEqual(len(attachments_passed), 2)
         filenames = [a["filename"] for a in attachments_passed]
+        self.assertTrue(any("resumen_ejecutivo" in f for f in filenames))
+        self.assertTrue(any("resumen_detallado" in f for f in filenames))
+
+    # ------------------------------------------------------------------ Punto E gap
+    def test_17_csv_error_field_truncated_to_500_chars(self):
+        """El campo error en el CSV queda truncado a 500 chars (server.py:522 [:500])."""
+        import io
+        import csv as csv_mod
+        long_error = "x" * 1000  # 1000 chars — debe quedar en 500 en el CSV
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tempfile.mkdtemp()) / "t.db"
+            db.init_db(db_path)
+            with db.connect(db_path) as conn:
+                db.record_ai_usage(
+                    conn, operation="generate_summary", status="error",
+                    provider="azure", model="gpt-chat-latest",
+                    total_tokens=0, daily_limit=50000, monthly_limit=500000,
+                    error=long_error,
+                )
+                rows = db.get_recent_ai_usage(conn, limit=10)
+        COLS = ["id", "created_at", "operation", "status", "provider", "model",
+                "input_tokens", "output_tokens", "total_tokens", "error"]
+        buf = io.StringIO()
+        writer = csv_mod.writer(buf)
+        writer.writerow(COLS + ["estimated_cost_usd", "estimated_cost_clp"])
+        settings = self._make_settings(
+            db_path,
+            ai_input_price_per_1m_usd=2.0,
+            ai_output_price_per_1m_usd=8.0,
+            ai_usd_clp_rate=921,
+        )
+        from dt_alerts.server import _calc_ai_cost
+        for row in rows:
+            cost_usd, cost_clp = _calc_ai_cost(
+                row["input_tokens"] or 0, row["output_tokens"] or 0, settings
+            )
+            writer.writerow([
+                row["id"], row["created_at"], row["operation"], row["status"],
+                row["provider"] or "", row["model"] or "",
+                row["input_tokens"], row["output_tokens"], row["total_tokens"],
+                (row["error"] or "")[:500],
+                f"{cost_usd:.6f}", f"{cost_clp:.2f}",
+            ])
+        csv_output = buf.getvalue()
+        # El campo error truncado nunca debe superar 500 chars
+        reader = csv_mod.reader(io.StringIO(csv_output))
+        header = next(reader)
+        error_col = header.index("error")
+        for data_row in reader:
+            self.assertLessEqual(len(data_row[error_col]), 500)
+        # Verificar que se insertaron exactamente 500 'x' (no 1000)
+        self.assertIn("x" * 500, csv_output)
+        self.assertNotIn("x" * 501, csv_output)
+
+    # ------------------------------------------------------------------ Punto H gaps
+    def test_18_render_settings_shows_referencial_text(self):
+        """render_settings incluye texto 'Costo estimado referencial'."""
+        from dt_alerts.server import render_settings
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db.init_db(db_path)
+            settings = self._make_settings(
+                db_path,
+                ai_enabled=False,
+                ai_input_price_per_1m_usd=2.0,
+                ai_output_price_per_1m_usd=8.0,
+                ai_usd_clp_rate=921,
+                ai_daily_token_limit=50000,
+                ai_monthly_token_limit=500000,
+                ai_warning_percent=80,
+            )
+            html_out = render_settings(settings)
+        self.assertIn("referencial", html_out.lower())
+
+    def test_19_render_settings_shows_cost_labels(self):
+        """render_settings incluye etiquetas de costo hoy y mes."""
+        from dt_alerts.server import render_settings
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db.init_db(db_path)
+            settings = self._make_settings(
+                db_path,
+                ai_enabled=False,
+                ai_input_price_per_1m_usd=2.0,
+                ai_output_price_per_1m_usd=8.0,
+                ai_usd_clp_rate=921,
+                ai_daily_token_limit=50000,
+                ai_monthly_token_limit=500000,
+                ai_warning_percent=80,
+            )
+            html_out = render_settings(settings)
+        self.assertIn("hoy", html_out.lower())
+        self.assertIn("mes", html_out.lower())
+        # Costo última llamada también presente
+        self.assertIn("última", html_out.lower())
+
+    def test_20_send_test_alert_email_includes_attachments(self):
+        """send_test_alert_email (función aislada) construye y pasa adjuntos a send_email."""
+        from unittest.mock import patch
+        from dt_alerts.notifier import send_test_alert_email
+        settings = self._make_settings(
+            Path(tempfile.mkdtemp()) / "t.db",
+            email_provider="console",
+            ai_attachments_enabled=True,
+        )
+        alert = {
+            "id": 7, "document_id": 7,
+            "title": "Circular endpoint test",
+            "category": "Circulares", "publication_date": "2026-01-01",
+            "canonical_url": "https://example.com",
+            "summary": "Resumen.", "relevance": "alto",
+            "key_points_json": "[]", "practical_impacts_json": "[]",
+            "ai_status": "success", "ai_provider": "azure", "ai_model": "gpt-chat-latest",
+            "ai_content_quality": "full", "ai_updated_at": "2026-01-01",
+            "ai_email_subject": "Test endpoint",
+            "ai_executive_summary": '{"title":"Eje","body":"Cuerpo."}',
+            "ai_detailed_summary_json": '{"descripcion":"Desc."}',
+            "ai_key_points_json": "[]", "ai_recommended_actions_json": "[]",
+            "ai_legal_disclaimer": "",
+        }
+        mock_result = {"ok": True, "provider": "console", "status": "simulated"}
+        with patch("dt_alerts.notifier.send_email", return_value=mock_result) as mock_send:
+            send_test_alert_email("qa@example.com", alert, settings)
+        attachments_passed = mock_send.call_args.kwargs.get("attachments")
+        self.assertIsNotNone(attachments_passed, "send_email no recibió adjuntos")
+        self.assertEqual(len(attachments_passed), 2)
+        filenames = [a["filename"] for a in attachments_passed]
+        self.assertTrue(any("resumen_ejecutivo" in f for f in filenames))
+        self.assertTrue(any("resumen_detallado" in f for f in filenames))
+
+    def test_21_test_endpoint_subject_template_and_attachments(self):
+        """POST /admin/alerts/{id}/test: respeta email_test_subject_template y adjunta archivos."""
+        import http.client
+        import threading
+        import urllib.parse
+        from http.server import ThreadingHTTPServer
+        from unittest.mock import patch
+        from dt_alerts.server import AppHandler
+
+        class _H(AppHandler):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            db_path = Path(tmp) / "t.db"
+            db.init_db(db_path)
+
+            with db.connect(db_path) as conn:
+                doc_id, _ = db.upsert_document(conn, {
+                    "dt_article_id": "art-test21",
+                    "canonical_url": "https://example.com/art21",
+                    "source_url": "https://example.com/list",
+                    "category": "Circulares",
+                    "title": "Circular test_21",
+                    "publication_date": "2026-01-01",
+                    "abstract": "Resumen breve.",
+                    "detail_text": "Texto completo.",
+                    "pdf_url": None, "content_hash": None,
+                })
+                db.update_document_processed(conn, doc_id, status="processed",
+                                             detail_text="Texto.", pdf_url=None,
+                                             content_hash=None, last_error=None)
+                alert_id = db.create_or_update_alert(
+                    conn, doc_id,
+                    summary="Resumen test_21.", key_points=[], practical_impacts=[],
+                    relevance="alto", status="pending_review", ai_error=None,
+                )
+                db.upsert_ai_summary(
+                    conn, doc_id,
+                    provider="azure", model="gpt-chat-latest", status="success",
+                    content_quality="full", relevance="alto",
+                    email_subject="Normativa test_21",
+                    email_summary="Resumen ejecutivo.",
+                    executive_summary='{"title":"Eje","body":"Cuerpo."}',
+                    detailed_summary_json='{"descripcion":"Desc."}',
+                    key_points_json="[]", practical_impacts_json="[]",
+                    recommended_actions_json="[]", tags_json="[]",
+                    legal_disclaimer="", raw_response_json="{}",
+                    input_hash="abc",
+                )
+                db.set_setting(conn, "email_test_subject_template",
+                               "[TEST CUSTOM] {title}")
+
+            _H.settings = settings_for(
+                db_path,
+                disable_admin_auth=True,
+                email_provider="console",
+                ai_attachments_enabled=True,
+            )
+
+            captured = {}
+            mock_result = {"ok": True, "provider": "console", "status": "simulated"}
+
+            def fake_send(settings, *, to, subject, html_body, text_body,
+                          attachments=None):
+                captured["subject"] = subject
+                captured["attachments"] = attachments
+                return mock_result
+
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+            t = threading.Thread(target=server.serve_forever)
+            t.daemon = True
+            t.start()
+            try:
+                port = server.server_address[1]
+                body = urllib.parse.urlencode({"to": "qa@example.com"}).encode()
+                with patch("dt_alerts.server.send_notifier_email", side_effect=fake_send):
+                    conn2 = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                    conn2.request(
+                        "POST", f"/admin/alerts/{alert_id}/test",
+                        body=body,
+                        headers={"Content-Type": "application/x-www-form-urlencoded",
+                                 "Content-Length": str(len(body))},
+                    )
+                    resp = conn2.getresponse()
+                    resp.read()
+            finally:
+                server.shutdown()
+
+        # Subject template personalizado fue respetado
+        self.assertEqual(captured.get("subject"), "[TEST CUSTOM] Circular test_21")
+        # Adjuntos presentes (2 archivos HTML)
+        atts = captured.get("attachments") or []
+        self.assertEqual(len(atts), 2)
+        filenames = [a["filename"] for a in atts]
         self.assertTrue(any("resumen_ejecutivo" in f for f in filenames))
         self.assertTrue(any("resumen_detallado" in f for f in filenames))
 
