@@ -1,1 +1,2 @@
-# Esta app usa solo librerías estándar de Python.
+# Dependencias de producción
+pdfplumber==0.11.10

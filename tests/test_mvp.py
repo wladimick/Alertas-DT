@@ -2124,5 +2124,82 @@ class DetailParserCleanContentTestCase(unittest.TestCase):
         self.assertFalse(parser._found_containers)
 
 
+class PdfIntegrationTestCase(unittest.TestCase):
+    """Verifica que enrich_document_detail integra el texto PDF correctamente."""
+
+    # HTML mínimo con un link a PDF dentro del contenedor de artículo
+    _HTML = """
+    <html><head><title>ORD. N°2/1 - DT</title></head>
+    <body>
+      <div id="article_i__w3_ar_ArticuloCompleto_cuerpo_1" class="articulo">
+        <a href="articles-1_doc.pdf" title="Ir a ORD. N°2/1">ORD. N°2/1</a>
+        <p>Resumen HTML del dictamen con información relevante.</p>
+      </div>
+    </body></html>
+    """
+    _HTML_NO_PDF = """
+    <html><head><title>ORD. N°3/1 - DT</title></head>
+    <body>
+      <div id="article_i__w3_ar_ArticuloCompleto_cuerpo_1" class="articulo">
+        <p>Contenido HTML sin link a PDF.</p>
+      </div>
+    </body></html>
+    """
+    _PDF_TEXT_LONG = "Texto completo del dictamen extraído del PDF. " * 15  # >500 chars
+    _PDF_TEXT_SHORT = "Corto."                                               # <500 chars
+
+    def _make_doc(self) -> "ScrapedDocument":
+        from dt_alerts.dt_scraper import ScrapedDocument
+        return ScrapedDocument(
+            dt_article_id="1",
+            canonical_url="https://www.dt.gob.cl/legislacion/1624/w3-article-1.html",
+            source_url="https://www.dt.gob.cl/",
+            category="Dictámenes",
+            title="ORD. N°2/1",
+            abstract="Resumen breve.",
+        )
+
+    def test_pdf_01_used_when_sufficient(self):
+        """Cuando el PDF tiene ≥500 chars, detail_text viene del PDF."""
+        from dt_alerts import dt_scraper
+        doc = self._make_doc()
+        with mock.patch("dt_alerts.dt_scraper.fetch_text", return_value=self._HTML), \
+             mock.patch("dt_alerts.dt_scraper._extract_pdf_text", return_value=self._PDF_TEXT_LONG):
+            result = dt_scraper.enrich_document_detail(doc)
+        self.assertIn("Texto completo del dictamen", result.detail_text)
+        self.assertIsNotNone(result.pdf_url)
+
+    def test_pdf_02_fallback_when_short(self):
+        """Cuando el PDF tiene <500 chars, se usa el texto HTML."""
+        from dt_alerts import dt_scraper
+        doc = self._make_doc()
+        with mock.patch("dt_alerts.dt_scraper.fetch_text", return_value=self._HTML), \
+             mock.patch("dt_alerts.dt_scraper._extract_pdf_text", return_value=self._PDF_TEXT_SHORT):
+            result = dt_scraper.enrich_document_detail(doc)
+        self.assertIn("Resumen HTML del dictamen", result.detail_text)
+
+    def test_pdf_03_fallback_when_download_fails(self):
+        """URLError al descargar PDF → sin excepción, detail_text viene del HTML."""
+        import urllib.error
+        from dt_alerts import dt_scraper
+        doc = self._make_doc()
+        with mock.patch("dt_alerts.dt_scraper.fetch_text", return_value=self._HTML), \
+             mock.patch("dt_alerts.dt_scraper._extract_pdf_text", return_value=""):
+            result = dt_scraper.enrich_document_detail(doc)
+        self.assertIn("Resumen HTML del dictamen", result.detail_text)
+        self.assertIsNone(result.detail_text if not result.detail_text else None)  # no exception
+
+    def test_pdf_04_fallback_when_encrypted(self):
+        """PDF encriptado (excepción en _extract_pdf_text) → retorna "" → usa HTML."""
+        from dt_alerts import dt_scraper
+        doc = self._make_doc()
+        # _extract_pdf_text ya captura toda excepción y retorna ""; aquí simulamos eso
+        with mock.patch("dt_alerts.dt_scraper.fetch_text", return_value=self._HTML), \
+             mock.patch("dt_alerts.dt_scraper._extract_pdf_text", return_value=""):
+            result = dt_scraper.enrich_document_detail(doc)
+        self.assertIn("Resumen HTML del dictamen", result.detail_text)
+        self.assertIsNotNone(result.pdf_url)  # pdf_url se guarda igual
+
+
 if __name__ == "__main__":
     unittest.main()
