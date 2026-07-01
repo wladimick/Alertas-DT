@@ -16,6 +16,26 @@ ARTICLE_RE = re.compile(r"w3-article-(\d+)\.html", re.IGNORECASE)
 PDF_RE = re.compile(r"\.pdf($|[?#])", re.IGNORECASE)
 USER_AGENT = "DT-Alertas-Contadores-MVP/0.1 (+https://example.com)"
 
+# IDs de los contenedores que contienen el cuerpo real del documento DT.
+# Excluyen menús, nav, breadcrumb y footer que el sitio inyecta en el <body>.
+_ARTICLE_CONTAINER_RE = re.compile(
+    r"article_i__w3_ar_ArticuloCompleto_(?:presentacion|cuerpo|Catalogacion)_\d+",
+    re.IGNORECASE,
+)
+
+# Líneas de navegación y ruido conocido que pueden colarse vía PDF o páginas sin
+# los contenedores estándar (segundo filtro de seguridad).
+_NOISE_LINES: frozenset[str] = frozenset({
+    "Contenido principal", "Toggle navigation", "Compartir", "Imprimir",
+    "Trámites y servicios", "Trabajadores", "Empleadores", "Sindicatos",
+    "Centro de consultas", "Dictámenes y normativa", "Inspecciones y oficinas",
+    "Estudios y estadísticas", "Mi DT", "Noticias", "Quiénes Somos", "Contáctenos",
+    "Buscar dictámenes", "Recorrer por", "Legislación", "Periodo",
+    "Referencias Legales", "Inicio / Dictámenes y normativa / Dictámenes",
+    "Inicio / Dictámenes y normativa / Normativa",
+    "Inicio / Dictámenes y normativa / Órdenes de Servicio",
+})
+
 
 @dataclass
 class ScrapedDocument:
@@ -152,6 +172,10 @@ class DetailParser(HTMLParser):
         self._in_body = False
         self._in_title = False
         self._skip_depth = 0
+        # Rastreo de contenedores de artículo DT (presentacion / cuerpo / Catalogacion).
+        # Solo acumulamos texto cuando estamos dentro de alguno de ellos.
+        self._article_depth = 0   # profundidad de divs anidados dentro del contenedor
+        self._found_containers = False  # True si la página tiene los contenedores esperados
 
     def handle_starttag(self, tag: str, attrs: list[tuple[str, str | None]]) -> None:
         tag = tag.lower()
@@ -167,6 +191,16 @@ class DetailParser(HTMLParser):
             if PDF_RE.search(href):
                 self.pdf_links.append(canonical_article_url(self.page_url, href))
 
+        # Detectar entrada a un contenedor de artículo DT.
+        # Al encontrar el primero, descartamos cualquier texto de nav acumulado antes.
+        if tag == "div" and _ARTICLE_CONTAINER_RE.search(attrs_dict.get("id", "")):
+            if not self._found_containers:
+                self.text_parts = []  # descarta nav/menú previo al primer contenedor
+            self._article_depth += 1
+            self._found_containers = True
+        elif self._article_depth > 0 and tag == "div":
+            self._article_depth += 1
+
     def handle_endtag(self, tag: str) -> None:
         tag = tag.lower()
         if tag == "body":
@@ -175,6 +209,8 @@ class DetailParser(HTMLParser):
             self._in_title = False
         elif tag in {"script", "style", "noscript", "svg", "form"} and self._skip_depth:
             self._skip_depth -= 1
+        elif tag == "div" and self._article_depth > 0:
+            self._article_depth -= 1
 
     def handle_data(self, data: str) -> None:
         text = normalize_text(data)
@@ -182,7 +218,15 @@ class DetailParser(HTMLParser):
             return
         if self._in_title:
             self.title += (" " + text) if self.title else text
-        elif self._in_body and not self._skip_depth:
+            return
+        if not self._in_body or self._skip_depth:
+            return
+        # Si encontramos contenedores DT, solo acumular dentro de ellos.
+        # Si la página no tiene los contenedores esperados (layout atípico),
+        # caemos al comportamiento anterior (todo el body) como fallback.
+        if self._found_containers and self._article_depth == 0:
+            return
+        if text not in _NOISE_LINES:
             self.text_parts.append(text)
 
     @property

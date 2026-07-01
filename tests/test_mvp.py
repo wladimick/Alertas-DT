@@ -2053,5 +2053,76 @@ class SubscriberNamePhoneTestCase(unittest.TestCase):
         self.assertEqual(row["whatsapp_consent"], 0)
 
 
+class DetailParserCleanContentTestCase(unittest.TestCase):
+    """Verifica que DetailParser extrae solo el cuerpo real del documento DT."""
+
+    # HTML mínimo que simula la estructura del sitio DT con contenedores y nav.
+    _HTML_WITH_CONTAINERS = """
+    <html><head><title>ORD. N°1/1 - DT</title></head>
+    <body>
+      <div id="menu">
+        <a href="/">Inicio</a>
+        Toggle navigation
+        Trámites y servicios
+        Trabajadores
+        Empleadores
+      </div>
+      <div id="breadcrumb">Inicio / Dictámenes y normativa / Dictámenes</div>
+      <div id="article_i__w3_ar_ArticuloCompleto_presentacion_1" class="articulo">
+        <h3 class="titulo">ORD. N°1/1</h3>
+        <p class="fecha">01-ene-2025</p>
+        <p class="abstract">Resumen del dictamen.</p>
+      </div>
+      <div id="article_i__w3_ar_ArticuloCompleto_cuerpo_1" class="articulo">
+        <p>DICTAMEN N°1/1</p>
+        <p>ACTUACIÓN: Fija doctrina.</p>
+        <p>MATERIA: Texto legal relevante para contadores.</p>
+      </div>
+      <div id="footer">Derechos reservados DT</div>
+    </body></html>
+    """
+
+    # HTML sin los contenedores estándar (layout atípico): debe caer a fallback body.
+    _HTML_WITHOUT_CONTAINERS = """
+    <html><head><title>Documento DT</title></head>
+    <body>
+      <p>Texto del documento sin contenedor estándar.</p>
+      <p>Segunda línea de contenido.</p>
+    </body></html>
+    """
+
+    def _parse(self, html: str):
+        from dt_alerts.dt_scraper import DetailParser
+        parser = DetailParser("https://www.dt.gob.cl/test")
+        parser.feed(html)
+        return parser
+
+    def test_01_extracts_article_body_and_excludes_nav(self):
+        """El texto extraído contiene el cuerpo real y excluye el menú de navegación."""
+        parser = self._parse(self._HTML_WITH_CONTAINERS)
+        text = parser.text
+        self.assertIn("DICTAMEN N°1/1", text)
+        self.assertIn("Texto legal relevante para contadores", text)
+        self.assertNotIn("Toggle navigation", text)
+        self.assertNotIn("Trámites y servicios", text)
+        self.assertNotIn("Trabajadores", text)
+        self.assertNotIn("Empleadores", text)
+
+    def test_02_excludes_breadcrumb_and_footer(self):
+        """El breadcrumb y el footer no aparecen en el texto extraído."""
+        parser = self._parse(self._HTML_WITH_CONTAINERS)
+        text = parser.text
+        self.assertNotIn("Inicio / Dictámenes y normativa / Dictámenes", text)
+        self.assertNotIn("Derechos reservados DT", text)
+
+    def test_03_fallback_when_no_containers(self):
+        """Sin contenedores estándar, el parser extrae el body completo (no queda vacío)."""
+        parser = self._parse(self._HTML_WITHOUT_CONTAINERS)
+        text = parser.text
+        self.assertIn("Texto del documento sin contenedor estándar", text)
+        self.assertIn("Segunda línea de contenido", text)
+        self.assertFalse(parser._found_containers)
+
+
 if __name__ == "__main__":
     unittest.main()
