@@ -20,18 +20,45 @@ class ADT_Activator {
 
     /**
      * Repite la creación/actualización de tabla cuando ADT_VERSION cambió desde
-     * la última carga. Necesario porque register_activation_hook NO se dispara
-     * al actualizar archivos de un plugin ya activo, solo en su primera activación.
+     * la última carga o cuando faltan columnas requeridas en la tabla real.
+     * Necesario porque register_activation_hook NO se dispara al actualizar
+     * archivos de un plugin ya activo, solo en su primera activación.
      * dbDelta() es seguro de re-ejecutar: agrega columnas/índices faltantes sin
      * eliminar datos ni columnas existentes.
      */
     public static function maybe_upgrade(): void {
-        $installed = get_option( 'adt_plugin_version' );
-        if ( $installed === ADT_VERSION ) {
+        $version_ok = ( get_option( 'adt_plugin_version' ) === ADT_VERSION );
+        $schema_ok  = self::schema_is_current();
+
+        if ( $version_ok && $schema_ok ) {
             return;
         }
 
         ADT_Database::create_table();
         update_option( 'adt_plugin_version', ADT_VERSION );
+    }
+
+    /**
+     * Verifica que todas las columnas requeridas existen en la tabla real.
+     * Cubre el caso donde la versión coincide pero la migración no corrió
+     * (ej. adt_plugin_version se escribió antes de que dbDelta se ejecutara).
+     */
+    private static function schema_is_current(): bool {
+        global $wpdb;
+        $table = ADT_Database::get_table();
+
+        // phpcs:ignore WordPress.DB.PreparedSQL.InterpolatedNotPrepared
+        $cols = $wpdb->get_col( "SHOW COLUMNS FROM {$table}" );
+        if ( empty( $cols ) ) {
+            return false; // tabla no existe aún
+        }
+
+        $required = [ 'email', 'status', 'subscriber_name', 'phone', 'whatsapp_consent' ];
+        foreach ( $required as $col ) {
+            if ( ! in_array( $col, $cols, true ) ) {
+                return false;
+            }
+        }
+        return true;
     }
 }
