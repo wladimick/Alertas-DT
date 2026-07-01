@@ -272,20 +272,32 @@ def fetch_listing(source: dict[str, str], limit: int = 25) -> list[ScrapedDocume
     return docs[:limit]
 
 
-def extract_pdf_text(pdf_url: str) -> str:
-    try:
-        from pypdf import PdfReader
-    except Exception as exc:  # pragma: no cover - depends on optional runtime package.
-        raise RuntimeError("pypdf no está instalado.") from exc
+# Mínimo de caracteres que debe tener el texto PDF para preferirlo sobre el HTML.
+# Descarta PDFs escaneados (retornan "") y PDFs de error (<100 chars).
+_PDF_MIN_CHARS = 500
 
-    raw = fetch_bytes(pdf_url)
-    reader = PdfReader(io.BytesIO(raw))
-    parts: list[str] = []
-    for page in reader.pages[:12]:
-        text = page.extract_text() or ""
-        if text:
-            parts.append(text)
-    return normalize_text(" ".join(parts))
+
+def _extract_pdf_text(pdf_url: str, timeout: int = 30) -> str:
+    """Descarga y extrae texto del PDF en memoria. Retorna "" ante cualquier error."""
+    try:
+        import pdfplumber  # noqa: PLC0415
+    except ImportError:
+        import logging
+        logging.getLogger(__name__).warning("pdfplumber no instalado; omitiendo PDF %s", pdf_url)
+        return ""
+    try:
+        raw = fetch_bytes(pdf_url, timeout=timeout)
+        with pdfplumber.open(io.BytesIO(raw)) as pdf:
+            parts: list[str] = []
+            for page in pdf.pages[:20]:
+                text = page.extract_text() or ""
+                if text:
+                    parts.append(text)
+        return normalize_text(" ".join(parts))
+    except Exception:
+        import logging
+        logging.getLogger(__name__).warning("Error extrayendo texto PDF: %s", pdf_url, exc_info=True)
+        return ""
 
 
 def enrich_document_detail(doc: ScrapedDocument, include_pdf_text: bool = True) -> ScrapedDocument:
@@ -296,13 +308,9 @@ def enrich_document_detail(doc: ScrapedDocument, include_pdf_text: bool = True) 
     body_text = parser.text
     pdf_url = parser.pdf_links[0] if parser.pdf_links else None
     if include_pdf_text and pdf_url:
-        try:
-            pdf_text = extract_pdf_text(pdf_url)
-            if len(pdf_text) > len(body_text):
-                body_text = pdf_text
-        except Exception:
-            # Keep the page text. The worker stores the PDF URL so an admin can review it.
-            pass
+        pdf_text = _extract_pdf_text(pdf_url)
+        if len(pdf_text) >= _PDF_MIN_CHARS:
+            body_text = pdf_text
 
     doc.detail_text = truncate_text(body_text, 24_000) or doc.abstract
     doc.pdf_url = pdf_url
