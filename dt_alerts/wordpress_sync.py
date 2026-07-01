@@ -116,6 +116,9 @@ def sync(settings: Settings) -> dict[str, Any]:
                             notify_whatsapp=False,
                             source_page=row.get("source_page") or "wordpress",
                             consent=bool(row.get("consent")),
+                            subscriber_name=row.get("subscriber_name") or None,
+                            phone=row.get("phone") or None,
+                            whatsapp_consent=bool(row.get("whatsapp_consent")),
                         )
                         wp_id = row.get("id")
                         if wp_id:

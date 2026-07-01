@@ -68,14 +68,31 @@ class ADT_Shortcode {
             <div class="alertas-dt-message" role="alert" aria-live="polite" style="display:none;"></div>
 
             <div class="eg-field">
+                <label class="eg-label" for="adt-name">Nombre (opcional)</label>
+                <input class="eg-input" id="adt-name" name="subscriber_name" type="text"
+                       placeholder="Tu nombre" autocomplete="name">
+            </div>
+
+            <div class="eg-field">
                 <label class="eg-label" for="adt-email">Correo electrónico</label>
                 <input class="eg-input" id="adt-email" name="email" type="email"
                        required placeholder="nombre@empresa.cl" autocomplete="email">
             </div>
 
+            <div class="eg-field">
+                <label class="eg-label" for="adt-phone">Teléfono (opcional)</label>
+                <input class="eg-input" id="adt-phone" name="phone" type="tel"
+                       placeholder="+56 9 1234 5678" autocomplete="tel">
+            </div>
+
             <label class="eg-check eg-check--consent">
                 <input type="checkbox" name="consent" value="1" required>
                 <span>Acepto recibir alertas informativas por email sobre nuevas publicaciones de la Dirección del Trabajo.</span>
+            </label>
+
+            <label class="eg-check eg-check--whatsapp" id="adt-whatsapp-check" style="display:none;">
+                <input type="checkbox" name="whatsapp_consent" value="1" id="adt-whatsapp-consent">
+                <span>También acepto recibir alertas por WhatsApp al número indicado.</span>
             </label>
 
             <button class="eg-btn eg-btn--primary eg-btn--block" type="submit">
@@ -86,6 +103,20 @@ class ADT_Shortcode {
                 Podrás solicitar la baja cuando quieras. Los resúmenes son informativos y no reemplazan la revisión del documento oficial.
             </p>
         </form>
+
+        <script>
+        (function(){
+            var phone = document.getElementById('adt-phone');
+            var wrap  = document.getElementById('adt-whatsapp-check');
+            var cb    = document.getElementById('adt-whatsapp-consent');
+            if (!phone || !wrap) return;
+            phone.addEventListener('input', function(){
+                var show = phone.value.trim().length > 0;
+                wrap.style.display = show ? '' : 'none';
+                if (!show) cb.checked = false;
+            });
+        })();
+        </script>
 
         <noscript>
             <form class="eg-card eg-form alertas-dt-form" method="post"
@@ -126,12 +157,15 @@ class ADT_Shortcode {
 
         try {
             $result = ADT_Database::upsert( [
-                'email'      => $email,
-                'consent'    => $consent,
-                'source_page' => isset( $_POST['source_page'] ) ? sanitize_text_field( wp_unslash( $_POST['source_page'] ) ) : null,
-                'source_url'  => isset( $_POST['source_url'] )  ? esc_url_raw( wp_unslash( $_POST['source_url'] ) ) : null,
-                'ip'         => $_SERVER['REMOTE_ADDR'] ?? '',
-                'user_agent' => $_SERVER['HTTP_USER_AGENT'] ?? '',
+                'email'            => $email,
+                'consent'          => $consent,
+                'source_page'      => isset( $_POST['source_page'] )     ? sanitize_text_field( wp_unslash( $_POST['source_page'] ) )     : null,
+                'source_url'       => isset( $_POST['source_url'] )      ? esc_url_raw( wp_unslash( $_POST['source_url'] ) )              : null,
+                'ip'               => $_SERVER['REMOTE_ADDR'] ?? '',
+                'user_agent'       => $_SERVER['HTTP_USER_AGENT'] ?? '',
+                'subscriber_name'  => isset( $_POST['subscriber_name'] ) ? sanitize_text_field( wp_unslash( $_POST['subscriber_name'] ) ) : null,
+                'phone'            => isset( $_POST['phone'] )           ? sanitize_text_field( wp_unslash( $_POST['phone'] ) )           : null,
+                'whatsapp_consent' => ! empty( $_POST['whatsapp_consent'] ),
             ] );
             $msg = $result['created']
                 ? 'Listo, quedaste inscrito en Alertas DT.'

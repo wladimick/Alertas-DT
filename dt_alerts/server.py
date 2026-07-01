@@ -363,12 +363,14 @@ class AppHandler(BaseHTTPRequestHandler):
                 subscriber = db.upsert_subscriber(
                     conn,
                     email=payload.get("email", ""),
-                    # WhatsApp reservado para fase futura: no se captura ni notifica.
                     whatsapp=None,
                     notify_email=True,
                     notify_whatsapp=False,
                     source_page=payload.get("source_page"),
                     consent=bool_from_form(payload.get("consent")),
+                    subscriber_name=payload.get("subscriber_name") or None,
+                    phone=payload.get("phone") or None,
+                    whatsapp_consent=bool_from_form(payload.get("whatsapp_consent")),
                 )
         except ValueError as exc:
             # Email inválido o sin consentimiento: mensaje amigable.
@@ -539,8 +541,11 @@ def public_subscriber(subscriber: dict[str, Any]) -> dict[str, Any]:
     return {
         "id": subscriber["id"],
         "email": subscriber["email"],
+        "subscriber_name": subscriber.get("subscriber_name"),
+        "phone": subscriber.get("phone"),
         "notify_email": bool(subscriber["notify_email"]),
         "notify_whatsapp": bool(subscriber["notify_whatsapp"]),
+        "whatsapp_consent": bool(subscriber.get("whatsapp_consent")),
         "status": subscriber["status"],
     }
 
@@ -1926,6 +1931,8 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
         f"""
 <tr>
   <td><strong>{h(item['email'])}</strong></td>
+  <td>{h(item.get('subscriber_name') or '—')}</td>
+  <td class="mono">{h(item.get('phone') or '—')}</td>
   <td class="mono">{h(item.get('source_page') or '—')}</td>
   <td>{badge(item['status'])}</td>
   <td class="mono">{fmt_dt(item.get('created_at'))}</td>
@@ -1946,8 +1953,8 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
   <div class="eg-card-head"><h2>Suscriptores</h2></div>
   <div class="eg-table-wrap">
     <table class="eg-table">
-      <thead><tr><th>Email</th><th>Fuente</th><th>Estado</th><th>Registro</th><th>Actualización</th><th></th></tr></thead>
-      <tbody>{rows or empty_row(6, "Aún no hay suscriptores.", "Puedes probar el formulario público usando un correo interno.")}</tbody>
+      <thead><tr><th>Email</th><th>Nombre</th><th>Teléfono</th><th>Fuente</th><th>Estado</th><th>Registro</th><th>Actualización</th><th></th></tr></thead>
+      <tbody>{rows or empty_row(8, "Aún no hay suscriptores.", "Puedes probar el formulario público usando un correo interno.")}</tbody>
     </table>
   </div>
   <p class="eg-note">WhatsApp reservado para fase futura: el MVP notifica solo por email.</p>
