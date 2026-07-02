@@ -141,10 +141,61 @@ class AppHandler(BaseHTTPRequestHandler):
             subscriber_id = int(match.group(1))
             action = match.group(2)
             with db.connect(self.settings.database_path) as conn:
+                existing = conn.execute(
+                    "SELECT id FROM subscribers WHERE id = ?", (subscriber_id,)
+                ).fetchone()
+                if not existing:
+                    self.respond_json({"error": "Suscriptor no encontrado."}, status=HTTPStatus.NOT_FOUND)
+                    return
                 db.set_subscriber_status(
                     conn, subscriber_id, "paused" if action == "pause" else "active"
                 )
-            self.redirect("/admin/subscribers")
+            content_type = self.headers.get("Content-Type", "")
+            if "application/json" in content_type or self.wants_json():
+                self.respond_json({"success": True})
+            else:
+                self.redirect("/admin/subscribers")
+        elif match := re.match(r"^/admin/subscribers/(\d+)/(activate|delete)$", path):
+            self.require_admin()
+            subscriber_id = int(match.group(1))
+            action = match.group(2)
+            with db.connect(self.settings.database_path) as conn:
+                existing = conn.execute(
+                    "SELECT id FROM subscribers WHERE id = ?", (subscriber_id,)
+                ).fetchone()
+                if not existing:
+                    self.respond_json({"error": "Suscriptor no encontrado."}, status=HTTPStatus.NOT_FOUND)
+                    return
+                if action == "activate":
+                    conn.execute(
+                        "UPDATE subscribers SET status='active', updated_at=? WHERE id=?",
+                        (db.utcnow(), subscriber_id),
+                    )
+                else:
+                    conn.execute("DELETE FROM subscribers WHERE id = ?", (subscriber_id,))
+                conn.commit()
+            self.respond_json({"success": True})
+        elif match := re.match(r"^/admin/subscribers/(\d+)/plan$", path):
+            self.require_admin()
+            subscriber_id = int(match.group(1))
+            payload = self.read_payload()
+            plan_value = (payload.get("plan") or "").strip()
+            if plan_value not in SUBSCRIBER_PLANS:
+                self.respond_json({"error": "Plan inválido."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            with db.connect(self.settings.database_path) as conn:
+                existing = conn.execute(
+                    "SELECT id FROM subscribers WHERE id = ?", (subscriber_id,)
+                ).fetchone()
+                if not existing:
+                    self.respond_json({"error": "Suscriptor no encontrado."}, status=HTTPStatus.NOT_FOUND)
+                    return
+                conn.execute(
+                    "UPDATE subscribers SET plan=?, updated_at=? WHERE id=?",
+                    (plan_value, db.utcnow(), subscriber_id),
+                )
+                conn.commit()
+            self.respond_json({"success": True})
         elif match := re.match(r"^/admin/alerts/(\d+)/delete$", path):
             self.require_admin()
             alert_id = int(match.group(1))
@@ -1969,35 +2020,175 @@ def render_settings(settings: Settings) -> str:
     )
 
 
-def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
-    rows = "".join(
-        f"""
-<tr>
-  <td><strong>{h(item['email'])}</strong></td>
-  <td>{h(item.get('subscriber_name') or '—')}</td>
-  <td class="mono">{h(item.get('phone') or '—')}</td>
-  <td class="mono">{h(item.get('source_page') or '—')}</td>
-  <td>{badge(item['status'])}</td>
-  <td class="mono">{fmt_dt(item.get('created_at'))}</td>
-  <td class="mono">{fmt_dt(item.get('updated_at'))}</td>
-  <td>
-    <form method="post" action="/admin/subscribers/{item['id']}/{'pause' if item['status'] == 'active' else 'reactivate'}">
-      <button class="eg-btn eg-ghost eg-btn--sm" type="submit">
-        {icon('pause', 14) if item['status'] == 'active' else icon('play', 14)}<span>{'Pausar' if item['status'] == 'active' else 'Reactivar'}</span>
-      </button>
-    </form>
-  </td>
-</tr>
+_SUBSCRIBERS_JS = """
+<script>
+function _planLabel(plan) {
+  const labels = {sin_suscripcion:'Sin suscripción',prueba:'Prueba gratuita',basico:'Básico',empresarial:'Empresarial'};
+  return labels[plan] || plan;
+}
+function _planColor(plan) {
+  const colors = {sin_suscripcion:'#8EA1AA',prueba:'#2563EB',basico:'#29B78D',empresarial:'#0A2231'};
+  return colors[plan] || '#8EA1AA';
+}
+function updateSubscriberRow(id, status) {
+  const row = document.getElementById('sub-row-' + id);
+  if (!row) return;
+  const statusCell = row.querySelector('[data-status]');
+  const actionsCell = row.querySelector('[data-actions]');
+  const email = row.dataset.email || '';
+  if (statusCell) {
+    const isActive = status === 'active';
+    statusCell.innerHTML = isActive
+      ? '<span style="color:#29B78D;font-weight:600;">&#9679; Activo</span>'
+      : '<span style="color:#F59E0B;font-weight:600;">&#9646; Pausado</span>';
+    statusCell.dataset.status = status;
+  }
+  if (actionsCell) {
+    actionsCell.innerHTML = _buildActions(id, email, status);
+  }
+}
+function _buildActions(id, email, status) {
+  const del = '<button onclick="deleteSubscriber(' + id + ',\\'' + email.replace(/'/g,"\\'") + '\\')" style="padding:3px 8px;border-radius:4px;font-size:12px;font-weight:600;background:#FEE2E2;color:#991B1B;border:1px solid #FECACA;cursor:pointer;">&#x1F5D1; Eliminar</button>';
+  if (status === 'active') {
+    return '<div style="display:flex;gap:6px;flex-wrap:wrap;">'
+      + '<button onclick="pauseSubscriber(' + id + ',\\'' + email.replace(/'/g,"\\'") + '\\')" style="padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;background:#FEF3C7;color:#92400E;border:1px solid #FDE68A;cursor:pointer;">&#9646; Pausar</button>'
+      + del + '</div>';
+  }
+  return '<div style="display:flex;gap:6px;flex-wrap:wrap;">'
+    + '<button onclick="activateSubscriber(' + id + ')" style="padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;background:#D1FAE5;color:#065F46;border:1px solid #6EE7B7;cursor:pointer;">&#9654; Reactivar</button>'
+    + del + '</div>';
+}
+function updatePlanBadge(id, plan) {
+  const badge = document.getElementById('plan-badge-' + id);
+  const sel = document.getElementById('plan-select-' + id);
+  if (badge) { badge.textContent = _planLabel(plan); badge.style.background = _planColor(plan); }
+  if (sel) sel.value = plan;
+}
+async function pauseSubscriber(id, email) {
+  const r = await fetch('/admin/subscribers/' + id + '/pause', {method:'POST'});
+  if (r.ok) updateSubscriberRow(id, 'paused');
+  else alert('Error al pausar');
+}
+async function activateSubscriber(id) {
+  const r = await fetch('/admin/subscribers/' + id + '/activate', {method:'POST'});
+  if (r.ok) updateSubscriberRow(id, 'active');
+  else alert('Error al reactivar');
+}
+async function deleteSubscriber(id, email) {
+  if (!confirm('\\u00BFEliminar a ' + email + '? No se puede deshacer.')) return;
+  const r = await fetch('/admin/subscribers/' + id + '/delete', {method:'POST'});
+  if (r.ok) {
+    const row = document.getElementById('sub-row-' + id);
+    if (row) {
+      row.remove();
+      const tbody = document.querySelector('#subscribers-table tbody');
+      if (tbody && tbody.querySelectorAll('tr').length === 0) {
+        tbody.innerHTML = '<tr><td colspan="8" style="text-align:center;padding:32px;color:#6B7280;">No hay suscriptores registrados a\\u00FAn.</td></tr>';
+      }
+    }
+  } else alert('Error al eliminar');
+}
+async function changePlan(id, plan) {
+  const r = await fetch('/admin/subscribers/' + id + '/plan', {
+    method:'POST', headers:{'Content-Type':'application/json'},
+    body: JSON.stringify({plan})
+  });
+  if (r.ok) updatePlanBadge(id, plan);
+  else alert('Error al cambiar plan');
+}
+</script>
 """
-        for item in subscribers
+
+
+def _subscriber_plan_badge(item: dict[str, Any]) -> str:
+    sub_id = item["id"]
+    plan = item.get("plan") or "prueba"
+    label = SUBSCRIBER_PLANS.get(plan, plan)
+    color = _PLAN_COLORS.get(plan, "#8EA1AA")
+    options = "".join(
+        f'<option value="{k}"{" selected" if k == plan else ""}>{v}</option>'
+        for k, v in SUBSCRIBER_PLANS.items()
+    )
+    return (
+        f'<span id="plan-badge-{sub_id}" '
+        f'style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;'
+        f'font-weight:600;background:{color};color:#fff;cursor:pointer;" '
+        f'onclick="this.style.display=\'none\';document.getElementById(\'plan-select-{sub_id}\').style.display=\'inline\';">'
+        f'{h(label)}</span>'
+        f'<select id="plan-select-{sub_id}" style="display:none;font-size:11px;padding:2px 4px;border-radius:4px;border:1px solid #D1D5DB;" '
+        f'onchange="changePlan({sub_id},this.value);this.style.display=\'none\';document.getElementById(\'plan-badge-{sub_id}\').style.display=\'inline-block\';">'
+        f'{options}'
+        f'</select>'
+    )
+
+
+def _subscriber_actions(item: dict[str, Any]) -> str:
+    sub_id = item["id"]
+    email_js = h(item["email"]).replace("'", "\\'")
+    status = item["status"]
+    del_btn = (
+        f'<button onclick="deleteSubscriber({sub_id},\'{email_js}\')" '
+        f'style="padding:3px 8px;border-radius:4px;font-size:12px;font-weight:600;'
+        f'background:#FEE2E2;color:#991B1B;border:1px solid #FECACA;cursor:pointer;">🗑 Eliminar</button>'
+    )
+    if status == "active":
+        toggle_btn = (
+            f'<button onclick="pauseSubscriber({sub_id},\'{email_js}\')" '
+            f'style="padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;'
+            f'background:#FEF3C7;color:#92400E;border:1px solid #FDE68A;cursor:pointer;">⏸ Pausar</button>'
+        )
+    else:
+        toggle_btn = (
+            f'<button onclick="activateSubscriber({sub_id})" '
+            f'style="padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;'
+            f'background:#D1FAE5;color:#065F46;border:1px solid #6EE7B7;cursor:pointer;">▶ Reactivar</button>'
+        )
+    return f'<div style="display:flex;gap:6px;flex-wrap:wrap;">{toggle_btn}{del_btn}</div>'
+
+
+def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
+    def _row(item: dict[str, Any]) -> str:
+        status = item["status"]
+        wa_ok = bool(item.get("whatsapp_consent"))
+        if status == "active":
+            status_html = '<span style="color:#29B78D;font-weight:600;">&#9679; Activo</span>'
+        else:
+            status_html = '<span style="color:#F59E0B;font-weight:600;">&#9646; Pausado</span>'
+        wa_html = (
+            '<span style="color:#29B78D;font-weight:600;">✓</span>'
+            if wa_ok else
+            '<span style="color:#9CA3AF;">—</span>'
+        )
+        return (
+            f'<tr id="sub-row-{item["id"]}" data-email="{h(item["email"])}">'
+            f'<td style="padding:10px 8px;font-size:13px;"><strong>{h(item["email"])}</strong></td>'
+            f'<td style="padding:10px 8px;font-size:13px;">{h(item.get("subscriber_name") or "—")}</td>'
+            f'<td style="padding:10px 8px;font-size:12px;font-family:monospace;">{h(item.get("phone") or "—")}</td>'
+            f'<td style="padding:10px 8px;">{_subscriber_plan_badge(item)}</td>'
+            f'<td style="padding:10px 8px;text-align:center;">{wa_html}</td>'
+            f'<td style="padding:10px 8px;" data-status="{h(status)}">{status_html}</td>'
+            f'<td style="padding:10px 8px;font-size:12px;font-family:monospace;">{_fmt_short_date(item.get("created_at"))}</td>'
+            f'<td style="padding:10px 8px;" data-actions="1">{_subscriber_actions(item)}</td>'
+            f'</tr>'
+        )
+
+    rows = "".join(_row(item) for item in subscribers)
+    empty = (
+        '<tr><td colspan="8" style="text-align:center;padding:32px;color:#6B7280;">'
+        'No hay suscriptores registrados aún.</td></tr>'
     )
     return f"""
 <section class="eg-card eg-panel">
   <div class="eg-card-head"><h2>Suscriptores</h2></div>
   <div class="eg-table-wrap">
-    <table class="eg-table">
-      <thead><tr><th>Email</th><th>Nombre</th><th>Teléfono</th><th>Fuente</th><th>Estado</th><th>Registro</th><th>Actualización</th><th></th></tr></thead>
-      <tbody>{rows or empty_row(8, "Aún no hay suscriptores.", "Puedes probar el formulario público usando un correo interno.")}</tbody>
+    <table class="eg-table" id="subscribers-table" style="table-layout:fixed;width:100%;">
+      <thead><tr>
+        <th>Email</th><th>Nombre</th><th style="width:110px;">Teléfono</th>
+        <th style="width:120px;">Plan</th><th style="width:60px;">WhatsApp</th>
+        <th style="width:90px;">Estado</th><th style="width:70px;">Registro</th>
+        <th style="width:200px;">Acciones</th>
+      </tr></thead>
+      <tbody>{rows or empty}</tbody>
     </table>
   </div>
   <details style="margin-top:12px;">
@@ -2007,8 +2198,23 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
     <p class="eg-note" style="margin-top:6px;">WhatsApp reservado para fase futura: el MVP notifica solo por email.</p>
   </details>
 </section>
+{_SUBSCRIBERS_JS}
 """
 
+
+SUBSCRIBER_PLANS: dict[str, str] = {
+    "sin_suscripcion": "Sin suscripción",
+    "prueba":          "Prueba gratuita",
+    "basico":          "Básico",
+    "empresarial":     "Empresarial",
+}
+
+_PLAN_COLORS: dict[str, str] = {
+    "sin_suscripcion": "#8EA1AA",
+    "prueba":          "#2563EB",
+    "basico":          "#29B78D",
+    "empresarial":     "#0A2231",
+}
 
 AI_STATUS_LABELS = {
     "success": ("IA generada", "eg-badge--active"),

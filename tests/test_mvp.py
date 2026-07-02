@@ -2201,6 +2201,137 @@ class PdfIntegrationTestCase(unittest.TestCase):
         self.assertIsNotNone(result.pdf_url)  # pdf_url se guarda igual
 
 
+class SubscriberActionsPlansTestCase(unittest.TestCase):
+    """Tests para feat/subscribers-actions-plans."""
+
+    def _start_server(self, tmp_path: Path):
+        import http.client, threading
+        from http.server import ThreadingHTTPServer
+        from dt_alerts.server import AppHandler
+
+        class _H(AppHandler):
+            pass
+
+        db.init_db(tmp_path)
+        _H.settings = get_settings().__class__(
+            **{**get_settings().__dict__, "database_path": str(tmp_path), "disable_admin_auth": True}
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+        t = threading.Thread(target=server.serve_forever)
+        t.daemon = True
+        t.start()
+        port = server.server_address[1]
+        return server, port
+
+    def _insert_subscriber(self, path: Path, email: str = "test@example.com") -> int:
+        with db.connect(path) as conn:
+            result = db.upsert_subscriber(
+                conn, email=email, whatsapp=None,
+                notify_email=True, notify_whatsapp=False,
+                source_page="test", consent=True,
+            )
+            return result["id"]
+
+    def _post(self, port: int, path: str, body: dict | None = None):
+        import http.client, json as _json
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        if body is not None:
+            data = _json.dumps(body).encode()
+            conn.request("POST", path, body=data, headers={"Content-Type": "application/json"})
+        else:
+            conn.request("POST", path)
+        resp = conn.getresponse()
+        resp_body = resp.read()
+        return resp.status, resp_body
+
+    def test_subscriber_pause_sets_status_paused(self):
+        import http.client
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.sqlite3"
+            server, port = self._start_server(path)
+            try:
+                sub_id = self._insert_subscriber(path)
+                conn_h = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn_h.request("POST", f"/admin/subscribers/{sub_id}/pause",
+                               headers={"Content-Type": "application/json"})
+                resp = conn_h.getresponse(); resp.read()
+                self.assertEqual(resp.status, 200)
+                with db.connect(path) as conn:
+                    row = conn.execute("SELECT status FROM subscribers WHERE id=?", (sub_id,)).fetchone()
+                self.assertEqual(row[0], "paused")
+            finally:
+                server.shutdown()
+
+    def test_subscriber_activate_sets_status_active(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.sqlite3"
+            server, port = self._start_server(path)
+            try:
+                sub_id = self._insert_subscriber(path)
+                with db.connect(path) as conn:
+                    db.set_subscriber_status(conn, sub_id, "paused")
+                status, _ = self._post(port, f"/admin/subscribers/{sub_id}/activate")
+                self.assertEqual(status, 200)
+                with db.connect(path) as conn:
+                    row = conn.execute("SELECT status FROM subscribers WHERE id=?", (sub_id,)).fetchone()
+                self.assertEqual(row[0], "active")
+            finally:
+                server.shutdown()
+
+    def test_subscriber_delete_removes_record(self):
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.sqlite3"
+            server, port = self._start_server(path)
+            try:
+                sub_id = self._insert_subscriber(path)
+                status, body = self._post(port, f"/admin/subscribers/{sub_id}/delete")
+                self.assertEqual(status, 200)
+                self.assertTrue(_json.loads(body).get("success"))
+                with db.connect(path) as conn:
+                    row = conn.execute("SELECT id FROM subscribers WHERE id=?", (sub_id,)).fetchone()
+                self.assertIsNone(row)
+            finally:
+                server.shutdown()
+
+    def test_subscriber_delete_nonexistent_returns_404(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.sqlite3"
+            server, port = self._start_server(path)
+            try:
+                status, _ = self._post(port, "/admin/subscribers/99999/delete")
+                self.assertEqual(status, 404)
+            finally:
+                server.shutdown()
+
+    def test_subscriber_plan_update_valid(self):
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.sqlite3"
+            server, port = self._start_server(path)
+            try:
+                sub_id = self._insert_subscriber(path)
+                status, body = self._post(port, f"/admin/subscribers/{sub_id}/plan", {"plan": "basico"})
+                self.assertEqual(status, 200)
+                self.assertTrue(_json.loads(body).get("success"))
+                with db.connect(path) as conn:
+                    row = conn.execute("SELECT plan FROM subscribers WHERE id=?", (sub_id,)).fetchone()
+                self.assertEqual(row[0], "basico")
+            finally:
+                server.shutdown()
+
+    def test_subscriber_plan_update_invalid(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.sqlite3"
+            server, port = self._start_server(path)
+            try:
+                sub_id = self._insert_subscriber(path)
+                status, _ = self._post(port, f"/admin/subscribers/{sub_id}/plan", {"plan": "vip"})
+                self.assertEqual(status, 400)
+            finally:
+                server.shutdown()
+
+
 class AlertsTableViewTestCase(unittest.TestCase):
     """Tests para feat/alerts-table-view: tabla con filtros y borrado."""
 

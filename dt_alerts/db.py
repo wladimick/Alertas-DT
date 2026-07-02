@@ -180,6 +180,7 @@ def migrate(conn: sqlite3.Connection) -> None:
     _add_column_if_missing(conn, "subscribers", "subscriber_name", "TEXT")
     _add_column_if_missing(conn, "subscribers", "phone",           "TEXT")
     _add_column_if_missing(conn, "subscribers", "whatsapp_consent","INTEGER NOT NULL DEFAULT 0")
+    _add_column_if_missing(conn, "subscribers", "plan",            "TEXT DEFAULT 'prueba'")
     conn.commit()
 
 
