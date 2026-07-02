@@ -189,6 +189,107 @@ def _email_list_html(title: str, items: list[Any], *, is_impacts: bool = False) 
     )
 
 
+_EMAIL_CSS = (
+    "* { box-sizing: border-box; margin: 0; padding: 0; }"
+    "body { font-family: Arial, sans-serif; background: #F4F7F8; color: #0A2231; }"
+    ".email-wrapper { max-width: 640px; margin: 0 auto; background: #F4F7F8; }"
+    ".header { background: #0A2231; padding: 22px 32px; display: flex; align-items: center; justify-content: space-between; }"
+    ".header-brand { display: flex; align-items: center; gap: 14px; }"
+    ".header-logo { height: 24px; }"
+    ".header-divider { width: 1px; height: 24px; background: #29B78D; opacity: 0.4; }"
+    ".header-tag { font-size: 10px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: #29B78D; }"
+    ".header-label { font-size: 11px; color: #7ca0b4; font-style: italic; }"
+    ".accent-bar { height: 4px; background: #29B78D; }"
+    ".doc-card { background: #0A2231; padding: 24px 32px 0; position: relative; }"
+    ".doc-card::after { content: ''; display: block; height: 3px; background: #29B78D; margin-top: 22px; }"
+    ".doc-type { font-size: 10px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: #29B78D; margin-bottom: 8px; }"
+    ".doc-title { font-size: 26px; font-weight: 700; color: #ffffff; margin-bottom: 10px; line-height: 1.2; }"
+    ".doc-meta { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px; color: #7ca0b4; }"
+    ".relevancia-badge { font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; background: #29B78D; color: #fff; padding: 2px 9px; border-radius: 20px; }"
+    ".body { background: #ffffff; padding: 28px 32px 24px; }"
+    ".ai-notice { display: flex; align-items: center; gap: 8px; background: #f0faf6; border: 1px solid #b8e8d6; border-radius: 6px; padding: 9px 14px; margin-bottom: 20px; font-size: 12px; color: #0f6e56; font-weight: 500; }"
+    ".ai-dot { width: 6px; height: 6px; border-radius: 50%; background: #29B78D; flex-shrink: 0; }"
+    ".summary-text { font-size: 14px; color: #3C4A52; line-height: 1.75; }"
+    ".section { padding: 22px 32px; border-top: 1px solid #eef2f4; background: #ffffff; }"
+    ".section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #0A2231; margin-bottom: 14px; }"
+    ".punto { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid #f4f7f8; }"
+    ".punto:last-child { border-bottom: none; }"
+    ".punto-dot { width: 6px; height: 6px; border-radius: 50%; background: #29B78D; flex-shrink: 0; margin-top: 8px; }"
+    ".punto-text { font-size: 14px; color: #3C4A52; line-height: 1.7; }"
+    ".impacto-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }"
+    ".impacto-item { background: #F4F7F8; border: 1px solid #dde4e8; border-radius: 8px; padding: 14px 16px; border-left: 3px solid #29B78D; }"
+    ".impacto-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #0A2231; margin-bottom: 6px; }"
+    ".impacto-text { font-size: 13px; color: #3C4A52; line-height: 1.6; }"
+    ".accion { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid #f4f7f8; }"
+    ".accion:last-child { border-bottom: none; }"
+    ".accion-num { width: 20px; height: 20px; border-radius: 50%; background: #0A2231; color: #29B78D; font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 2px; }"
+    ".accion-text { font-size: 14px; color: #3C4A52; line-height: 1.7; }"
+    ".tags-section { padding: 16px 32px; background: #ffffff; border-top: 1px solid #eef2f4; }"
+    ".tag { display: inline-block; font-size: 11px; font-weight: 600; background: #F4F7F8; color: #5a7080; border: 1px solid #dde4e8; padding: 4px 10px; border-radius: 20px; margin: 3px 4px 3px 0; }"
+    ".cta-section { background: #0A2231; padding: 20px 32px; text-align: center; }"
+    ".cta-btn { display: inline-block; padding: 12px 28px; background: #29B78D; color: #ffffff; text-decoration: none; font-size: 13px; font-weight: 700; border-radius: 6px; letter-spacing: 0.03em; }"
+    ".cta-sub { font-size: 11px; color: #7ca0b4; margin-top: 10px; }"
+    ".footer { padding: 20px 32px; background: #F4F7F8; border-top: 1px solid #dde4e8; }"
+    ".disclaimer { font-size: 11px; color: #8EA1AA; line-height: 1.6; margin-bottom: 12px; }"
+    ".footer-brand { font-size: 11px; color: #B0BEC5; }"
+    ".footer-brand strong { color: #7ca0b4; }"
+)
+
+_ATTACHMENT_CSS = (
+    "* { box-sizing: border-box; margin: 0; padding: 0; }"
+    "body { font-family: Arial, sans-serif; background: #F4F7F8; color: #0A2231; }"
+    ".header { background: #0A2231; padding: 24px 40px; display: flex; align-items: center; justify-content: space-between; }"
+    ".header-brand { display: flex; align-items: center; gap: 14px; }"
+    ".header-logo { height: 26px; }"
+    ".header-divider { width: 1px; height: 26px; background: #29B78D; opacity: 0.5; }"
+    ".header-tag { font-size: 11px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: #29B78D; }"
+    ".header-badge { font-size: 11px; background: rgba(41,183,141,0.15); color: #29B78D; border: 1px solid rgba(41,183,141,0.3); padding: 4px 10px; border-radius: 20px; font-weight: 600; letter-spacing: 0.04em; }"
+    ".accent-bar { height: 4px; background: #29B78D; }"
+    ".wrapper { max-width: 720px; margin: 32px auto; padding: 0 24px 48px; }"
+    ".doc-card { background: #ffffff; border: 1px solid #dde4e8; border-radius: 10px; overflow: hidden; margin-bottom: 20px; }"
+    ".doc-card-header { background: #0A2231; padding: 20px 28px; position: relative; }"
+    ".doc-card-header::after { content: ''; position: absolute; bottom: 0; left: 0; right: 0; height: 3px; background: #29B78D; }"
+    ".doc-card-body { padding: 24px 28px; }"
+    ".doc-type { font-size: 11px; font-weight: 700; letter-spacing: 0.1em; text-transform: uppercase; color: #29B78D; margin-bottom: 6px; }"
+    ".doc-title { font-size: 22px; font-weight: 700; color: #ffffff; margin-bottom: 8px; }"
+    ".doc-meta { font-size: 12px; color: #7ca0b4; display: flex; gap: 16px; flex-wrap: wrap; }"
+    ".relevancia-badge { display: inline-block; font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; background: #29B78D; color: #ffffff; padding: 2px 8px; border-radius: 20px; }"
+    ".ai-notice { display: flex; align-items: center; gap: 8px; background: #f0faf6; border: 1px solid #b8e8d6; border-radius: 6px; padding: 10px 14px; margin-bottom: 20px; font-size: 12px; color: #0f6e56; font-weight: 500; }"
+    ".ai-dot { width: 6px; height: 6px; border-radius: 50%; background: #29B78D; flex-shrink: 0; }"
+    ".summary-text { font-size: 14px; color: #3C4A52; line-height: 1.75; }"
+    ".section { background: #ffffff; border: 1px solid #dde4e8; border-radius: 10px; padding: 22px 28px; margin-bottom: 14px; }"
+    ".section-header { display: flex; align-items: center; gap: 10px; margin-bottom: 14px; padding-bottom: 12px; border-bottom: 1px solid #eef2f4; }"
+    ".section-icon { width: 28px; height: 28px; border-radius: 6px; background: #0A2231; display: flex; align-items: center; justify-content: center; font-size: 13px; flex-shrink: 0; }"
+    ".section-title { font-size: 12px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.08em; color: #0A2231; }"
+    ".section p, .section li { font-size: 14px; color: #3C4A52; line-height: 1.75; }"
+    ".section ul { padding-left: 18px; }"
+    ".section li { margin-bottom: 6px; }"
+    ".plazos-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }"
+    ".plazo-item { background: #F4F7F8; border: 1px solid #dde4e8; border-radius: 8px; padding: 14px 16px; }"
+    ".plazo-fecha { font-size: 13px; font-weight: 700; color: #29B78D; margin-bottom: 4px; }"
+    ".plazo-desc { font-size: 13px; color: #3C4A52; line-height: 1.5; }"
+    ".puntos-item { display: flex; gap: 10px; align-items: flex-start; padding: 10px 0; border-bottom: 1px solid #f0f4f6; }"
+    ".puntos-item:last-child { border-bottom: none; padding-bottom: 0; }"
+    ".punto-dot { width: 6px; height: 6px; border-radius: 50%; background: #29B78D; flex-shrink: 0; margin-top: 8px; }"
+    ".punto-text { font-size: 14px; color: #3C4A52; line-height: 1.7; }"
+    ".link-btn { display: inline-block; margin-top: 4px; padding: 10px 20px; background: #0A2231; color: #ffffff; text-decoration: none; font-size: 13px; font-weight: 600; border-radius: 6px; letter-spacing: 0.02em; }"
+    ".disclaimer { background: #ffffff; border: 1px solid #dde4e8; border-radius: 10px; padding: 16px 28px; font-size: 12px; color: #8EA1AA; line-height: 1.6; margin-bottom: 16px; }"
+    ".footer { text-align: center; font-size: 11px; color: #B0BEC5; padding-top: 8px; }"
+    ".footer strong { color: #7ca0b4; }"
+)
+
+
+def _build_puntos_html(items: list[Any], css_item: str = "punto", css_dot: str = "punto-dot", css_text: str = "punto-text") -> str:
+    parts = []
+    for item in items:
+        text = html.escape(str(item.get("title") if isinstance(item, dict) else item))
+        parts.append(
+            f'<div class="{css_item}"><div class="{css_dot}"></div>'
+            f'<div class="{css_text}">{text}</div></div>'
+        )
+    return "".join(parts)
+
+
 def render_alert_email_html(alert: dict[str, Any]) -> str:
     """Email HTML with AI content when available."""
     ai = _ai_content(alert)
@@ -205,78 +306,123 @@ def render_alert_email_html(alert: dict[str, Any]) -> str:
     category = html.escape(alert.get("category") or "Normativa")
     pub_date = html.escape(alert.get("publication_date") or "sin fecha informada")
     relevance = html.escape(alert.get("relevance") or "media")
-    summary_esc = html.escape(summary_text)
     url = html.escape(alert.get("canonical_url") or "#")
     preheader = html.escape(truncate_subject(summary_text or title, 120))
+    summary_esc = html.escape(summary_text)
+    disclaimer_esc = html.escape(disclaimer)
 
-    ai_badge = ""
+    ai_notice = ""
     if ai.get("status") == "success":
-        ai_badge = (
-            f'<p style="font-family:Arial,Helvetica,sans-serif;font-size:11px;'
-            f'color:#167A5F;margin:0 0 16px;">Resumen generado con IA</p>'
+        ai_notice = (
+            '<div class="ai-notice">'
+            '<div class="ai-dot"></div>'
+            'Resumen generado con inteligencia artificial · Revisar antes de tomar decisiones'
+            '</div>'
         )
 
+    # Puntos clave
+    puntos_html = ""
+    if key_points:
+        puntos_html = (
+            '<div class="section">'
+            '<div class="section-title">Puntos clave</div>'
+            + _build_puntos_html(key_points)
+            + '</div>'
+        )
+
+    # Impacto grid
+    impacto_html = ""
+    if impacts:
+        items_html = ""
+        for imp in impacts:
+            if isinstance(imp, dict):
+                lbl = html.escape(str(imp.get("title") or ""))
+                txt = html.escape(str(imp.get("description") or imp.get("text") or ""))
+            else:
+                lbl = html.escape(str(imp))
+                txt = ""
+            items_html += (
+                f'<div class="impacto-item">'
+                f'<div class="impacto-label">{lbl}</div>'
+                f'<div class="impacto-text">{txt}</div>'
+                f'</div>'
+            )
+        impacto_html = (
+            '<div class="section">'
+            '<div class="section-title">Impacto práctico para contadores y empresas</div>'
+            f'<div class="impacto-grid">{items_html}</div>'
+            '</div>'
+        )
+
+    # Acciones
+    acciones_html = ""
+    if rec_actions:
+        items_html = ""
+        for i, act in enumerate(rec_actions, 1):
+            txt = html.escape(str(act.get("title") if isinstance(act, dict) else act))
+            items_html += (
+                f'<div class="accion">'
+                f'<div class="accion-num">{i}</div>'
+                f'<div class="accion-text">{txt}</div>'
+                f'</div>'
+            )
+        acciones_html = (
+            '<div class="section">'
+            '<div class="section-title">Acciones recomendadas</div>'
+            + items_html
+            + '</div>'
+        )
+
+    # Tags
     tags_html = ""
     if tags:
-        tag_spans = "".join(
-            f'<span style="display:inline-block;background:#EEF3F5;color:#3C4A52;'
-            f'font-size:11px;padding:3px 8px;border-radius:4px;margin:2px;">'
-            f'{html.escape(str(t))}</span>'
-            for t in tags
+        spans = "".join(
+            f'<span class="tag">{html.escape(str(t))}</span>' for t in tags
         )
-        tags_html = (
-            f'<div style="margin:20px 0 8px;">'
-            f'<p style="font-family:Arial,Helvetica,sans-serif;font-size:12px;'
-            f'color:{EG_MUTED};margin:0 0 6px;font-weight:bold;">Temas</p>'
-            f'{tag_spans}</div>'
-        )
+        tags_html = f'<div class="tags-section">{spans}</div>'
 
-    return f"""<!doctype html>
-<html lang="es">
-<head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1"></head>
-<body style="margin:0;padding:0;background:{EG_BG};">
-  <span style="display:none!important;visibility:hidden;opacity:0;height:0;width:0;overflow:hidden;">{preheader}</span>
-  <table role="presentation" width="100%" cellpadding="0" cellspacing="0" style="background:{EG_BG};">
-    <tr><td align="center" style="padding:24px 12px;">
-      <table role="presentation" width="600" cellpadding="0" cellspacing="0" style="width:600px;max-width:100%;">
-        <!-- Header marca -->
-        <tr><td style="background:{EG_DEEP};border-radius:14px 14px 0 0;padding:22px 28px;">
-          <img src="{EG_LOGO_LIGHT}" alt="External Group" height="30" style="height:30px;display:block;border:0;">
-          <div style="font-family:Arial,Helvetica,sans-serif;color:#9FE7CF;font-size:11px;font-weight:bold;letter-spacing:2px;text-transform:uppercase;margin-top:8px;">Alertas DT</div>
-        </td></tr>
-        <!-- Cuerpo -->
-        <tr><td style="background:#ffffff;border:1px solid {EG_BORDER};border-top:0;border-radius:0 0 14px 14px;padding:28px;">
-          {ai_badge}
-          <p style="font-family:Arial,Helvetica,sans-serif;font-size:12px;font-weight:bold;letter-spacing:1.5px;text-transform:uppercase;color:{EG_CTA};margin:0 0 10px;">Nueva publicación de la Dirección del Trabajo</p>
-          <h1 style="font-family:Arial,Helvetica,sans-serif;font-size:22px;line-height:1.25;color:{EG_TEXT};margin:0 0 12px;">{title}</h1>
-          <p style="font-family:Arial,Helvetica,sans-serif;font-size:13px;color:{EG_MUTED};margin:0 0 18px;">
-            {category} &nbsp;·&nbsp; {pub_date} &nbsp;·&nbsp; Relevancia: {relevance}
-          </p>
-          <p style="font-family:Arial,Helvetica,sans-serif;font-size:15px;line-height:1.6;color:{EG_TEXT};margin:0 0 8px;">{summary_esc}</p>
-          {_email_list_html("Puntos clave", key_points)}
-          {_email_list_html("Impacto práctico para contadores y empresas", impacts, is_impacts=True)}
-          {_email_list_html("Acciones recomendadas", rec_actions)}
-          {tags_html}
-          <table role="presentation" cellpadding="0" cellspacing="0" style="margin:26px 0 8px;"><tr><td style="background:{EG_CTA};border-radius:999px;">
-            <a href="{url}" style="display:inline-block;font-family:Arial,Helvetica,sans-serif;font-size:15px;font-weight:bold;color:#ffffff;text-decoration:none;padding:13px 26px;">Ver documento oficial</a>
-          </td></tr></table>
-          <p style="font-family:Arial,Helvetica,sans-serif;font-size:12px;color:{EG_MUTED};margin:8px 0 0;word-break:break-all;">
-            Enlace directo: <a href="{url}" style="color:{EG_CTA};">{url}</a>
-          </p>
-          <hr style="border:0;border-top:1px solid {EG_BORDER};margin:24px 0;">
-          <p style="font-family:Arial,Helvetica,sans-serif;font-size:12px;line-height:1.5;color:{EG_MUTED};margin:0;">
-            {html.escape(disclaimer)}
-          </p>
-        </td></tr>
-        <!-- Footer -->
-        <tr><td style="padding:18px 28px;">
-          <p style="font-family:Arial,Helvetica,sans-serif;font-size:12px;color:{EG_MUTED};margin:0;">External Group · Servicios especializados de gestión y tecnología.</p>
-        </td></tr>
-      </table>
-    </td></tr>
-  </table>
-</body>
-</html>"""
+    return (
+        f'<!doctype html>\n<html lang="es">\n<head>'
+        f'<meta charset="utf-8">'
+        f'<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+        f'<style>{_EMAIL_CSS}</style></head>\n<body>\n'
+        f'<div class="email-wrapper">\n'
+        f'<span style="display:none;visibility:hidden;opacity:0;height:0;width:0;overflow:hidden;">{preheader}</span>\n'
+        f'<div class="header">'
+        f'<div class="header-brand">'
+        f'<img class="header-logo" src="{EG_LOGO_LIGHT}" alt="External Group">'
+        f'<div class="header-divider"></div>'
+        f'<span class="header-tag">Alertas DT</span>'
+        f'</div>'
+        f'<span class="header-label">Nueva normativa</span>'
+        f'</div>\n'
+        f'<div class="accent-bar"></div>\n'
+        f'<div class="doc-card">'
+        f'<div class="doc-type">Nueva publicación · {category}</div>'
+        f'<div class="doc-title">{title}</div>'
+        f'<div class="doc-meta">'
+        f'<span>{pub_date}</span><span>·</span>'
+        f'<span class="relevancia-badge">{relevance}</span>'
+        f'</div>'
+        f'</div>\n'
+        f'<div class="body">'
+        f'{ai_notice}'
+        f'<p class="summary-text">{summary_esc}</p>'
+        f'</div>\n'
+        f'{puntos_html}'
+        f'{impacto_html}'
+        f'{acciones_html}'
+        f'{tags_html}'
+        f'<div class="cta-section">'
+        f'<a class="cta-btn" href="{url}" target="_blank">Ver documento oficial en DT →</a>'
+        f'<div class="cta-sub">Se adjuntan resúmenes en este correo</div>'
+        f'</div>\n'
+        f'<div class="footer">'
+        f'<div class="disclaimer">{disclaimer_esc}</div>'
+        f'<div class="footer-brand"><strong>External Group</strong> · Alertas DT</div>'
+        f'</div>\n'
+        f'</div>\n</body>\n</html>'
+    )
 
 
 # --------------------------------------------------------------------------
@@ -284,19 +430,7 @@ def render_alert_email_html(alert: dict[str, Any]) -> str:
 # --------------------------------------------------------------------------
 
 def _attachment_css() -> str:
-    return (
-        "body{font-family:Arial,sans-serif;max-width:800px;margin:40px auto;"
-        "padding:20px 24px;color:#0A2231;line-height:1.6;}"
-        "h1{color:#0A2231;font-size:1.6rem;border-bottom:2px solid #29B78D;padding-bottom:8px;}"
-        "h2{color:#167A5F;font-size:1.1rem;margin-top:24px;}"
-        "h3{color:#243743;font-size:1rem;}"
-        "p,li{color:#3C4A52;font-size:14px;}"
-        "ul{padding-left:18px;}"
-        ".meta{font-size:12px;color:#8EA1AA;margin-bottom:20px;}"
-        ".disclaimer{font-size:12px;color:#8EA1AA;margin-top:40px;"
-        "border-top:1px solid #E2E8EC;padding-top:12px;}"
-        ".footer{font-size:11px;color:#C7D1D6;margin-top:16px;}"
-    )
+    return _ATTACHMENT_CSS
 
 
 def generate_executive_summary_html(document_id: int, alert: dict[str, Any]) -> str:
@@ -312,36 +446,62 @@ def generate_executive_summary_html(document_id: int, alert: dict[str, Any]) -> 
     else:
         executive = {"title": "Resumen ejecutivo", "body": str(raw)}
 
-    title = html.escape(executive.get("title") or "Resumen ejecutivo")
-    body_text = html.escape(executive.get("body") or alert.get("summary") or "")
     doc_title = html.escape(alert.get("title") or "Documento DT")
-    category = html.escape(alert.get("category") or "")
+    category = html.escape(alert.get("category") or "Normativa")
     pub_date = html.escape(alert.get("publication_date") or "sin fecha")
+    relevance = html.escape(alert.get("relevance") or "")
     url = html.escape(alert.get("canonical_url") or "#")
     disclaimer = html.escape(
         alert.get("ai_legal_disclaimer")
         or "Este resumen es informativo y no reemplaza la lectura del documento oficial ni asesoría profesional."
     )
 
-    return f"""<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-<style>{_attachment_css()}</style>
-</head>
-<body>
-<h1>{title}</h1>
-<div class="meta">
-  <strong>{doc_title}</strong><br>
-  {category} · {pub_date}<br>
-  <a href="{url}">{url}</a>
-</div>
-<p>{body_text}</p>
-<div class="disclaimer">{disclaimer}</div>
-<div class="footer">External Group · Alertas DT · Documento #{document_id}</div>
-</body>
-</html>"""
+    body_raw = executive.get("body") or alert.get("summary") or ""
+    paragraphs_html = "".join(
+        f'<p class="summary-text">{html.escape(p.strip())}</p>'
+        for p in body_raw.split("\n\n") if p.strip()
+    ) or f'<p class="summary-text">{html.escape(body_raw)}</p>'
+
+    relevance_badge = (
+        f'<span class="relevancia-badge">{relevance}</span>' if relevance else ""
+    )
+
+    return (
+        f'<!doctype html>\n<html lang="es">\n<head>'
+        f'<meta charset="utf-8">'
+        f'<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+        f'<title>Resumen ejecutivo</title>'
+        f'<style>{_ATTACHMENT_CSS}</style></head>\n<body>\n'
+        f'<div class="header">'
+        f'<div class="header-brand">'
+        f'<img class="header-logo" src="{EG_LOGO_LIGHT}" alt="External Group">'
+        f'<div class="header-divider"></div>'
+        f'<span class="header-tag">Alertas DT</span>'
+        f'</div>'
+        f'<span class="header-badge">Resumen ejecutivo</span>'
+        f'</div>\n'
+        f'<div class="accent-bar"></div>\n'
+        f'<div class="wrapper">\n'
+        f'<div class="doc-card">'
+        f'<div class="doc-card-header">'
+        f'<div class="doc-type">{category} · Dirección del Trabajo</div>'
+        f'<div class="doc-title">{doc_title}</div>'
+        f'<div class="doc-meta"><span>{pub_date}</span>'
+        f'{"<span>&middot;</span>" + relevance_badge if relevance_badge else ""}'
+        f'</div>'
+        f'</div>'
+        f'<div class="doc-card-body">'
+        f'<div class="ai-notice"><div class="ai-dot"></div>'
+        f'Contenido generado con apoyo de inteligencia artificial. Revisar antes de tomar decisiones.'
+        f'</div>'
+        f'{paragraphs_html}'
+        f'<a class="link-btn" href="{url}" target="_blank">Ver documento oficial en DT →</a>'
+        f'</div>'
+        f'</div>\n'
+        f'<div class="disclaimer">{disclaimer}</div>\n'
+        f'<div class="footer"><strong>External Group</strong> · Alertas DT · Documento #{document_id}</div>\n'
+        f'</div>\n</body>\n</html>'
+    )
 
 
 def generate_detailed_summary_html(document_id: int, alert: dict[str, Any]) -> str:
@@ -357,75 +517,141 @@ def generate_detailed_summary_html(document_id: int, alert: dict[str, Any]) -> s
     else:
         detailed = {"title": "Resumen detallado", "sections": []}
 
-    title = html.escape(detailed.get("title") or "Resumen detallado")
     doc_title = html.escape(alert.get("title") or "Documento DT")
-    category = html.escape(alert.get("category") or "")
+    category = html.escape(alert.get("category") or "Normativa")
     pub_date = html.escape(alert.get("publication_date") or "sin fecha")
+    relevance = html.escape(alert.get("relevance") or "")
     url = html.escape(alert.get("canonical_url") or "#")
     disclaimer = html.escape(
         alert.get("ai_legal_disclaimer")
         or "Este resumen es informativo y no reemplaza la lectura del documento oficial ni asesoría profesional."
     )
 
+    def _section(icon: str, label: str, body_html: str) -> str:
+        return (
+            f'<div class="section">'
+            f'<div class="section-header">'
+            f'<div class="section-icon">{icon}</div>'
+            f'<div class="section-title">{label}</div>'
+            f'</div>'
+            f'{body_html}'
+            f'</div>\n'
+        )
+
     sections_html = ""
+
     if "sections" in detailed:
         # Formato antiguo: {"title": "...", "sections": [{"heading": "...", "body": "..."}]}
+        ICON_MAP = {
+            "descripci": "📄", "impacto contable": "📊", "impacto laboral": "⚖️",
+            "plazos": "📅", "puntos clave": "🎯", "acciones": "✅", "riesgo": "⚠️",
+        }
         for section in detailed.get("sections") or []:
-            h_text = html.escape(str(section.get("heading") or ""))
+            h_text = str(section.get("heading") or "")
             b_text = html.escape(str(section.get("body") or ""))
-            if h_text:
-                sections_html += f"<h2>{h_text}</h2>"
-            if b_text:
-                sections_html += f"<p>{b_text}</p>"
+            if not h_text and not b_text:
+                continue
+            icon = next(
+                (v for k, v in ICON_MAP.items() if k in h_text.lower()), "📄"
+            )
+            body_part = f"<p>{b_text}</p>" if b_text else ""
+            sections_html += _section(icon, html.escape(h_text), body_part)
     else:
         # Formato nuevo: dict plano con claves específicas
-        _SECTION_LABELS = [
-            ("descripcion", "Descripción"),
-            ("impacto_contable", "Impacto contable"),
-            ("impacto_laboral", "Impacto laboral"),
-            ("acciones_recomendadas", "Acciones recomendadas"),
-            ("riesgos", "Riesgos"),
-            ("plazos", "Plazos"),
+        _FLAT_SECTIONS = [
+            ("descripcion", "📄", "Descripción del documento"),
+            ("impacto_contable", "📊", "Impacto contable"),
+            ("impacto_laboral", "⚖️", "Impacto laboral"),
         ]
-        for key, label in _SECTION_LABELS:
+        for key, icon, label in _FLAT_SECTIONS:
             val = str(detailed.get(key) or "").strip()
             if val and val != "no informado en el documento":
-                sections_html += f"<h2>{label}</h2><p>{html.escape(val)}</p>"
+                sections_html += _section(icon, label, f"<p>{html.escape(val)}</p>")
+
+        # Plazos (puede ser lista o texto)
+        plazos_raw = detailed.get("plazos")
+        if plazos_raw:
+            if isinstance(plazos_raw, list):
+                items = "".join(
+                    f'<div class="plazo-item">'
+                    f'<div class="plazo-fecha">{html.escape(str(p.get("fecha", "")))}</div>'
+                    f'<div class="plazo-desc">{html.escape(str(p.get("descripcion", "")))}</div>'
+                    f'</div>'
+                    for p in plazos_raw if isinstance(p, dict)
+                )
+                plazos_body = f'<div class="plazos-grid">{items}</div>' if items else ""
+            else:
+                plazos_body = f"<p>{html.escape(str(plazos_raw))}</p>"
+            if plazos_body:
+                sections_html += _section("📅", "Plazos clave", plazos_body)
+
+    # Puntos clave (de ai_key_points_json)
+    kp_raw = _parse_json_field(alert.get("ai_key_points_json"), [])
+    if kp_raw:
+        body_part = "".join(
+            f'<div class="puntos-item"><div class="punto-dot"></div>'
+            f'<div class="punto-text">{html.escape(str(p))}</div></div>'
+            for p in kp_raw if p
+        )
+        sections_html += _section("🎯", "Puntos clave", body_part)
+
+    # Acciones recomendadas (de ai_recommended_actions_json o campo plano)
+    rec_raw = _parse_json_field(alert.get("ai_recommended_actions_json"), [])
+    acc_field = str(detailed.get("acciones_recomendadas") or "").strip()
+    if rec_raw:
+        body_part = "".join(
+            f'<div class="puntos-item"><div class="punto-dot"></div>'
+            f'<div class="punto-text">{html.escape(str(a))}</div></div>'
+            for a in rec_raw if a
+        )
+        sections_html += _section("✅", "Acciones recomendadas", body_part)
+    elif acc_field and acc_field != "no informado en el documento":
+        sections_html += _section("✅", "Acciones recomendadas", f"<p>{html.escape(acc_field)}</p>")
+
+    # Riesgos
+    riesgos_val = str(detailed.get("riesgos") or "").strip()
+    if riesgos_val and riesgos_val != "no informado en el documento":
+        sections_html += _section("⚠️", "Riesgos", f"<p>{html.escape(riesgos_val)}</p>")
 
     if not sections_html:
         fallback = html.escape(alert.get("summary") or "Sin contenido disponible.")
-        sections_html = f"<p>{fallback}</p>"
+        sections_html = f'<div class="section"><p>{fallback}</p></div>'
 
-    # Also include key points and impacts if available
-    kp_raw = _parse_json_field(alert.get("ai_key_points_json"), [])
-    if kp_raw:
-        lis = "".join(f"<li>{html.escape(str(p))}</li>" for p in kp_raw if p)
-        sections_html += f"<h2>Puntos clave</h2><ul>{lis}</ul>"
+    relevance_badge = (
+        f'<span class="relevancia-badge">{relevance}</span>' if relevance else ""
+    )
 
-    rec_raw = _parse_json_field(alert.get("ai_recommended_actions_json"), [])
-    if rec_raw:
-        lis = "".join(f"<li>{html.escape(str(a))}</li>" for a in rec_raw if a)
-        sections_html += f"<h2>Acciones recomendadas</h2><ul>{lis}</ul>"
-
-    return f"""<!doctype html>
-<html lang="es">
-<head>
-<meta charset="utf-8">
-<title>{title}</title>
-<style>{_attachment_css()}</style>
-</head>
-<body>
-<h1>{title}</h1>
-<div class="meta">
-  <strong>{doc_title}</strong><br>
-  {category} · {pub_date}<br>
-  <a href="{url}">{url}</a>
-</div>
-{sections_html}
-<div class="disclaimer">{disclaimer}</div>
-<div class="footer">External Group · Alertas DT · Documento #{document_id}</div>
-</body>
-</html>"""
+    return (
+        f'<!doctype html>\n<html lang="es">\n<head>'
+        f'<meta charset="utf-8">'
+        f'<meta name="viewport" content="width=device-width, initial-scale=1.0">'
+        f'<title>Resumen detallado</title>'
+        f'<style>{_ATTACHMENT_CSS}</style></head>\n<body>\n'
+        f'<div class="header">'
+        f'<div class="header-brand">'
+        f'<img class="header-logo" src="{EG_LOGO_LIGHT}" alt="External Group">'
+        f'<div class="header-divider"></div>'
+        f'<span class="header-tag">Alertas DT</span>'
+        f'</div>'
+        f'<span class="header-badge">Resumen detallado</span>'
+        f'</div>\n'
+        f'<div class="accent-bar"></div>\n'
+        f'<div class="wrapper">\n'
+        f'<div class="doc-card">'
+        f'<div class="doc-card-header">'
+        f'<div class="doc-type">{category} · Dirección del Trabajo</div>'
+        f'<div class="doc-title">{doc_title}</div>'
+        f'<div class="doc-meta"><span>{pub_date}</span>'
+        f'{"<span>&middot;</span>" + relevance_badge if relevance_badge else ""}'
+        f'</div>'
+        f'</div>'
+        f'</div>\n'
+        f'{sections_html}'
+        f'<a class="link-btn" href="{url}" target="_blank">Ver documento oficial en DT →</a>\n'
+        f'<div class="disclaimer">{disclaimer}</div>\n'
+        f'<div class="footer"><strong>External Group</strong> · Alertas DT · Documento #{document_id}</div>\n'
+        f'</div>\n</body>\n</html>'
+    )
 
 
 def _parse_json_field(value: Any, default: Any = None) -> Any:
