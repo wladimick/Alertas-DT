@@ -2201,5 +2201,130 @@ class PdfIntegrationTestCase(unittest.TestCase):
         self.assertIsNotNone(result.pdf_url)  # pdf_url se guarda igual
 
 
+class AlertsTableViewTestCase(unittest.TestCase):
+    """Tests para feat/alerts-table-view: tabla con filtros y borrado."""
+
+    def _make_alert(self, alert_id: int, status: str) -> dict:
+        return {
+            "id": alert_id,
+            "document_id": alert_id,
+            "title": f"Circular DT #{alert_id}",
+            "category": "Portada normativa",
+            "publication_date": "01/01/2026",
+            "relevance": "alto",
+            "status": status,
+            "summary": "Resumen de prueba.",
+            "key_points_json": "[]",
+            "practical_impacts_json": "[]",
+            "canonical_url": "https://example.com",
+            "created_at": "2026-06-26T10:00:00",
+            "ai_status": "success",
+            "ai_provider": "azure",
+            "ai_content_quality": "full",
+            "ai_email_subject": "Nuevo documento",
+            "ai_summary_error": None,
+        }
+
+    def test_alerts_table_shows_all_by_default(self):
+        from dt_alerts.server import render_alerts_table
+        alerts = [
+            self._make_alert(1, "pending_review"),
+            self._make_alert(2, "sent"),
+            self._make_alert(3, "fallback"),
+        ]
+        html = render_alerts_table(alerts)
+        self.assertIn("<table", html)
+        self.assertIn("<thead", html)
+        self.assertIn("alert-row-1", html)
+        self.assertIn("alert-row-2", html)
+        self.assertIn("alert-row-3", html)
+
+    def test_alerts_filter_by_status(self):
+        from dt_alerts.server import render_alerts_table
+        alerts = [
+            self._make_alert(1, "pending_review"),
+            self._make_alert(2, "sent"),
+            self._make_alert(3, "pending_review"),
+        ]
+        html = render_alerts_table(alerts, status_filter="pending_review")
+        self.assertIn("alert-row-1", html)
+        self.assertIn("alert-row-3", html)
+        self.assertNotIn("alert-row-2", html)
+
+    def test_alerts_delete_removes_record(self):
+        import http.client, threading, json as _json
+        from http.server import ThreadingHTTPServer
+        from dt_alerts.server import AppHandler
+
+        class _H(AppHandler):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                doc_id = conn.execute(
+                    "INSERT INTO documents (title,category,canonical_url,source_url,dt_article_id,publication_date,status,detected_at)"
+                    " VALUES (?,?,?,?,?,?,?,datetime('now'))",
+                    ("Doc test", "Categoría", "https://example.com/1", "https://example.com/1", "art1", "01/01/2026", "processed"),
+                ).lastrowid
+                conn.execute(
+                    "INSERT INTO alerts (document_id,summary,key_points_json,practical_impacts_json,relevance,status,created_at,updated_at)"
+                    " VALUES (?,?,?,?,?,?,datetime('now'),datetime('now'))",
+                    (doc_id, "Resumen", "[]", "[]", "alto", "pending_review"),
+                )
+                conn.commit()
+                alert_id = conn.execute("SELECT id FROM alerts WHERE document_id=?", (doc_id,)).fetchone()[0]
+
+            _H.settings = get_settings().__class__(
+                **{**get_settings().__dict__, "database_path": str(path), "disable_admin_auth": True}
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+            t = threading.Thread(target=server.serve_forever)
+            t.daemon = True
+            t.start()
+            try:
+                port = server.server_address[1]
+                conn_http = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn_http.request("POST", f"/admin/alerts/{alert_id}/delete", headers={"Cookie": "admin_token=dev"})
+                resp = conn_http.getresponse()
+                body = _json.loads(resp.read())
+                self.assertEqual(resp.status, 200)
+                self.assertTrue(body.get("success"))
+                with db.connect(path) as db_conn:
+                    row = db_conn.execute("SELECT id FROM alerts WHERE id=?", (alert_id,)).fetchone()
+                self.assertIsNone(row, "La alerta debe haberse eliminado de la DB")
+            finally:
+                server.shutdown()
+
+    def test_alerts_delete_nonexistent_returns_404(self):
+        import http.client, threading
+        from http.server import ThreadingHTTPServer
+        from dt_alerts.server import AppHandler
+
+        class _H(AppHandler):
+            pass
+
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.sqlite3"
+            db.init_db(path)
+            _H.settings = get_settings().__class__(
+                **{**get_settings().__dict__, "database_path": str(path), "disable_admin_auth": True}
+            )
+            server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+            t = threading.Thread(target=server.serve_forever)
+            t.daemon = True
+            t.start()
+            try:
+                port = server.server_address[1]
+                conn_http = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn_http.request("POST", "/admin/alerts/99999/delete", headers={"Cookie": "admin_token=dev"})
+                resp = conn_http.getresponse()
+                resp.read()
+                self.assertEqual(resp.status, 404)
+            finally:
+                server.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()

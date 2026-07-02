@@ -88,7 +88,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.redirect("/admin/login")
                 return
             flash = query.get("flash", [""])[0]
-            self.respond_html(render_admin(path, self.settings, flash=flash))
+            status_filter = query.get("status", [""])[0]
+            page = max(1, int(query.get("page", ["1"])[0]) if query.get("page", ["1"])[0].isdigit() else 1)
+            self.respond_html(render_admin(path, self.settings, flash=flash, status_filter=status_filter, page=page))
         elif match := re.match(r"^/admin/alerts/(\d+)/preview-email$", path):
             if not self.is_admin():
                 self.redirect("/admin/login")
@@ -143,6 +145,17 @@ class AppHandler(BaseHTTPRequestHandler):
                     conn, subscriber_id, "paused" if action == "pause" else "active"
                 )
             self.redirect("/admin/subscribers")
+        elif match := re.match(r"^/admin/alerts/(\d+)/delete$", path):
+            self.require_admin()
+            alert_id = int(match.group(1))
+            with db.connect(self.settings.database_path) as conn:
+                existing = conn.execute("SELECT id FROM alerts WHERE id = ?", (alert_id,)).fetchone()
+                if not existing:
+                    self.respond_json({"error": "Alerta no encontrada."}, status=HTTPStatus.NOT_FOUND)
+                    return
+                conn.execute("DELETE FROM alerts WHERE id = ?", (alert_id,))
+                conn.commit()
+            self.respond_json({"success": True})
         elif match := re.match(r"^/admin/alerts/(\d+)/ready$", path):
             self.require_admin()
             alert_id = int(match.group(1))
@@ -1072,7 +1085,7 @@ def render_system_status(settings: Settings, last_job: dict[str, Any] | None) ->
 """
 
 
-def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
+def render_admin(path: str, settings: Settings, *, flash: str = "", status_filter: str = "", page: int = 1) -> str:
     with db.connect(settings.database_path) as conn:
         subscribers = db.list_subscribers(conn)
         alerts = db.list_alerts(conn)
@@ -1109,7 +1122,7 @@ def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
     elif path == "/admin/documents":
         section = render_documents(documents)
     elif path == "/admin/alerts":
-        section = render_alerts(alerts)
+        section = render_alerts_table(alerts, status_filter=status_filter, page=page)
     elif path == "/admin/jobs":
         section = (
             '<p class="eg-section-note">El monitoreo revisa las fuentes configuradas de la '
@@ -2014,76 +2027,138 @@ def ai_status_badge(item: dict[str, Any]) -> str:
     return f'<span class="eg-badge {cls} eg-badge--no-dot">{h(label)}</span>'
 
 
-def alert_actions(item: dict[str, Any]) -> str:
-    """Acciones esenciales de la card. Acciones secundarias (IA, descargas) van en preview."""
+_ALERT_STATUS_LABELS: dict[str, tuple[str, str]] = {
+    "pending_review": ("Pendiente revisión", "#FEF3C7;color:#92400E"),
+    "ready_to_send":  ("Lista p/enviar",     "#D1FAE5;color:#065F46"),
+    "ready":          ("Lista p/enviar",     "#D1FAE5;color:#065F46"),
+    "sent":           ("Enviada",            "#29B78D;color:#fff"),
+    "fallback":       ("Fallback",           "#F3F4F6;color:#6B7280"),
+    "error":          ("Error",              "#FEE2E2;color:#991B1B"),
+}
+
+_ALERT_FILTER_TABS: list[tuple[str, str]] = [
+    ("", "Todas"),
+    ("pending_review", "Pendiente"),
+    ("ready_to_send", "Lista p/enviar"),
+    ("sent", "Enviadas"),
+    ("fallback", "Fallback"),
+    ("error", "Error"),
+]
+
+_PAGE_SIZE = 20
+
+
+def _alert_status_badge(status: str) -> str:
+    label, style = _ALERT_STATUS_LABELS.get(status, (h(status), "#F3F4F6;color:#6B7280"))
+    return (
+        f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
+        f'font-size:11px;font-weight:600;background:{style};">{label}</span>'
+    )
+
+
+def _alert_ia_badge(item: dict[str, Any]) -> str:
+    if (item.get("ai_status") or "") == "success":
+        return (
+            '<span style="display:inline-block;padding:2px 7px;border-radius:10px;'
+            'font-size:11px;font-weight:600;background:#D1FAE5;color:#065F46;">✓ IA</span>'
+        )
+    return (
+        '<span style="display:inline-block;padding:2px 7px;border-radius:10px;'
+        'font-size:11px;font-weight:600;background:#F3F4F6;color:#6B7280;">− Sin IA</span>'
+    )
+
+
+def _fmt_short_date(val: str | None) -> str:
+    if not val:
+        return "—"
+    try:
+        from datetime import datetime
+        _MONTHS = ["ene","feb","mar","abr","may","jun","jul","ago","sep","oct","nov","dic"]
+        dt = datetime.fromisoformat(val[:19])
+        return f"{dt.day} {_MONTHS[dt.month - 1]}"
+    except Exception:
+        return val[:10] if val else "—"
+
+
+def _alert_table_row(item: dict[str, Any]) -> str:
     alert_id = item["id"]
     status = item["status"]
-    ai_st = item.get("ai_status") or ""
-    btns: list[str] = [
-        f'<a class="eg-btn eg-btn--primary eg-btn--sm" href="/admin/alerts/{alert_id}/preview-email">'
-        f'{icon("eye", 14)}<span>Vista previa</span></a>'
-    ]
-    if status == "pending_review":
-        btns.append(
-            f'<form method="post" action="/admin/alerts/{alert_id}/ready">'
-            f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
-            f'{icon("check", 14)}<span>Marcar lista</span></button></form>'
-        )
-    if status in {"ready_to_send", "ready"}:
-        btns.append(
-            f'<form method="post" action="/admin/alerts/{alert_id}/send" '
-            f'onsubmit="return confirm(\'¿Enviar esta alerta a los suscriptores activos?\');">'
-            f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
-            f'{icon("send", 14)}<span>Enviar</span></button></form>'
-        )
-    if not ai_st:
-        btns.append(
-            f'<form method="post" action="/admin/alerts/{alert_id}/generate-ai">'
-            f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
-            f'{icon("cpu", 14)}<span>Generar con IA</span></button></form>'
-        )
-    test_form = (
-        f'<form method="post" action="/admin/alerts/{alert_id}/test" class="eg-test-row">'
-        f'<input class="eg-input eg-input--sm" type="email" name="to" placeholder="correo de prueba" aria-label="Correo de prueba">'
-        f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
-        f'{icon("mail", 14)}<span>Enviar prueba</span></button></form>'
+    title_raw = item.get("title") or ""
+    title_trunc = (title_raw[:45] + "…") if len(title_raw) > 45 else title_raw
+    cat_raw = item.get("category") or ""
+    cat_trunc = (cat_raw[:20] + "…") if len(cat_raw) > 20 else cat_raw
+
+    # Botón Ver
+    ver_btn = (
+        f'<a href="/admin/alerts/{alert_id}/preview-email" '
+        f'style="display:inline-block;padding:3px 10px;border-radius:4px;font-size:12px;'
+        f'font-weight:600;background:#29B78D;color:#fff;text-decoration:none;">Ver</a>'
     )
+
+    # Botón Enviar prueba (inline form colapsable) — solo si no enviada
+    if status != "sent":
+        enviar_btn = (
+            f'<span style="display:inline-block;">'
+            f'<button onclick="this.parentNode.querySelector(\'form\').style.display=\'block\';this.style.display=\'none\';" '
+            f'style="padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;'
+            f'background:#F3F4F6;color:#374151;border:1px solid #D1D5DB;cursor:pointer;">Enviar</button>'
+            f'<form method="post" action="/admin/alerts/{alert_id}/test" '
+            f'style="display:none;margin-top:4px;display:none;">'
+            f'<input type="email" name="to" placeholder="correo@ejemplo.com" '
+            f'style="font-size:11px;padding:2px 6px;border:1px solid #D1D5DB;border-radius:3px;width:130px;">'
+            f'<button type="submit" '
+            f'style="margin-left:4px;padding:2px 8px;border-radius:3px;font-size:11px;'
+            f'background:#29B78D;color:#fff;border:none;cursor:pointer;">OK</button>'
+            f'</form></span>'
+        )
+    else:
+        enviar_btn = ""
+
+    # Botón Eliminar
+    delete_btn = (
+        f'<button onclick="deleteAlert({alert_id})" '
+        f'style="padding:3px 8px;border-radius:4px;font-size:12px;font-weight:600;'
+        f'background:#FEE2E2;color:#991B1B;border:1px solid #FECACA;cursor:pointer;" '
+        f'title="Eliminar alerta">🗑</button>'
+    )
+
     return (
-        f'<div class="eg-alert-actions">'
-        f'<div class="eg-action-row">{"".join(btns)}</div>'
-        f'{test_form}'
-        f'</div>'
+        f'<tr id="alert-row-{alert_id}">'
+        f'<td style="font-family:monospace;font-size:12px;color:#6B7280;width:50px;padding:10px 8px;">{alert_id}</td>'
+        f'<td style="padding:10px 8px;font-size:13px;" title="{h(title_raw)}">{h(title_trunc)}</td>'
+        f'<td style="padding:10px 8px;font-size:12px;color:#6B7280;" title="{h(cat_raw)}">{h(cat_trunc)}</td>'
+        f'<td style="padding:10px 8px;">{_alert_status_badge(status)}</td>'
+        f'<td style="padding:10px 8px;">{_alert_ia_badge(item)}</td>'
+        f'<td style="padding:10px 8px;font-size:12px;color:#6B7280;white-space:nowrap;">{_fmt_short_date(item.get("created_at"))}</td>'
+        f'<td style="padding:10px 8px;">'
+        f'<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">'
+        f'{ver_btn}{enviar_btn}{delete_btn}'
+        f'</div></td>'
+        f'</tr>'
     )
 
 
-def alert_card(item: dict[str, Any]) -> str:
-    return f"""<article class="eg-alert-card">
-  <div class="accent"></div>
-  <div class="eg-alert-body">
-    <div class="eg-alert-meta-top">
-      <span class="eg-alert-cat">{h(item['category'])}</span>
-      <span class="eg-alert-chips">
-        {rel_badge(item['relevance'])}
-        {badge(item['status'])}
-        {ai_status_badge(item)}
-      </span>
-    </div>
-    <h3 class="eg-alert-title">{h(item['title'])}</h3>
-    <p class="eg-alert-summary">{h(item['summary'])}</p>
-    <div class="eg-alert-date mono">{fmt_dt(item.get('created_at'))}</div>
-  </div>
-  {alert_actions(item)}
-</article>"""
+_DELETE_ALERT_JS = """
+<script>
+async function deleteAlert(id) {
+  if (!confirm('\\u00BFEliminar alerta #' + id + '? No se puede deshacer.')) return;
+  const r = await fetch('/admin/alerts/' + id + '/delete', {method:'POST'});
+  if (r.ok) { const row = document.getElementById('alert-row-' + id); if (row) row.remove(); }
+  else alert('Error al eliminar');
+}
+</script>
+"""
 
 
 def render_alerts(
     alerts: list[dict[str, Any]],
     *,
-    title: str = "Alertas",
-    empty_msg: str = "Aún no hay alertas generadas.",
-    empty_hint: str = "Las alertas aparecerán cuando se detecten documentos nuevos.",
-    history_link: str = "",
+    title: str = "Alertas pendientes de acción",
+    empty_msg: str = "✓ No hay alertas pendientes de revisión.",
+    empty_hint: str = "Todas las alertas han sido enviadas o no hay nuevas.",
+    history_link: str = "/admin/alerts",
 ) -> str:
+    """Vista compacta para el dashboard (cards pendientes). Mantiene compatibilidad."""
     if not alerts:
         history_html = (
             f'<a href="{history_link}" style="font-size:13px;color:var(--eg-accent);margin-top:8px;display:inline-block;">'
@@ -2098,13 +2173,132 @@ def render_alerts(
             f"{history_html}"
             "</div></div>"
         )
-    cards = "".join(alert_card(item) for item in alerts)
+    rows = "".join(_alert_table_row(item) for item in alerts)
+    table = (
+        '<div class="eg-table-wrap">'
+        '<table class="eg-table" style="table-layout:fixed;width:100%;">'
+        '<thead><tr>'
+        '<th style="width:50px;">ID</th>'
+        '<th>Documento</th>'
+        '<th style="width:120px;">Categoría</th>'
+        '<th style="width:130px;">Estado</th>'
+        '<th style="width:80px;">IA</th>'
+        '<th style="width:70px;">Fecha</th>'
+        '<th style="width:200px;">Acciones</th>'
+        '</tr></thead>'
+        f'<tbody>{rows}</tbody>'
+        '</table></div>'
+    )
     return (
         f'<div class="eg-section-head">'
         f'<span class="ghost">01</span><h2>{h(title)}</h2>'
-        f'<p>{len(alerts)} alerta{"s" if len(alerts) != 1 else ""} generada{"s" if len(alerts) != 1 else ""}</p>'
+        f'<p>{len(alerts)} alerta{"s" if len(alerts) != 1 else ""}</p>'
         f'</div>'
-        f'<div class="eg-alert-grid">{cards}</div>'
+        f'<section class="eg-card eg-panel">{table}</section>'
+        f'{_DELETE_ALERT_JS}'
+    )
+
+
+def render_alerts_table(
+    alerts: list[dict[str, Any]],
+    *,
+    status_filter: str = "",
+    page: int = 1,
+) -> str:
+    """Vista completa /admin/alerts con filtros, tabla y paginación."""
+    # Filtrar
+    valid_statuses = {"pending_review", "ready_to_send", "ready", "sent", "fallback", "error"}
+    if status_filter and status_filter in valid_statuses:
+        filtered = [a for a in alerts if a.get("status") == status_filter]
+    else:
+        status_filter = ""
+        filtered = list(alerts)
+
+    total = len(filtered)
+    total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
+    page = max(1, min(page, total_pages))
+    page_slice = filtered[(page - 1) * _PAGE_SIZE : page * _PAGE_SIZE]
+
+    # Barra de filtros
+    filter_tabs = ""
+    for tab_val, tab_label in _ALERT_FILTER_TABS:
+        is_active = (tab_val == status_filter)
+        href = f"/admin/alerts{'?status=' + tab_val if tab_val else ''}"
+        active_style = "background:#29B78D;color:#fff;border-color:#29B78D;" if is_active else "background:#fff;color:#374151;border-color:#D1D5DB;"
+        filter_tabs += (
+            f'<a href="{href}" style="display:inline-block;padding:5px 14px;border-radius:20px;'
+            f'font-size:12px;font-weight:600;text-decoration:none;border:1px solid;margin-right:6px;margin-bottom:6px;'
+            f'{active_style}">{tab_label}</a>'
+        )
+
+    # Tabla
+    if page_slice:
+        rows = "".join(_alert_table_row(item) for item in page_slice)
+        table_body = rows
+    else:
+        status_label_str = dict(_ALERT_FILTER_TABS).get(status_filter, status_filter)
+        empty_text = f"No hay alertas con estado {h(status_label_str)}" if status_filter else "No hay alertas generadas."
+        table_body = (
+            f'<tr><td colspan="7" style="text-align:center;padding:32px;color:#6B7280;">'
+            f'{empty_text}'
+            f'{"<br><a href=/admin/alerts style=color:#29B78D;font-size:13px;>Ver todas las alertas →</a>" if status_filter else ""}'
+            f'</td></tr>'
+        )
+
+    table_html = (
+        '<div class="eg-table-wrap">'
+        '<table class="eg-table" style="table-layout:fixed;width:100%;">'
+        '<thead><tr>'
+        '<th style="width:50px;">ID</th>'
+        '<th>Documento</th>'
+        '<th style="width:120px;">Categoría</th>'
+        '<th style="width:130px;">Estado</th>'
+        '<th style="width:80px;">IA</th>'
+        '<th style="width:70px;">Fecha</th>'
+        '<th style="width:220px;">Acciones</th>'
+        '</tr></thead>'
+        f'<tbody>{table_body}</tbody>'
+        '</table></div>'
+    )
+
+    # Paginación
+    pagination = ""
+    if total_pages > 1:
+        base = f"/admin/alerts{'?status=' + status_filter if status_filter else '?'}"
+        sep = "&" if status_filter else ""
+        prev_link = (
+            f'<a href="{base}{sep}page={page - 1}" style="padding:5px 14px;border-radius:4px;'
+            f'border:1px solid #D1D5DB;text-decoration:none;font-size:13px;color:#374151;">← Anterior</a>'
+            if page > 1 else
+            '<span style="padding:5px 14px;border-radius:4px;border:1px solid #E5E7EB;'
+            'font-size:13px;color:#D1D5DB;">← Anterior</span>'
+        )
+        next_link = (
+            f'<a href="{base}{sep}page={page + 1}" style="padding:5px 14px;border-radius:4px;'
+            f'border:1px solid #D1D5DB;text-decoration:none;font-size:13px;color:#374151;">Siguiente →</a>'
+            if page < total_pages else
+            '<span style="padding:5px 14px;border-radius:4px;border:1px solid #E5E7EB;'
+            'font-size:13px;color:#D1D5DB;">Siguiente →</span>'
+        )
+        pagination = (
+            f'<div style="display:flex;align-items:center;gap:16px;justify-content:center;padding:16px 0;">'
+            f'{prev_link}'
+            f'<span style="font-size:13px;color:#6B7280;">Página {page} de {total_pages}</span>'
+            f'{next_link}'
+            f'</div>'
+        )
+
+    return (
+        f'<div class="eg-section-head">'
+        f'<span class="ghost">01</span><h2>Alertas generadas</h2>'
+        f'<p>{total} alerta{"s" if total != 1 else ""}</p>'
+        f'</div>'
+        f'<section class="eg-card eg-panel">'
+        f'<div style="margin-bottom:16px;">{filter_tabs}</div>'
+        f'{table_html}'
+        f'{pagination}'
+        f'</section>'
+        f'{_DELETE_ALERT_JS}'
     )
 
 
