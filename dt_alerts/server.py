@@ -945,14 +945,21 @@ def auth_mode(settings: Settings) -> tuple[str, str]:
     return ("Login por token activo", "active")
 
 
-def render_sidebar(path: str, settings: Settings) -> str:
+def render_sidebar(path: str, settings: Settings, *, pending_alerts: int = 0) -> str:
     email_label, email_key = email_mode(settings)
     parts = []
     for href, label, ic in SIDEBAR_NAV:
         active = path == href
         cls = ' class="active"' if active else ""
         aria = ' aria-current="page"' if active else ""
-        parts.append(f'<a href="{href}"{cls}{aria}>{icon(ic, 19)}<span>{label}</span></a>')
+        badge_html = ""
+        if href == "/admin/alerts" and pending_alerts > 0:
+            badge_html = (
+                f'<span style="margin-left:auto;background:#F59E0B;color:#fff;'
+                f'font-size:10px;font-weight:700;padding:1px 6px;border-radius:10px;'
+                f'line-height:16px;">{pending_alerts}</span>'
+            )
+        parts.append(f'<a href="{href}"{cls}{aria}>{icon(ic, 19)}<span>{label}</span>{badge_html}</a>')
     items = "".join(parts)
     return f"""
 <div class="eg-brand">
@@ -1083,16 +1090,17 @@ def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
     banner = ""
     if settings.disable_admin_auth:
         banner = (
-            '<div class="eg-devbanner" role="alert">'
-            "⚠ Modo desarrollo: autenticación admin desactivada "
-            "(DISABLE_ADMIN_AUTH=True). No usar en producción.</div>"
+            '<div role="alert" style="font-size:12px;padding:6px 16px;background:#FFF3CD;'
+            'color:#856404;border-bottom:1px solid #FFEEBA;text-align:center;">'
+            "⚠ Modo desarrollo: autenticación desactivada (DISABLE_ADMIN_AUTH=True)"
+            "</div>"
         )
     if flash:
         banner += f'<div class="eg-flash" role="status">{h(flash)}</div>'
 
     if path == "/admin/settings":
         title, subtitle = SECTION_META["/admin/settings"]
-        sidebar = render_sidebar(path, settings)
+        sidebar = render_sidebar(path, settings, pending_alerts=pending_count)
         topbar = render_topbar(title, subtitle, settings, show_action=False)
         content = banner + render_settings(settings) + MONITOR_SCRIPT
         return render_page(title, content, sidebar=sidebar, topbar=topbar)
@@ -1160,17 +1168,25 @@ def render_admin(path: str, settings: Settings, *, flash: str = "") -> str:
             f'{icon(cta_icon, 15)}<span>{cta_label}</span></a>'
             '</section>'
         )
+        _pending_statuses = {"pending_review", "pending", "ready_to_send", "ready", "fallback"}
+        pending_alerts = [a for a in alerts if a.get("status") in _pending_statuses]
         section = (
             f'<div class="eg-metric-grid">{cards}</div>'
             + activity_html
             + render_system_status(settings, last_job)
             + render_jobs(jobs[:5])
-            + render_alerts(alerts[:6])
+            + render_alerts(
+                pending_alerts[:6],
+                title="Alertas pendientes de acción",
+                empty_msg="✓ No hay alertas pendientes de revisión.",
+                empty_hint="Todas las alertas han sido enviadas o no hay nuevas.",
+                history_link="/admin/alerts",
+            )
         )
 
     title, subtitle = SECTION_META.get(path, SECTION_META["/admin"])
     content = banner + section + MONITOR_SCRIPT
-    sidebar = render_sidebar(path, settings)
+    sidebar = render_sidebar(path, settings, pending_alerts=pending_count)
     topbar = render_topbar(title, subtitle, settings)
     return render_page(title, content, sidebar=sidebar, topbar=topbar)
 
@@ -1210,51 +1226,40 @@ def render_jobs(jobs: list[dict[str, Any]]) -> str:
 
 
 def render_db_info(settings: Settings, subscribers: list[dict[str, Any]]) -> str:
-    """Cards informativas: base de datos y estado de sincronización WordPress."""
-    from pathlib import Path
-
-    p = Path(str(settings.database_path))
-    partial = "/".join(p.parts[-2:]) if len(p.parts) >= 2 else p.name
+    """Card compacta de WordPress Sync para la vista de suscriptores."""
     last_update = max((s.get("updated_at") or "" for s in subscribers), default="")
+    wp_synced_count = sum(
+        1 for s in subscribers
+        if "wordpress" in (s.get("source_page") or "").lower()
+        or "wp" in (s.get("source_page") or "").lower()
+    )
 
-    # WordPress sync status card
     if settings.wordpress_sync_enabled:
-        wp_section = f"""
-<section class="eg-card eg-panel">
-  <div class="eg-card-head"><h2>WordPress Sync</h2>{badge("active", "Activo")}</div>
+        return f"""
+<section class="eg-card eg-panel" style="margin-bottom:16px;">
+  <div class="eg-card-head">
+    <h2>WordPress Sync</h2>{badge("active", "Activo")}
+  </div>
   <dl class="eg-kv eg-kv--2col">
-    <dt>API URL</dt><dd class="mono">{h(settings.wordpress_api_url) if settings.wordpress_api_url else '—'}</dd>
-    <dt>Intervalo</dt><dd class="mono">{h(settings.wordpress_sync_interval_minutes)} min</dd>
+    <dt>Última sincronización</dt><dd class="mono">{fmt_dt(last_update) if last_update else '—'}</dd>
+    <dt>Suscriptores sincronizados</dt><dd class="mono">{wp_synced_count}</dd>
   </dl>
-  <form method="post" action="/admin/wordpress/sync" style="margin-top:12px">
+  <form method="post" action="/admin/wordpress/sync" style="margin-top:12px;text-align:center;">
     <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
-      {icon("refresh", 14)}<span>Sincronizar ahora</span>
+      {icon("refresh", 14)}<span>↺ Sincronizar ahora</span>
     </button>
   </form>
-</section>
-"""
-    else:
-        wp_section = f"""
-<section class="eg-card eg-panel">
-  <div class="eg-card-head"><h2>WordPress Sync</h2>{badge("paused", "Desactivado")}</div>
-  <p class="eg-muted">Configura <code>WORDPRESS_SYNC_ENABLED=true</code> y <code>WORDPRESS_API_URL</code> para importar suscriptores desde WordPress.</p>
-</section>
-"""
-
+</section>"""
     return f"""
-<div class="eg-grid-2">
-<section class="eg-card eg-panel">
-  <div class="eg-card-head"><h2>Base de datos</h2></div>
-  <dl class="eg-kv eg-kv--2col">
-    <dt>Motor</dt><dd>SQLite</dd>
-    <dt>Ruta</dt><dd class="mono eg-muted">…/{h(partial)}</dd>
-    <dt>Suscriptores</dt><dd class="mono">{len(subscribers)}</dd>
-    <dt>Última actualización</dt><dd class="mono">{fmt_dt(last_update) if last_update else '—'}</dd>
-  </dl>
-  <p class="eg-note">Para operación local productiva, apunta DATABASE_PATH a una ruta fuera del repo.</p>
-</section>
-{wp_section}
-</div>"""
+<section class="eg-card eg-panel" style="margin-bottom:16px;">
+  <div class="eg-card-head">
+    <h2>WordPress Sync</h2>{badge("paused", "Desactivado")}
+  </div>
+  <p class="eg-muted" style="font-size:13px;">
+    Activa <code>WORDPRESS_SYNC_ENABLED=true</code> en Configuración para importar suscriptores desde WordPress.
+    <a href="/admin/settings" style="color:var(--eg-accent);">Ir a Configuración →</a>
+  </p>
+</section>"""
 
 
 def _test_wordpress_connection(settings: Settings) -> str:
@@ -1812,7 +1817,8 @@ def render_settings(settings: Settings) -> str:
         )
     )
 
-    section_ai = f"""
+    # IA core (conexión + uso) — ancho completo
+    section_ai_core = f"""
 {_ai_warning_banner}
 <section class="eg-card eg-panel">
   <h2>{icon("cpu", 17)} Conexion IA</h2>
@@ -1851,22 +1857,33 @@ def render_settings(settings: Settings) -> str:
 </section>
 
 {_render_ai_usage_table(recent_ai_logs, settings)}
-
-<section class="eg-card eg-panel">
-  <h2>{icon("cpu", 17)} IA · Configuracion editorial</h2>
-  <p class="eg-muted">
-    Estos valores controlan el comportamiento editorial de la IA. No incluyas API keys aquí.
-    Los cambios se guardan en la base de datos y anulan los valores por defecto.
-  </p>
-  <form method="post" action="/admin/settings">
-    <input type="hidden" name="_section" value="ai">
-    {ai_editable_fields}
-    <button class="eg-btn eg-btn--primary" type="submit">
-      {icon("check", 15)}<span>Guardar configuracion IA</span>
-    </button>
-  </form>
-</section>
 """
+
+    # IA editorial — colapsable
+    section_ai_editorial = f"""
+<details class="eg-card eg-panel" style="padding:0;">
+  <summary style="padding:20px 24px;font-size:14px;font-weight:700;color:var(--eg-text);
+    cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;border-radius:10px;">
+    {icon("cpu", 16)} ✏️ Configuracion editorial IA
+    <span style="margin-left:auto;font-size:12px;color:var(--eg-muted);font-weight:400;">▼ Expandir</span>
+  </summary>
+  <div style="padding:0 24px 20px;">
+    <p class="eg-muted" style="margin-bottom:14px;">
+      Controlan el comportamiento editorial de la IA. No incluyas API keys aquí.
+      Los cambios se guardan en la base de datos y anulan los valores por defecto.
+    </p>
+    <form method="post" action="/admin/settings">
+      <input type="hidden" name="_section" value="ai">
+      {ai_editable_fields}
+      <button class="eg-btn eg-btn--primary" type="submit">
+        {icon("check", 15)}<span>Guardar configuracion IA</span>
+      </button>
+    </form>
+  </div>
+</details>
+"""
+
+    section_ai = section_ai_core
 
     # --- Email y plantillas (editable) ---
     def _field(key: str, label: str, placeholder: str, env_val: str, multiline: bool = False) -> str:
@@ -1906,22 +1923,37 @@ def render_settings(settings: Settings) -> str:
     )
 
     section_email = f"""
-<section class="eg-card eg-panel">
-  <h2>{icon("mail", 17)} Email y plantillas</h2>
-  <p class="eg-muted">
-    Estos valores anulan el <code>.env</code> para el envio de emails. Si se dejan en blanco, se usan los valores de las variables de entorno.
-    No guardes API keys en este formulario.
-  </p>
-  <form method="post" action="/admin/settings">
-    {fields_html}
-    <button class="eg-btn eg-btn--primary" type="submit">
-      {icon("check", 15)}<span>Guardar configuracion</span>
-    </button>
-  </form>
-</section>
+<details class="eg-card eg-panel" style="padding:0;">
+  <summary style="padding:20px 24px;font-size:14px;font-weight:700;color:var(--eg-text);
+    cursor:pointer;list-style:none;display:flex;align-items:center;gap:8px;border-radius:10px;">
+    {icon("mail", 16)} 📨 Email y plantillas
+    <span style="margin-left:auto;font-size:12px;color:var(--eg-muted);font-weight:400;">▼ Expandir</span>
+  </summary>
+  <div style="padding:0 24px 20px;">
+    <p class="eg-muted" style="margin-bottom:14px;">
+      Anulan el <code>.env</code> para el envio de emails. Si se dejan en blanco, se usan las variables de entorno.
+      No guardes API keys en este formulario.
+    </p>
+    <form method="post" action="/admin/settings">
+      {fields_html}
+      <button class="eg-btn eg-btn--primary" type="submit">
+        {icon("check", 15)}<span>Guardar configuracion</span>
+      </button>
+    </form>
+  </div>
+</details>
 """
 
-    return section_general + section_sendgrid + section_db + section_wp + section_ai + section_email
+    _grid2 = '<div style="display:grid;grid-template-columns:1fr 1fr;gap:16px;margin-bottom:0;">'
+    _grid2_end = '</div>'
+
+    return (
+        _grid2 + section_general + section_sendgrid + _grid2_end
+        + _grid2 + section_db + section_wp + _grid2_end
+        + section_ai
+        + section_ai_editorial
+        + section_email
+    )
 
 
 def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
@@ -1955,7 +1987,12 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
       <tbody>{rows or empty_row(8, "Aún no hay suscriptores.", "Puedes probar el formulario público usando un correo interno.")}</tbody>
     </table>
   </div>
-  <p class="eg-note">WhatsApp reservado para fase futura: el MVP notifica solo por email.</p>
+  <details style="margin-top:12px;">
+    <summary style="font-size:12px;color:var(--eg-muted);cursor:pointer;list-style:none;">
+      ℹ️ Sobre notificaciones WhatsApp
+    </summary>
+    <p class="eg-note" style="margin-top:6px;">WhatsApp reservado para fase futura: el MVP notifica solo por email.</p>
+  </details>
 </section>
 """
 
@@ -2039,19 +2076,32 @@ def alert_card(item: dict[str, Any]) -> str:
 </article>"""
 
 
-def render_alerts(alerts: list[dict[str, Any]]) -> str:
+def render_alerts(
+    alerts: list[dict[str, Any]],
+    *,
+    title: str = "Alertas",
+    empty_msg: str = "Aún no hay alertas generadas.",
+    empty_hint: str = "Las alertas aparecerán cuando se detecten documentos nuevos.",
+    history_link: str = "",
+) -> str:
     if not alerts:
+        history_html = (
+            f'<a href="{history_link}" style="font-size:13px;color:var(--eg-accent);margin-top:8px;display:inline-block;">'
+            f'Ver historial de alertas →</a>'
+            if history_link else ""
+        )
         return (
-            '<div class="eg-section-head"><span class="ghost">01</span><h2>Alertas</h2></div>'
+            f'<div class="eg-section-head"><span class="ghost">01</span><h2>{h(title)}</h2></div>'
             '<div class="eg-card eg-panel"><div class="eg-empty">'
-            "<strong>Aún no hay alertas generadas.</strong>"
-            "<span>Las alertas aparecerán cuando se detecten documentos nuevos.</span>"
+            f"<strong>{h(empty_msg)}</strong>"
+            f"<span>{h(empty_hint)}</span>"
+            f"{history_html}"
             "</div></div>"
         )
     cards = "".join(alert_card(item) for item in alerts)
     return (
         f'<div class="eg-section-head">'
-        f'<span class="ghost">01</span><h2>Alertas</h2>'
+        f'<span class="ghost">01</span><h2>{h(title)}</h2>'
         f'<p>{len(alerts)} alerta{"s" if len(alerts) != 1 else ""} generada{"s" if len(alerts) != 1 else ""}</p>'
         f'</div>'
         f'<div class="eg-alert-grid">{cards}</div>'
