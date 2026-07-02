@@ -2299,11 +2299,13 @@ def _alert_ia_badge(item: dict[str, Any]) -> str:
     if (item.get("ai_status") or "") == "success":
         return (
             '<span style="display:inline-block;padding:2px 7px;border-radius:10px;'
-            'font-size:11px;font-weight:600;background:#D1FAE5;color:#065F46;">✓ IA</span>'
+            'font-size:11px;font-weight:600;background:#D1FAE5;color:#065F46;" '
+            'title="Resumen IA generado — clic para ver preview">✓ IA</span>'
         )
     return (
         '<span style="display:inline-block;padding:2px 7px;border-radius:10px;'
-        'font-size:11px;font-weight:600;background:#F3F4F6;color:#6B7280;">− Sin IA</span>'
+        'font-size:11px;font-weight:600;background:#F3F4F6;color:#6B7280;" '
+        'title="Sin resumen IA — usar Generar con IA en el preview">− Sin IA</span>'
     )
 
 
@@ -2709,11 +2711,18 @@ def render_alert_preview(alert_id: int, settings: Settings, *, flash: str = "") 
             f'{icon("document", 14)}<span>Descargar detallado</span></a>'
             if ai_st in ("success", "fallback") else ""
         )
-        regen_btn = (
-            f'<form method="post" action="/admin/alerts/{alert_id}/regenerate-ai" style="display:inline;">'
-            f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit">'
-            f'{icon("refresh", 14)}<span>Regenerar con IA</span></button></form>'
-        )
+        if ai_st == "success":
+            regen_btn = (
+                f'<form method="post" action="/admin/alerts/{alert_id}/regenerate-ai" style="display:inline;">'
+                f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit" title="Volver a generar el resumen con IA">'
+                f'{icon("refresh", 14)}<span>↺ Regenerar con IA</span></button></form>'
+            )
+        else:
+            regen_btn = (
+                f'<form method="post" action="/admin/alerts/{alert_id}/generate-ai" style="display:inline;">'
+                f'<button class="eg-btn eg-ghost eg-btn--sm" type="submit" title="Generar resumen con inteligencia artificial">'
+                f'{icon("cpu", 14)}<span>✨ Generar con IA</span></button></form>'
+            )
         canon_btn = (
             f'<a class="eg-btn eg-ghost eg-btn--sm" href="{h(alert["canonical_url"])}" target="_blank" rel="noopener noreferrer">'
             f'{icon("external", 14)}<span>Ver documento oficial</span></a>'
@@ -2792,6 +2801,19 @@ def render_alert_preview(alert_id: int, settings: Settings, *, flash: str = "") 
   </summary>
   <div style="padding:0 20px 18px;">{sections_html}</div>
 </details>"""
+
+    # Cuando no hay resumen IA, mostrar tarjeta con botón "Generar con IA"
+    if not ai_st:
+        ai_panel = (
+            f'<section class="eg-card eg-panel">'
+            f'<p class="eg-eyebrow">Inteligencia Artificial</p>'
+            f'<h2>Sin resumen IA</h2>'
+            f'<p style="font-size:14px;color:#6B7280;margin-bottom:16px;">Este documento aún no tiene un resumen generado por IA.</p>'
+            f'<form method="post" action="/admin/alerts/{alert_id}/generate-ai" style="display:inline;">'
+            f'<button class="eg-btn eg-btn--primary eg-btn--sm" type="submit" title="Generar resumen con inteligencia artificial">'
+            f'{icon("cpu", 14)}<span>✨ Generar con IA</span></button></form>'
+            f'</section>'
+        )
 
     ai_lower_row = ""
     if ai_panel or ai_attach_card:

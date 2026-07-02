@@ -2560,5 +2560,81 @@ class AlertsSendToSubscribersTestCase(unittest.TestCase):
                 server.shutdown()
 
 
+class GenerateVsRegenerateBtnTestCase(unittest.TestCase):
+    """Tests para feat/generate-vs-regenerate-btn."""
+
+    def _db_path(self, tmp: str) -> Path:
+        path = Path(tmp) / "t.sqlite3"
+        db.init_db(path)
+        return path
+
+    def _insert_doc_and_alert(self, conn) -> tuple[int, int]:
+        doc = {
+            "dt_article_id": "art-gr1",
+            "canonical_url": "https://example.com/gr1",
+            "source_url": "https://example.com/gr1",
+            "category": "Dictámenes",
+            "title": "ORD. Test Generar",
+            "publication_date": "01/01/2026",
+            "abstract": None,
+            "detail_text": "Texto de prueba.",
+            "pdf_url": None,
+            "content_hash": None,
+        }
+        doc_id, _ = db.upsert_document(conn, doc)
+        db.update_document_processed(
+            conn, doc_id, status="processed", detail_text="Texto.",
+            pdf_url=None, content_hash=None, last_error=None,
+        )
+        alert_id = db.create_or_update_alert(
+            conn, doc_id,
+            summary="Resumen básico.",
+            key_points=[],
+            practical_impacts=[],
+            relevance="medio",
+            status="pending_review",
+            ai_error=None,
+        )
+        return doc_id, alert_id
+
+    def test_preview_shows_generar_when_no_summary(self):
+        from dt_alerts.server import render_alert_preview
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                _, alert_id = self._insert_doc_and_alert(conn)
+            settings = settings_for(path)
+            html = render_alert_preview(alert_id, settings)
+        self.assertIn("Generar con IA", html)
+        self.assertNotIn("Regenerar con IA", html)
+
+    def test_preview_shows_regenerar_when_summary_exists(self):
+        from dt_alerts.server import render_alert_preview
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                doc_id, alert_id = self._insert_doc_and_alert(conn)
+                db.upsert_ai_summary(
+                    conn, doc_id,
+                    provider="openai", model="gpt-4o-mini",
+                    status="success", content_quality="full",
+                    relevance="alto",
+                    email_subject="Nuevo documento",
+                    email_summary="Resumen IA.",
+                    key_points_json="[]",
+                    practical_impacts_json="[]",
+                    recommended_actions_json="[]",
+                    executive_summary=None,
+                    detailed_summary_json=None,
+                    tags_json="[]",
+                    legal_disclaimer=None,
+                    error=None,
+                )
+            settings = settings_for(path)
+            html = render_alert_preview(alert_id, settings)
+        self.assertIn("Regenerar con IA", html)
+        self.assertNotIn("✨ Generar con IA", html)
+
+
 if __name__ == "__main__":
     unittest.main()
