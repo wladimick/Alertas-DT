@@ -189,41 +189,25 @@ def _email_list_html(title: str, items: list[Any], *, is_impacts: bool = False) 
     )
 
 
+# Estilos del email. Solo propiedades que Outlook soporta vía <style>.
+# Layout (flex/grid) se maneja con tablas HTML en el código de generación.
 _EMAIL_CSS = (
     "* { box-sizing: border-box; margin: 0; padding: 0; }"
     "body { font-family: Arial, sans-serif; background: #F4F7F8; color: #0A2231; }"
     ".email-wrapper { max-width: 640px; margin: 0 auto; background: #F4F7F8; }"
-    ".header { background: #0A2231; padding: 22px 32px; display: flex; align-items: center; justify-content: space-between; }"
-    ".header-brand { display: flex; align-items: center; gap: 14px; }"
-    ".header-logo { height: 24px; }"
-    ".header-divider { width: 1px; height: 24px; background: #29B78D; opacity: 0.4; }"
+    ".header-logo { height: 24px; border: 0; display: block; }"
     ".header-tag { font-size: 10px; font-weight: 700; letter-spacing: 0.14em; text-transform: uppercase; color: #29B78D; }"
     ".header-label { font-size: 11px; color: #7ca0b4; font-style: italic; }"
     ".accent-bar { height: 4px; background: #29B78D; }"
-    ".doc-card { background: #0A2231; padding: 24px 32px 0; position: relative; }"
-    ".doc-card::after { content: ''; display: block; height: 3px; background: #29B78D; margin-top: 22px; }"
+    ".doc-card { background: #0A2231; padding: 24px 32px 0; }"
     ".doc-type { font-size: 10px; font-weight: 700; letter-spacing: 0.12em; text-transform: uppercase; color: #29B78D; margin-bottom: 8px; }"
     ".doc-title { font-size: 26px; font-weight: 700; color: #ffffff; margin-bottom: 10px; line-height: 1.2; }"
-    ".doc-meta { display: flex; align-items: center; gap: 12px; flex-wrap: wrap; font-size: 12px; color: #7ca0b4; }"
+    ".doc-meta { font-size: 12px; color: #7ca0b4; margin-top: 4px; }"
     ".relevancia-badge { font-size: 10px; font-weight: 700; letter-spacing: 0.08em; text-transform: uppercase; background: #29B78D; color: #fff; padding: 2px 9px; border-radius: 20px; }"
     ".body { background: #ffffff; padding: 28px 32px 24px; }"
-    ".ai-notice { display: flex; align-items: center; gap: 8px; background: #f0faf6; border: 1px solid #b8e8d6; border-radius: 6px; padding: 9px 14px; margin-bottom: 20px; font-size: 12px; color: #0f6e56; font-weight: 500; }"
-    ".ai-dot { width: 6px; height: 6px; border-radius: 50%; background: #29B78D; flex-shrink: 0; }"
     ".summary-text { font-size: 14px; color: #3C4A52; line-height: 1.75; }"
     ".section { padding: 22px 32px; border-top: 1px solid #eef2f4; background: #ffffff; }"
     ".section-title { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.1em; color: #0A2231; margin-bottom: 14px; }"
-    ".punto { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid #f4f7f8; }"
-    ".punto:last-child { border-bottom: none; }"
-    ".punto-dot { width: 6px; height: 6px; border-radius: 50%; background: #29B78D; flex-shrink: 0; margin-top: 8px; }"
-    ".punto-text { font-size: 14px; color: #3C4A52; line-height: 1.7; }"
-    ".impacto-grid { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; }"
-    ".impacto-item { background: #F4F7F8; border: 1px solid #dde4e8; border-radius: 8px; padding: 14px 16px; border-left: 3px solid #29B78D; }"
-    ".impacto-label { font-size: 11px; font-weight: 700; text-transform: uppercase; letter-spacing: 0.06em; color: #0A2231; margin-bottom: 6px; }"
-    ".impacto-text { font-size: 13px; color: #3C4A52; line-height: 1.6; }"
-    ".accion { display: flex; gap: 10px; align-items: flex-start; padding: 8px 0; border-bottom: 1px solid #f4f7f8; }"
-    ".accion:last-child { border-bottom: none; }"
-    ".accion-num { width: 20px; height: 20px; border-radius: 50%; background: #0A2231; color: #29B78D; font-size: 10px; font-weight: 700; display: flex; align-items: center; justify-content: center; flex-shrink: 0; margin-top: 2px; }"
-    ".accion-text { font-size: 14px; color: #3C4A52; line-height: 1.7; }"
     ".tags-section { padding: 16px 32px; background: #ffffff; border-top: 1px solid #eef2f4; }"
     ".tag { display: inline-block; font-size: 11px; font-weight: 600; background: #F4F7F8; color: #5a7080; border: 1px solid #dde4e8; padding: 4px 10px; border-radius: 20px; margin: 3px 4px 3px 0; }"
     ".cta-section { background: #0A2231; padding: 20px 32px; text-align: center; }"
@@ -280,12 +264,20 @@ _ATTACHMENT_CSS = (
 
 
 def _build_puntos_html(items: list[Any], css_item: str = "punto", css_dot: str = "punto-dot", css_text: str = "punto-text") -> str:
+    """Genera filas de puntos con tabla HTML — compatible con Outlook."""
     parts = []
     for item in items:
         text = html.escape(str(item.get("title") if isinstance(item, dict) else item))
         parts.append(
-            f'<div class="{css_item}"><div class="{css_dot}"></div>'
-            f'<div class="{css_text}">{text}</div></div>'
+            '<table width="100%" cellpadding="0" cellspacing="0" border="0"'
+            ' style="border-bottom:1px solid #f4f7f8;">'
+            '<tr>'
+            '<td width="16" style="padding:8px 10px 8px 0;vertical-align:top;">'
+            '<div style="width:6px;height:6px;border-radius:50%;background:#29B78D;margin-top:6px;"></div>'
+            '</td>'
+            f'<td style="font-size:14px;color:#3C4A52;line-height:1.7;padding:8px 0;">{text}</td>'
+            '</tr>'
+            '</table>'
         )
     return "".join(parts)
 
@@ -311,16 +303,24 @@ def render_alert_email_html(alert: dict[str, Any]) -> str:
     summary_esc = html.escape(summary_text)
     disclaimer_esc = html.escape(disclaimer)
 
+    # AI notice — tabla para compatibilidad con Outlook (no flex)
     ai_notice = ""
     if ai.get("status") == "success":
         ai_notice = (
-            '<div class="ai-notice">'
-            '<div class="ai-dot"></div>'
+            '<table width="100%" cellpadding="0" cellspacing="0" border="0"'
+            ' style="background:#f0faf6;border:1px solid #b8e8d6;border-radius:6px;margin-bottom:20px;">'
+            '<tr>'
+            '<td width="20" style="padding:9px 0 9px 14px;vertical-align:middle;">'
+            '<div style="width:6px;height:6px;border-radius:50%;background:#29B78D;"></div>'
+            '</td>'
+            '<td style="padding:9px 14px 9px 8px;font-size:12px;color:#0f6e56;font-weight:500;">'
             'Resumen generado con inteligencia artificial · Revisar antes de tomar decisiones'
-            '</div>'
+            '</td>'
+            '</tr>'
+            '</table>'
         )
 
-    # Puntos clave
+    # Puntos clave — usa _build_puntos_html (tabla interna por punto)
     puntos_html = ""
     if key_points:
         puntos_html = (
@@ -330,10 +330,10 @@ def render_alert_email_html(alert: dict[str, Any]) -> str:
             + '</div>'
         )
 
-    # Impacto grid
+    # Impacto grid — tabla 2 columnas, compatible con Outlook
     impacto_html = ""
     if impacts:
-        items_html = ""
+        cells: list[str] = []
         for imp in impacts:
             if isinstance(imp, dict):
                 lbl = html.escape(str(imp.get("title") or ""))
@@ -341,35 +341,55 @@ def render_alert_email_html(alert: dict[str, Any]) -> str:
             else:
                 lbl = html.escape(str(imp))
                 txt = ""
-            items_html += (
-                f'<div class="impacto-item">'
-                f'<div class="impacto-label">{lbl}</div>'
-                f'<div class="impacto-text">{txt}</div>'
+            cells.append(
+                f'<div style="background:#F4F7F8;border:1px solid #dde4e8;border-radius:8px;'
+                f'padding:14px 16px;border-left:3px solid #29B78D;">'
+                f'<div style="font-size:11px;font-weight:700;text-transform:uppercase;'
+                f'letter-spacing:0.06em;color:#0A2231;margin-bottom:6px;">{lbl}</div>'
+                f'<div style="font-size:13px;color:#3C4A52;line-height:1.6;">{txt}</div>'
                 f'</div>'
+            )
+        # Agrupar en filas de 2 celdas
+        rows = ""
+        for i in range(0, len(cells), 2):
+            left = cells[i]
+            right = cells[i + 1] if i + 1 < len(cells) else ""
+            pad_top = "0" if i == 0 else "6px"
+            rows += (
+                f'<tr>'
+                f'<td width="50%" style="padding:{pad_top} 6px 0 0;vertical-align:top;">{left}</td>'
+                f'<td width="50%" style="padding:{pad_top} 0 0 6px;vertical-align:top;">{right}</td>'
+                f'</tr>'
             )
         impacto_html = (
             '<div class="section">'
             '<div class="section-title">Impacto práctico para contadores y empresas</div>'
-            f'<div class="impacto-grid">{items_html}</div>'
+            f'<table width="100%" cellpadding="0" cellspacing="0" border="0">{rows}</table>'
             '</div>'
         )
 
-    # Acciones
+    # Acciones — tabla para compatibilidad con Outlook (no flex)
     acciones_html = ""
     if rec_actions:
-        items_html = ""
+        rows_html = ""
         for i, act in enumerate(rec_actions, 1):
             txt = html.escape(str(act.get("title") if isinstance(act, dict) else act))
-            items_html += (
-                f'<div class="accion">'
-                f'<div class="accion-num">{i}</div>'
-                f'<div class="accion-text">{txt}</div>'
-                f'</div>'
+            rows_html += (
+                '<table width="100%" cellpadding="0" cellspacing="0" border="0"'
+                ' style="border-bottom:1px solid #f4f7f8;">'
+                '<tr>'
+                '<td width="30" style="padding:8px 10px 8px 0;vertical-align:top;">'
+                f'<div style="width:20px;height:20px;border-radius:50%;background:#0A2231;'
+                f'color:#29B78D;font-size:10px;font-weight:700;text-align:center;line-height:20px;">{i}</div>'
+                '</td>'
+                f'<td style="font-size:14px;color:#3C4A52;line-height:1.7;padding:8px 0;">{txt}</td>'
+                '</tr>'
+                '</table>'
             )
         acciones_html = (
             '<div class="section">'
             '<div class="section-title">Acciones recomendadas</div>'
-            + items_html
+            + rows_html
             + '</div>'
         )
 
@@ -381,6 +401,31 @@ def render_alert_email_html(alert: dict[str, Any]) -> str:
         )
         tags_html = f'<div class="tags-section">{spans}</div>'
 
+    # Header — tabla para compatibilidad con Outlook (no flex)
+    header_html = (
+        f'<table width="100%" cellpadding="0" cellspacing="0" border="0"'
+        f' style="background:#0A2231;padding:22px 32px;">'
+        f'<tr>'
+        f'<td style="vertical-align:middle;">'
+        f'<table cellpadding="0" cellspacing="0" border="0">'
+        f'<tr>'
+        f'<td style="vertical-align:middle;padding-right:14px;">'
+        f'<img src="{EG_LOGO_LIGHT}" alt="External Group" height="24"'
+        f' style="height:24px;display:block;border:0;"></td>'
+        f'<td style="vertical-align:middle;padding-right:14px;">'
+        f'<div style="width:1px;height:24px;background:#29B78D;opacity:0.4;"></div></td>'
+        f'<td style="vertical-align:middle;">'
+        f'<span style="font-size:10px;font-weight:700;letter-spacing:0.14em;'
+        f'text-transform:uppercase;color:#29B78D;">Alertas DT</span></td>'
+        f'</tr>'
+        f'</table>'
+        f'</td>'
+        f'<td align="right" style="vertical-align:middle;font-size:11px;color:#7ca0b4;font-style:italic;">'
+        f'Nueva normativa</td>'
+        f'</tr>'
+        f'</table>'
+    )
+
     return (
         f'<!doctype html>\n<html lang="es">\n<head>'
         f'<meta charset="utf-8">'
@@ -388,22 +433,13 @@ def render_alert_email_html(alert: dict[str, Any]) -> str:
         f'<style>{_EMAIL_CSS}</style></head>\n<body>\n'
         f'<div class="email-wrapper">\n'
         f'<span style="display:none;visibility:hidden;opacity:0;height:0;width:0;overflow:hidden;">{preheader}</span>\n'
-        f'<div class="header">'
-        f'<div class="header-brand">'
-        f'<img class="header-logo" src="{EG_LOGO_LIGHT}" alt="External Group">'
-        f'<div class="header-divider"></div>'
-        f'<span class="header-tag">Alertas DT</span>'
-        f'</div>'
-        f'<span class="header-label">Nueva normativa</span>'
-        f'</div>\n'
+        f'{header_html}\n'
         f'<div class="accent-bar"></div>\n'
         f'<div class="doc-card">'
         f'<div class="doc-type">Nueva publicación · {category}</div>'
         f'<div class="doc-title">{title}</div>'
-        f'<div class="doc-meta">'
-        f'<span>{pub_date}</span><span>·</span>'
-        f'<span class="relevancia-badge">{relevance}</span>'
-        f'</div>'
+        f'<div class="doc-meta">{pub_date} · <span class="relevancia-badge">{relevance}</span></div>'
+        f'<div style="height:3px;background:#29B78D;margin-top:22px;"></div>'
         f'</div>\n'
         f'<div class="body">'
         f'{ai_notice}'
