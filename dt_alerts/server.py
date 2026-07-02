@@ -73,6 +73,13 @@ class AppHandler(BaseHTTPRequestHandler):
             )
         elif path == "/healthz":
             self.respond_json({"ok": True, "service": "dt-alertas"})
+        elif path == "/admin/api/subscribers/count":
+            if not self.is_admin():
+                self.respond_json({"error": "No autorizado."}, status=HTTPStatus.UNAUTHORIZED)
+                return
+            with db.connect(self.settings.database_path) as conn:
+                active = len(db.active_subscribers(conn))
+            self.respond_json({"active": active})
         elif path == "/admin/login":
             if self.settings.disable_admin_auth:
                 # Modo desarrollo: sin autenticación, vamos directo al panel.
@@ -216,13 +223,39 @@ class AppHandler(BaseHTTPRequestHandler):
         elif match := re.match(r"^/admin/alerts/(\d+)/(send|resend)$", path):
             self.require_admin()
             alert_id = int(match.group(1))
+            content_type = self.headers.get("Content-Type", "")
+            is_json = "application/json" in content_type or self.wants_json()
             with db.connect(self.settings.database_path) as conn:
-                count = dispatch_alert(conn, alert_id, self.settings)
-            if count:
-                msg = f"Alerta procesada para {count} suscriptor(es) activo(s)."
+                alert_check = conn.execute(
+                    "SELECT id FROM alerts WHERE id = ?", (alert_id,)
+                ).fetchone()
+                if not alert_check:
+                    if is_json:
+                        self.respond_json({"error": "Alerta no encontrada."}, status=HTTPStatus.NOT_FOUND)
+                    else:
+                        self.redirect_flash("/admin/alerts", "Alerta no encontrada.")
+                    return
+                active_subs = db.active_subscribers(conn)
+                if is_json and not active_subs:
+                    self.respond_json({"error": "No hay suscriptores activos."}, status=HTTPStatus.BAD_REQUEST)
+                    return
+                try:
+                    count = dispatch_alert(conn, alert_id, self.settings)
+                except Exception as exc:
+                    if is_json:
+                        self.respond_json({"success": False, "error": str(exc)}, status=HTTPStatus.INTERNAL_SERVER_ERROR)
+                    else:
+                        self.redirect_flash("/admin/alerts", f"Error al enviar: {exc}")
+                    return
+            if is_json:
+                self.respond_json({"success": True, "sent_count": count, "errors": []})
             else:
-                msg = "Sin envíos: no hay suscriptores activos o ya habían recibido la alerta."
-            self.redirect_flash("/admin/alerts", msg)
+                msg = (
+                    f"Alerta procesada para {count} suscriptor(es) activo(s)."
+                    if count else
+                    "Sin envíos: no hay suscriptores activos o ya habían recibido la alerta."
+                )
+                self.redirect_flash("/admin/alerts", msg)
         elif match := re.match(r"^/admin/alerts/(\d+)/test$", path):
             self.require_admin()
             alert_id = int(match.group(1))
@@ -2294,6 +2327,8 @@ def _alert_table_row(item: dict[str, Any]) -> str:
     cat_raw = item.get("category") or ""
     cat_trunc = (cat_raw[:20] + "…") if len(cat_raw) > 20 else cat_raw
 
+    title_js = h(title_raw).replace("'", "\\'")
+
     # Botón Ver
     ver_btn = (
         f'<a href="/admin/alerts/{alert_id}/preview-email" '
@@ -2301,24 +2336,37 @@ def _alert_table_row(item: dict[str, Any]) -> str:
         f'font-weight:600;background:#29B78D;color:#fff;text-decoration:none;">Ver</a>'
     )
 
-    # Botón Enviar prueba (inline form colapsable) — solo si no enviada
-    if status != "sent":
-        enviar_btn = (
-            f'<span style="display:inline-block;">'
-            f'<button onclick="this.parentNode.querySelector(\'form\').style.display=\'block\';this.style.display=\'none\';" '
-            f'style="padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;'
-            f'background:#F3F4F6;color:#374151;border:1px solid #D1D5DB;cursor:pointer;">Enviar</button>'
-            f'<form method="post" action="/admin/alerts/{alert_id}/test" '
-            f'style="display:none;margin-top:4px;display:none;">'
-            f'<input type="email" name="to" placeholder="correo@ejemplo.com" '
-            f'style="font-size:11px;padding:2px 6px;border:1px solid #D1D5DB;border-radius:3px;width:130px;">'
-            f'<button type="submit" '
-            f'style="margin-left:4px;padding:2px 8px;border-radius:3px;font-size:11px;'
-            f'background:#29B78D;color:#fff;border:none;cursor:pointer;">OK</button>'
-            f'</form></span>'
+    # Botón Prueba ▾ (inline form colapsable)
+    prueba_btn = (
+        f'<span style="display:inline-block;">'
+        f'<button onclick="this.parentNode.querySelector(\'form\').style.display=\'block\';this.style.display=\'none\';" '
+        f'style="padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;'
+        f'background:#F3F4F6;color:#374151;border:1px solid #D1D5DB;cursor:pointer;">Prueba ▾</button>'
+        f'<form method="post" action="/admin/alerts/{alert_id}/test" '
+        f'style="display:none;margin-top:4px;">'
+        f'<input type="email" name="to" placeholder="correo@ejemplo.com" '
+        f'style="font-size:11px;padding:2px 6px;border:1px solid #D1D5DB;border-radius:3px;width:130px;">'
+        f'<button type="submit" '
+        f'style="margin-left:4px;padding:2px 8px;border-radius:3px;font-size:11px;'
+        f'background:#29B78D;color:#fff;border:none;cursor:pointer;">OK</button>'
+        f'</form></span>'
+    )
+
+    # Botón Enviar a todos / badge Enviada
+    if status == "sent":
+        send_all_btn = (
+            f'<span id="send-status-{alert_id}" '
+            f'style="font-size:12px;color:#29B78D;font-weight:600;">✓ Enviada</span>'
         )
     else:
-        enviar_btn = ""
+        send_all_btn = (
+            f'<span id="send-status-{alert_id}">'
+            f'<button onclick="confirmSend({alert_id},\'{title_js}\')" '
+            f'style="padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;'
+            f'background:#EFF6FF;color:#1D4ED8;border:1px solid #BFDBFE;cursor:pointer;">'
+            f'✉ Enviar a todos</button>'
+            f'</span>'
+        )
 
     # Botón Eliminar
     delete_btn = (
@@ -2333,25 +2381,77 @@ def _alert_table_row(item: dict[str, Any]) -> str:
         f'<td style="font-family:monospace;font-size:12px;color:#6B7280;width:50px;padding:10px 8px;">{alert_id}</td>'
         f'<td style="padding:10px 8px;font-size:13px;" title="{h(title_raw)}">{h(title_trunc)}</td>'
         f'<td style="padding:10px 8px;font-size:12px;color:#6B7280;" title="{h(cat_raw)}">{h(cat_trunc)}</td>'
-        f'<td style="padding:10px 8px;">{_alert_status_badge(status)}</td>'
+        f'<td style="padding:10px 8px;" id="status-cell-{alert_id}">{_alert_status_badge(status)}</td>'
         f'<td style="padding:10px 8px;">{_alert_ia_badge(item)}</td>'
         f'<td style="padding:10px 8px;font-size:12px;color:#6B7280;white-space:nowrap;">{_fmt_short_date(item.get("created_at"))}</td>'
         f'<td style="padding:10px 8px;">'
         f'<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">'
-        f'{ver_btn}{enviar_btn}{delete_btn}'
+        f'{ver_btn}{prueba_btn}{send_all_btn}{delete_btn}'
         f'</div></td>'
         f'</tr>'
     )
 
 
-_DELETE_ALERT_JS = """
+_ALERTS_TABLE_JS = """
+<div id="send-modal" style="display:none;position:fixed;inset:0;background:rgba(0,0,0,.45);z-index:1000;align-items:center;justify-content:center;">
+  <div style="background:#fff;border-radius:12px;padding:28px 32px;max-width:420px;width:90%;box-shadow:0 8px 32px rgba(0,0,0,.18);">
+    <h3 id="modal-alert-title" style="font-size:16px;font-weight:700;color:#0A2231;margin-bottom:8px;"></h3>
+    <p style="font-size:14px;color:#374151;margin-bottom:6px;">
+      Se enviará a <strong id="modal-count">…</strong> suscriptores activos.
+    </p>
+    <p style="font-size:13px;color:#9CA3AF;margin-bottom:24px;">Esta acción no se puede deshacer.</p>
+    <div style="display:flex;gap:12px;justify-content:flex-end;">
+      <button onclick="closeModal()" style="padding:8px 18px;border-radius:6px;border:1px solid #D1D5DB;background:#fff;font-size:14px;cursor:pointer;">Cancelar</button>
+      <button id="modal-confirm" style="padding:8px 18px;border-radius:6px;border:none;background:#1D4ED8;color:#fff;font-size:14px;font-weight:600;cursor:pointer;">✉ Enviar ahora</button>
+    </div>
+  </div>
+</div>
 <script>
+var _activeCount = null;
+async function _loadCount() {
+  if (_activeCount !== null) return _activeCount;
+  try {
+    const r = await fetch('/admin/api/subscribers/count');
+    const d = await r.json();
+    _activeCount = d.active || 0;
+  } catch(e) { _activeCount = 0; }
+  return _activeCount;
+}
+function closeModal() {
+  document.getElementById('send-modal').style.display = 'none';
+}
+async function confirmSend(id, title) {
+  const count = await _loadCount();
+  document.getElementById('modal-alert-title').textContent = title;
+  document.getElementById('modal-count').textContent = count;
+  document.getElementById('modal-confirm').onclick = function() { sendToSubscribers(id, count); };
+  document.getElementById('send-modal').style.display = 'flex';
+}
+async function sendToSubscribers(id, count) {
+  closeModal();
+  const r = await fetch('/admin/alerts/' + id + '/send', {
+    method: 'POST',
+    headers: {'Content-Type': 'application/json'}
+  });
+  const data = await r.json();
+  if (data.success) {
+    const sc = document.getElementById('status-cell-' + id);
+    if (sc) sc.innerHTML = '<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;background:#29B78D;color:#fff;">Enviada</span>';
+    const ss = document.getElementById('send-status-' + id);
+    if (ss) ss.innerHTML = '<span style="font-size:12px;color:#29B78D;font-weight:600;">✓ Enviada a ' + data.sent_count + ' suscriptores</span>';
+  } else {
+    alert('Error: ' + (data.error || 'Error desconocido'));
+  }
+}
 async function deleteAlert(id) {
   if (!confirm('\\u00BFEliminar alerta #' + id + '? No se puede deshacer.')) return;
   const r = await fetch('/admin/alerts/' + id + '/delete', {method:'POST'});
   if (r.ok) { const row = document.getElementById('alert-row-' + id); if (row) row.remove(); }
   else alert('Error al eliminar');
 }
+document.getElementById('send-modal').addEventListener('click', function(e) {
+  if (e.target === this) closeModal();
+});
 </script>
 """
 
@@ -2401,7 +2501,7 @@ def render_alerts(
         f'<p>{len(alerts)} alerta{"s" if len(alerts) != 1 else ""}</p>'
         f'</div>'
         f'<section class="eg-card eg-panel">{table}</section>'
-        f'{_DELETE_ALERT_JS}'
+        f'{_ALERTS_TABLE_JS}'
     )
 
 
@@ -2504,7 +2604,7 @@ def render_alerts_table(
         f'{table_html}'
         f'{pagination}'
         f'</section>'
-        f'{_DELETE_ALERT_JS}'
+        f'{_ALERTS_TABLE_JS}'
     )
 
 

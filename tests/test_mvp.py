@@ -2457,5 +2457,108 @@ class AlertsTableViewTestCase(unittest.TestCase):
                 server.shutdown()
 
 
+class AlertsSendToSubscribersTestCase(unittest.TestCase):
+    """Tests para feat/alerts-send-to-subscribers."""
+
+    def _start_server(self, tmp_path: Path):
+        import http.client, threading
+        from http.server import ThreadingHTTPServer
+        from dt_alerts.server import AppHandler
+
+        class _H(AppHandler):
+            pass
+
+        db.init_db(tmp_path)
+        _H.settings = get_settings().__class__(
+            **{**get_settings().__dict__, "database_path": str(tmp_path), "disable_admin_auth": True}
+        )
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+        t = threading.Thread(target=server.serve_forever)
+        t.daemon = True
+        t.start()
+        port = server.server_address[1]
+        return server, port
+
+    def _insert_alert(self, path: Path) -> int:
+        with db.connect(path) as conn:
+            doc_id = conn.execute(
+                "INSERT INTO documents (title,category,canonical_url,source_url,dt_article_id,publication_date,status,detected_at)"
+                " VALUES (?,?,?,?,?,?,?,datetime('now'))",
+                ("ORD. Test", "Dictámenes", "https://example.com/1", "https://example.com/1", "art1", "01/01/2026", "processed"),
+            ).lastrowid
+            conn.execute(
+                "INSERT INTO alerts (document_id,summary,key_points_json,practical_impacts_json,relevance,status,created_at,updated_at)"
+                " VALUES (?,?,?,?,?,?,datetime('now'),datetime('now'))",
+                (doc_id, "Resumen", "[]", "[]", "alto", "pending_review"),
+            )
+            conn.commit()
+            return conn.execute("SELECT id FROM alerts WHERE document_id=?", (doc_id,)).fetchone()[0]
+
+    def _post_json(self, port: int, path: str):
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("POST", path, headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        body = resp.read()
+        return resp.status, body
+
+    def test_alerts_send_to_subscribers_success(self):
+        import json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.sqlite3"
+            # Insertar un suscriptor activo para que la validación no rechace
+            db.init_db(path)
+            with db.connect(path) as conn:
+                db.upsert_subscriber(
+                    conn, email="sub@example.com", whatsapp=None,
+                    notify_email=True, notify_whatsapp=False,
+                    source_page="test", consent=True,
+                )
+            server, port = self._start_server(path)
+            try:
+                alert_id = self._insert_alert(path)
+                with mock.patch("dt_alerts.server.dispatch_alert", return_value=1):
+                    status, body = self._post_json(port, f"/admin/alerts/{alert_id}/send")
+                self.assertEqual(status, 200)
+                data = _json.loads(body)
+                self.assertTrue(data.get("success"))
+                self.assertIn("sent_count", data)
+                self.assertEqual(data["sent_count"], 1)
+            finally:
+                server.shutdown()
+
+    def test_alerts_send_nonexistent_returns_404(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.sqlite3"
+            server, port = self._start_server(path)
+            try:
+                status, _ = self._post_json(port, "/admin/alerts/99999/send")
+                self.assertEqual(status, 404)
+            finally:
+                server.shutdown()
+
+    def test_subscribers_count_endpoint(self):
+        import http.client, json as _json
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "test.sqlite3"
+            server, port = self._start_server(path)
+            try:
+                with db.connect(path) as conn:
+                    db.upsert_subscriber(
+                        conn, email="a@example.com", whatsapp=None,
+                        notify_email=True, notify_whatsapp=False,
+                        source_page="test", consent=True,
+                    )
+                conn_h = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+                conn_h.request("GET", "/admin/api/subscribers/count")
+                resp = conn_h.getresponse()
+                data = _json.loads(resp.read())
+                self.assertEqual(resp.status, 200)
+                self.assertIn("active", data)
+                self.assertEqual(data["active"], 1)
+            finally:
+                server.shutdown()
+
+
 if __name__ == "__main__":
     unittest.main()
