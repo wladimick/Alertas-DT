@@ -55,16 +55,14 @@ def compute_input_hash(text: str) -> str:
 
 
 def is_ai_runtime_enabled(settings: Settings, app_settings: dict[str, str]) -> bool:
-    """Interruptor efectivo: AI_ENABLED=false bloquea siempre; panel solo controla si .env permite."""
-    if not bool(getattr(settings, "ai_enabled", False)):
-        return False
-
+    """DB (ai_runtime_enabled) es autoritativa. AI_ENABLED en .env es solo valor inicial."""
     override = (app_settings.get("ai_runtime_enabled") or "").strip().lower()
     if override in {"0", "false", "no", "n", "off"}:
         return False
     if override in {"1", "true", "yes", "y", "on"}:
         return True
-    return True
+    # Sin valor en DB: usar AI_ENABLED del entorno como fallback
+    return bool(getattr(settings, "ai_enabled", False))
 
 
 # --------------------------------------------------------------------------

@@ -424,6 +424,18 @@ class AppHandler(BaseHTTPRequestHandler):
             self.require_admin()
             msg = _test_wordpress_connection(self.settings)
             self.redirect_flash("/admin/settings", msg)
+        elif path == "/admin/settings/ai-toggle":
+            self.require_admin()
+            if not self.settings.ai_api_key:
+                self.respond_json({"error": "API key no configurada."}, status=HTTPStatus.BAD_REQUEST)
+                return
+            payload = self.read_payload()
+            enabled = payload.get("enabled")
+            if not isinstance(enabled, bool):
+                enabled = str(enabled).strip().lower() in {"1", "true", "yes", "on"}
+            with db.connect(self.settings.database_path) as conn:
+                db.set_setting(conn, "ai_runtime_enabled", "true" if enabled else "false")
+            self.respond_json({"success": True, "enabled": enabled})
         elif path == "/admin/settings/ai-enable":
             self.require_admin()
             with db.connect(self.settings.database_path) as conn:
@@ -1702,18 +1714,16 @@ def render_settings(settings: Settings) -> str:
     ai_provider = settings.ai_provider
     ai_env_enabled = bool(getattr(settings, "ai_enabled", False))
     ai_runtime_raw = (app_cfg.get("ai_runtime_enabled") or "").strip().lower()
-    if not ai_env_enabled:
-        ai_runtime_enabled = False
-        ai_runtime_source = ".env bloqueado"
-    elif ai_runtime_raw in {"0", "false", "no", "n", "off"}:
+    if ai_runtime_raw in {"0", "false", "no", "n", "off"}:
         ai_runtime_enabled = False
         ai_runtime_source = "panel"
     elif ai_runtime_raw in {"1", "true", "yes", "y", "on"}:
         ai_runtime_enabled = True
         ai_runtime_source = "panel"
     else:
-        ai_runtime_enabled = True
-        ai_runtime_source = ".env"
+        # Sin valor en DB: usar AI_ENABLED del entorno como fallback
+        ai_runtime_enabled = ai_env_enabled
+        ai_runtime_source = ".env (inicial)"
 
     with db.connect(settings.database_path) as ai_conn:
         ai_usage = db.get_ai_usage_status(
@@ -1746,25 +1756,54 @@ def render_settings(settings: Settings) -> str:
 
     ai_last_test = app_cfg.get("ai_last_test", "")
 
-    if not ai_env_enabled:
-        ai_toggle_btn = (
-            f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="button" disabled>'
-            f'{icon("pause", 14)}<span>IA bloqueada por .env</span></button>'
-        )
-    else:
-        ai_toggle_btn = (
-            f"""<form method="post" action="/admin/settings/ai-disable" style="display:inline">
-    <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
-      {icon("pause", 14)}<span>Apagar IA</span>
-    </button>
-  </form>"""
-            if ai_runtime_enabled
-            else f"""<form method="post" action="/admin/settings/ai-enable" style="display:inline">
-    <button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">
-      {icon("play", 14)}<span>Activar IA</span>
-    </button>
-  </form>"""
-        )
+    has_api_key = bool(settings.ai_api_key)
+    _toggle_checked = "checked" if ai_runtime_enabled else ""
+    _toggle_disabled = "disabled" if not has_api_key else ""
+    _toggle_label = "Activa" if ai_runtime_enabled else "Inactiva"
+    _no_key_note = (
+        '<span id="ai-toggle-note" style="font-size:12px;color:#9CA3AF;margin-left:8px;">'
+        'Sin API key — configura AI_API_KEY para habilitar</span>'
+        if not has_api_key else
+        '<span id="ai-toggle-note" style="font-size:12px;color:#9CA3AF;margin-left:8px;display:none;"></span>'
+    )
+    ai_toggle_btn = f"""<style>
+.eg-toggle{{display:flex;align-items:center;gap:10px;cursor:pointer;}}
+.eg-toggle input{{display:none;}}
+.eg-toggle-slider{{width:44px;height:24px;border-radius:12px;background:#8EA1AA;position:relative;transition:background 0.2s;flex-shrink:0;}}
+.eg-toggle-slider::after{{content:'';position:absolute;width:18px;height:18px;border-radius:50%;background:#fff;top:3px;left:3px;transition:transform 0.2s;}}
+input:checked+.eg-toggle-slider{{background:#29B78D;}}
+input:checked+.eg-toggle-slider::after{{transform:translateX(20px);}}
+input:disabled+.eg-toggle-slider{{opacity:0.4;cursor:not-allowed;}}
+</style>
+<div style="display:flex;align-items:center;gap:0;flex-wrap:wrap;">
+<label class="eg-toggle" title="Activar/desactivar IA">
+  <input type="checkbox" id="ai-toggle" {_toggle_checked} {_toggle_disabled}
+    onchange="toggleAI(this.checked)">
+  <span class="eg-toggle-slider"></span>
+  <span class="eg-toggle-label" id="ai-toggle-label" style="font-size:13px;font-weight:600;color:var(--eg-text);">{_toggle_label}</span>
+</label>
+{_no_key_note}
+</div>
+<script>
+async function toggleAI(enabled) {{
+  const label = document.getElementById('ai-toggle-label');
+  const note = document.getElementById('ai-toggle-note');
+  const r = await fetch('/admin/settings/ai-toggle', {{
+    method: 'POST',
+    headers: {{'Content-Type': 'application/json'}},
+    body: JSON.stringify({{enabled}})
+  }});
+  const data = await r.json();
+  if (data.success) {{
+    label.textContent = enabled ? 'Activa' : 'Inactiva';
+    if (note) note.style.display = 'none';
+  }} else {{
+    document.getElementById('ai-toggle').checked = !enabled;
+    if (note) {{ note.textContent = data.error || 'Error al cambiar estado IA'; note.style.display = ''; }}
+    else alert(data.error || 'Error al cambiar estado IA');
+  }}
+}}
+</script>"""
 
     ai_test_btn = ""
     if ai_runtime_enabled and ai_provider not in ("disabled", "") and settings.ai_api_key and not ai_limit_reached:
@@ -1919,10 +1958,11 @@ def render_settings(settings: Settings) -> str:
 {_ai_warning_banner}
 <section class="eg-card eg-panel">
   <h2>{icon("cpu", 17)} Conexion IA</h2>
+  <div style="margin-bottom:16px;">{ai_toggle_btn}</div>
   <dl class="eg-kv eg-kv--2col">
     <dt>Estado</dt><dd>{ai_estado}</dd>
-    <dt>Interruptor efectivo</dt><dd class="mono">{h(str(ai_runtime_enabled).lower())} · {h(ai_runtime_source)}</dd>
-    <dt>AI_ENABLED (.env)</dt><dd class="mono">{h(str(settings.ai_enabled).lower())}</dd>
+    <dt>Fuente interruptor</dt><dd class="mono">{h(ai_runtime_source)}</dd>
+    <dt>AI_ENABLED (.env, inicial)</dt><dd class="mono">{h(str(settings.ai_enabled).lower())}</dd>
     <dt>AI_PROVIDER</dt><dd class="mono">{h(ai_provider or 'disabled')}</dd>
     <dt>AI_MODEL</dt><dd class="mono">{h(settings.ai_model or '—')}</dd>
     <dt>AI_BASE_URL</dt><dd class="mono">{h(settings.ai_base_url or '—')}</dd>
@@ -1950,7 +1990,7 @@ def render_settings(settings: Settings) -> str:
     Costo estimado referencial. Puede variar según contrato Azure, modelo y tipo de cambio.
     Configurable con AI_INPUT_PRICE_PER_1M_USD, AI_OUTPUT_PRICE_PER_1M_USD, AI_USD_CLP_RATE.
   </p>
-  <div class="eg-actions" style="margin-top:14px">{ai_toggle_btn}{ai_test_btn}</div>
+  <div class="eg-actions" style="margin-top:14px">{ai_test_btn}</div>
 </section>
 
 {_render_ai_usage_table(recent_ai_logs, settings)}

@@ -2560,6 +2560,95 @@ class AlertsSendToSubscribersTestCase(unittest.TestCase):
                 server.shutdown()
 
 
+class AIToggleFromPanelTestCase(unittest.TestCase):
+    """Tests para feat/ai-toggle-from-panel."""
+
+    def _start_server(self, tmp_path: Path, **settings_overrides):
+        import threading
+        from http.server import ThreadingHTTPServer
+        from dt_alerts.server import AppHandler
+
+        class _H(AppHandler):
+            pass
+
+        db.init_db(tmp_path)
+        base = get_settings().__class__(
+            **{**get_settings().__dict__,
+               "database_path": str(tmp_path),
+               "disable_admin_auth": True,
+               **settings_overrides}
+        )
+        _H.settings = base
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+        t = threading.Thread(target=server.serve_forever)
+        t.daemon = True
+        t.start()
+        return server, server.server_address[1]
+
+    def _post_json(self, port: int, path: str, body: dict):
+        import http.client, json as _json
+        data = _json.dumps(body).encode()
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=5)
+        conn.request("POST", path, body=data,
+                     headers={"Content-Type": "application/json"})
+        resp = conn.getresponse()
+        return resp.status, _json.loads(resp.read())
+
+    def test_ai_toggle_enable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            server, port = self._start_server(path, ai_api_key="sk-test-key")
+            try:
+                status, data = self._post_json(port, "/admin/settings/ai-toggle", {"enabled": True})
+                self.assertEqual(status, 200)
+                self.assertTrue(data.get("success"))
+                self.assertTrue(data.get("enabled"))
+                with db.connect(path) as conn:
+                    val = db.get_setting(conn, "ai_runtime_enabled")
+                self.assertEqual(val, "true")
+            finally:
+                server.shutdown()
+
+    def test_ai_toggle_disable(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            server, port = self._start_server(path, ai_api_key="sk-test-key")
+            try:
+                status, data = self._post_json(port, "/admin/settings/ai-toggle", {"enabled": False})
+                self.assertEqual(status, 200)
+                self.assertTrue(data.get("success"))
+                self.assertFalse(data.get("enabled"))
+                with db.connect(path) as conn:
+                    val = db.get_setting(conn, "ai_runtime_enabled")
+                self.assertEqual(val, "false")
+            finally:
+                server.shutdown()
+
+    def test_ai_toggle_without_api_key(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            server, port = self._start_server(path, ai_api_key="")
+            try:
+                status, data = self._post_json(port, "/admin/settings/ai-toggle", {"enabled": True})
+                self.assertEqual(status, 400)
+                self.assertIn("error", data)
+            finally:
+                server.shutdown()
+
+    def test_summarizer_respects_db_toggle(self):
+        from dt_alerts.summarizer import is_ai_runtime_enabled
+        settings_on = settings_for(Path(":memory:"), ai_enabled=True, ai_api_key="sk-test")
+        settings_off_env = settings_for(Path(":memory:"), ai_enabled=False, ai_api_key="sk-test")
+        # DB dice false → IA desactivada sin importar AI_ENABLED
+        self.assertFalse(is_ai_runtime_enabled(settings_on, {"ai_runtime_enabled": "false"}))
+        # DB dice true → IA activa
+        self.assertTrue(is_ai_runtime_enabled(settings_on, {"ai_runtime_enabled": "true"}))
+        # Sin valor en DB, ai_enabled=False → usa .env como fallback → False
+        self.assertFalse(is_ai_runtime_enabled(settings_off_env, {}))
+        # Sin valor en DB, ai_enabled=True → usa .env como fallback → True
+        self.assertTrue(is_ai_runtime_enabled(settings_on, {}))
+
+
 class GenerateVsRegenerateBtnTestCase(unittest.TestCase):
     """Tests para feat/generate-vs-regenerate-btn."""
 
