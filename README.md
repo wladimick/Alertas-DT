@@ -1,13 +1,13 @@
-# Alertas DT
+# Alertas DT + SII
 
-App Python (estándar + SQLite) que monitorea normativa de la Dirección del Trabajo,
+App Python (estándar + SQLite) que monitorea normativa de la Dirección del Trabajo y del Servicio de Impuestos Internos,
 genera resúmenes orientados a contadores y empresas, y envía alertas por email.
 Se integra con WordPress mediante un **plugin bridge** que captura suscriptores en el
 sitio público y los sincroniza a la app local por API REST privada. Diseño visual basado
 en el sistema **External Group**.
 
-> **Estado:** MVP funcional para revisión interna. No vender como 100% productivo.
-> WhatsApp, pagos y planes comerciales quedan reservados para fases futuras.
+> **Estado:** piloto funcional para revisión interna. No vender como 100% productivo.
+> WhatsApp queda preparado con API Business y solo envía si se configuran credenciales.
 
 ## Arquitectura recomendada
 
@@ -18,7 +18,7 @@ WordPress público
               ↓
 App Python local (computador del cliente)
   ├─ Sincroniza suscriptores ← WordPress
-  ├─ Monitorea Dirección del Trabajo
+  ├─ Monitorea Dirección del Trabajo + Servicio de Impuestos Internos
   ├─ Genera alertas (IA opcional + fallback)
   └─ Envía emails con SendGrid
 ```
@@ -30,14 +30,14 @@ router. Solo WordPress es público.
 
 ---
 
-## Estado del MVP
+## Estado del piloto
 
 **Qué funciona hoy**
 
 - Landing pública con diseño External Group.
 - Suscripción por **email** (validación, consentimiento obligatorio, sin duplicados).
 - Panel admin protegido por token: métricas reales, suscriptores, documentos, alertas y jobs.
-- Scraper/monitor DT por URL canónica `w3-article-XXXXX.html`, robusto ante fallas por fuente.
+- Scraper/monitor DT + SII para dictámenes, ordinarios, circulares, resoluciones y jurisprudencia administrativa, con deduplicación por URL/ID oficial y tolerancia a fallas por fuente.
 - Generación de alertas con resumen, puntos clave, impacto práctico y relevancia (IA opcional + fallback local).
 - Vista previa de email (HTML + texto) desde el admin.
 - Envío transaccional preparado con **SendGrid** y **modo simulado/console** seguro.
@@ -45,7 +45,6 @@ router. Solo WordPress es público.
 
 **Qué NO está activo en esta fase**
 
-- **WhatsApp** (reservado para fase futura; oculto en el formulario).
 - Pagos y planes comerciales.
 - Migración a Postgres (se usa SQLite).
 - Cron productivo externo (si no se configura, el worker interno corre cada N horas).
@@ -100,7 +99,7 @@ Para envío real en Render:
 ```env
 EMAIL_PROVIDER=sendgrid
 SENDGRID_API_KEY=...
-EMAIL_FROM=alertasdt@externalgroup.cl
+EMAIL_FROM=alertassii@externalgroup.cl
 ```
 
 (No se incluyen credenciales reales en el repositorio; se definen solo en Render.)
@@ -124,7 +123,7 @@ Si se usa SQLite en Render, configurar `DATABASE_PATH` apuntando a una ruta pers
 (el mount del disco), por ejemplo:
 
 ```env
-DATABASE_PATH=/var/data/dt_alertas.sqlite3
+DATABASE_PATH=/var/data/alertas_normativas.sqlite3
 ```
 
 Sin disco persistente ni base externa, los datos se reinician al redeploy o restart del
@@ -162,7 +161,7 @@ GET   /admin/alerts             Alertas
 GET   /admin/jobs               Monitoreo (historial de jobs)
 GET   /admin/alerts/{id}/preview-email   Vista previa del email
 POST  /api/subscribe            Alta/actualización de suscriptor
-POST  /api/jobs/check-dt        Ejecuta el monitoreo (requiere X-Job-Token)
+POST  /api/jobs/check-normative Ejecuta el monitoreo completo (requiere X-Job-Token)
 POST  /admin/subscribers/{id}/pause|reactivate
 POST  /admin/documents/{id}/regenerate|ignore
 POST  /admin/alerts/{id}/ready|send|test
@@ -184,9 +183,16 @@ DISABLE_ADMIN_AUTH=False
 EMAIL_PROVIDER=console        # console | sendgrid | resend | smtp
 SENDGRID_API_KEY=
 EMAIL_FROM=
-EMAIL_FROM_NAME=Alertas DT
+EMAIL_FROM_NAME=Alertas DT + SII
 EMAIL_REPLY_TO=
 TEST_EMAIL_TO=
+
+# WhatsApp Business Cloud API
+WHATSAPP_ENABLED=false
+WHATSAPP_PHONE_NUMBER_ID=
+WHATSAPP_ACCESS_TOKEN=
+WHATSAPP_TEMPLATE_NAME=alerta_normativa
+WHATSAPP_LANGUAGE=es
 
 # IA (opcional). Sin clave o con disabled, el resumen usa fallback local y queda pending_review.
 AI_PROVIDER=disabled           # disabled | openai | azure
@@ -291,8 +297,8 @@ Ningún correo real sale sin credenciales explícitas.
    ```env
    EMAIL_PROVIDER=sendgrid
    SENDGRID_API_KEY=            # se define en Render, no en el código
-   EMAIL_FROM=alertasdt@externalgroup.cl
-   EMAIL_FROM_NAME=Alertas DT
+   EMAIL_FROM=alertassii@externalgroup.cl
+   EMAIL_FROM_NAME=Alertas DT + SII
    EMAIL_REPLY_TO=contacto@externalgroup.cl
    TEST_EMAIL_TO=
    ```
@@ -322,7 +328,7 @@ python -m dt_alerts.worker
 O por HTTP:
 
 ```bash
-curl -X POST http://localhost:8000/api/jobs/check-dt -H "X-Job-Token: <JOB_TOKEN>"
+curl -X POST http://localhost:8000/api/jobs/check-normative -H "X-Job-Token: <JOB_TOKEN>"
 ```
 
 > Las alertas nuevas quedan **pendientes de revisión**: el envío a suscriptores es
@@ -339,7 +345,7 @@ sin exponer la app local y permite sincronizarlos al computador del cliente.
 
 1. Sube `wordpress/alertas-dt-bridge/` a `wp-content/plugins/`.
 2. Activa el plugin en WordPress → Plugins.
-3. Ve a **Alertas DT** en el menú lateral de WordPress.
+3. Ve a **Alertas DT + SII** en el menú lateral de WordPress.
 4. Copia el shortcode y pégalo en una página:
 
    ```
@@ -382,7 +388,7 @@ Autenticación: `Authorization: Bearer TOKEN`
 python -m unittest
 ```
 
-Cubren: parseo del listado DT, suscripción (consentimiento, email inválido, dedup/
+Cubren: parseo del listado SII, suscripción (consentimiento, email inválido, dedup/
 actualización), auth admin por defecto, render de email HTML/texto y asunto, modos de
 envío (console/sendgrid sin clave) y robustez del job (sin documentos / error de fuente
 / duplicados).
@@ -390,4 +396,4 @@ envío (console/sendgrid sin clave) y robustez del job (sin documentos / error d
 ## Aviso
 
 El resumen es informativo y no reemplaza la revisión profesional ni la lectura del
-documento oficial de la Dirección del Trabajo.
+documento oficial de la DT o del SII.

@@ -2,6 +2,7 @@ from __future__ import annotations
 
 import hashlib
 import io
+import json
 import re
 import urllib.error
 import urllib.parse
@@ -14,7 +15,23 @@ from typing import Iterable
 
 ARTICLE_RE = re.compile(r"w3-article-(\d+)\.html", re.IGNORECASE)
 PDF_RE = re.compile(r"\.pdf($|[?#])", re.IGNORECASE)
-USER_AGENT = "DT-Alertas-Contadores-MVP/0.1 (+https://example.com)"
+USER_AGENT = "Alertas-Normativas-Contadores/0.1 (+https://example.com)"
+SII_JURISPRUDENCE_API = "https://www3.sii.cl/getPublicacionesCTByMateria"
+SII_MONTHS = {
+    "enero": "01",
+    "febrero": "02",
+    "marzo": "03",
+    "abril": "04",
+    "mayo": "05",
+    "junio": "06",
+    "julio": "07",
+    "agosto": "08",
+    "septiembre": "09",
+    "setiembre": "09",
+    "octubre": "10",
+    "noviembre": "11",
+    "diciembre": "12",
+}
 
 # IDs de los contenedores que contienen el cuerpo real del documento DT.
 # Excluyen menús, nav, breadcrumb y footer que el sitio inyecta en el <body>.
@@ -67,7 +84,7 @@ def fetch_bytes(url: str, timeout: int = 30, max_bytes: int = 8_000_000) -> byte
     with urllib.request.urlopen(request, timeout=timeout) as response:
         raw = response.read(max_bytes + 1)
     if len(raw) > max_bytes:
-        raise ValueError("El PDF supera el tamaño máximo permitido para el MVP.")
+        raise ValueError("El PDF supera el tamaño máximo permitido para el piloto.")
     return raw
 
 
@@ -88,6 +105,116 @@ def canonical_article_url(base_url: str, href: str) -> str:
     absolute = urllib.parse.urljoin(base_url, href)
     parsed = urllib.parse.urlparse(absolute)
     return urllib.parse.urlunparse((parsed.scheme, parsed.netloc, parsed.path, "", "", ""))
+
+
+def stable_document_id(prefix: str, value: str) -> str:
+    parsed = urllib.parse.urlparse(value)
+    basename = parsed.path.rsplit("/", 1)[-1] or value
+    slug = re.sub(r"[^a-zA-Z0-9]+", "-", basename.rsplit(".", 1)[0]).strip("-").lower()
+    if not slug:
+        slug = hashlib.sha1(value.encode("utf-8")).hexdigest()[:12]
+    return f"{prefix}-{slug}"[:120]
+
+
+def parse_sii_date_from_title(title: str) -> str | None:
+    match = re.search(
+        r"del\s+(\d{1,2})\s+de\s+([A-Za-záéíóúñ]+)\s+del\s+(\d{4})",
+        title,
+        re.IGNORECASE,
+    )
+    if not match:
+        return None
+    day, month_name, year = match.groups()
+    month = SII_MONTHS.get(month_name.lower())
+    if not month:
+        return None
+    return f"{int(day):02d}/{month}/{year}"
+
+
+def parse_sii_listing(html: str, source_url: str, category: str) -> list[ScrapedDocument]:
+    docs: list[ScrapedDocument] = []
+    seen: set[str] = set()
+    pattern = re.compile(
+        r"<h5[^>]*>\s*<a\s+href=['\"]([^'\"]+)['\"][^>]*>(.*?)</a>\s*</h5>\s*"
+        r"(?:<p[^>]*>(.*?)</p>)?\s*(?:<span[^>]*>(.*?)</span>)?",
+        re.IGNORECASE | re.DOTALL,
+    )
+    for match in pattern.finditer(html):
+        href, title_html, abstract_html, source_html = match.groups()
+        canonical_url = canonical_article_url(source_url, href)
+        if canonical_url in seen:
+            continue
+        seen.add(canonical_url)
+        title = normalize_text(re.sub(r"<[^>]+>", " ", title_html))
+        abstract = normalize_text(re.sub(r"<[^>]+>", " ", abstract_html or ""))
+        source = normalize_text(re.sub(r"<[^>]+>", " ", source_html or ""))
+        if source:
+            abstract = f"{abstract} ({source})" if abstract else source
+        docs.append(
+            ScrapedDocument(
+                dt_article_id=stable_document_id("sii", canonical_url),
+                canonical_url=canonical_url,
+                source_url=source_url,
+                category=category,
+                title=title or "Documento SII",
+                publication_date=parse_sii_date_from_title(title),
+                abstract=abstract or None,
+                pdf_url=canonical_url if PDF_RE.search(canonical_url) else None,
+            )
+        )
+    return docs
+
+
+def fetch_sii_jurisprudence(source: dict[str, str], limit: int = 25) -> list[ScrapedDocument]:
+    payload = json.dumps(
+        {"key": source.get("key", "RENTA"), "year": str(source.get("year", ""))}
+    ).encode("utf-8")
+    request = urllib.request.Request(
+        SII_JURISPRUDENCE_API,
+        data=payload,
+        headers={"User-Agent": USER_AGENT, "Content-Type": "application/json"},
+        method="POST",
+    )
+    with urllib.request.urlopen(request, timeout=25) as response:
+        rows = json.loads(response.read().decode("utf-8"))
+
+    docs: list[ScrapedDocument] = []
+    for item in rows[:limit]:
+        pub_key = str(item.get("pubKey") or item.get("soliKey") or item.get("idBlobArchPublica") or "")
+        number = str(item.get("pubNumOficio") or "").strip()
+        kind = str(item.get("tipoArchPublica") or "Oficio").strip()
+        title = f"{kind} N° {number}".strip()
+        legal = normalize_text(item.get("pubLegal"))
+        summary = normalize_text(item.get("pubResumen"))
+        abstract = " - ".join(part for part in [legal, summary] if part)
+        canonical_url = f"{source['url']}#pubKey={urllib.parse.quote(pub_key)}"
+        detail_text = "\n".join(
+            part
+            for part in [
+                f"{title}.",
+                f"Fecha de publicación: {item.get('pubFechaPubli') or item.get('pubFecha') or 'no informada'}.",
+                f"Materia: {legal}." if legal else "",
+                summary,
+            ]
+            if part
+        )
+        docs.append(
+            ScrapedDocument(
+                dt_article_id=stable_document_id("sii-jadm", pub_key or canonical_url),
+                canonical_url=canonical_url,
+                source_url=source["url"],
+                category=source["category"],
+                title=title or "Jurisprudencia administrativa SII",
+                publication_date=item.get("pubFechaPubli") or item.get("pubFecha"),
+                abstract=abstract or None,
+                detail_text=detail_text,
+                pdf_url=None,
+                content_hash=content_hash(
+                    [pub_key, title, item.get("pubFechaPubli") or "", abstract, detail_text]
+                ),
+            )
+        )
+    return docs
 
 
 class ListingParser(HTMLParser):
@@ -267,7 +394,13 @@ def parse_listing(html: str, source_url: str, category: str) -> list[ScrapedDocu
 
 
 def fetch_listing(source: dict[str, str], limit: int = 25) -> list[ScrapedDocument]:
+    if source.get("type") == "sii_jurisprudence":
+        return fetch_sii_jurisprudence(source, limit=limit)
+
     html = fetch_text(source["url"])
+    if source.get("type") == "sii_listing":
+        return parse_sii_listing(html, source["url"], source["category"])[:limit]
+
     docs = parse_listing(html, source["url"], source["category"])
     return docs[:limit]
 
@@ -301,6 +434,24 @@ def _extract_pdf_text(pdf_url: str, timeout: int = 30) -> str:
 
 
 def enrich_document_detail(doc: ScrapedDocument, include_pdf_text: bool = True) -> ScrapedDocument:
+    if doc.pdf_url and PDF_RE.search(doc.pdf_url):
+        body_text = _extract_pdf_text(doc.pdf_url) if include_pdf_text else ""
+        doc.detail_text = truncate_text(body_text, 24_000) or doc.abstract
+        doc.content_hash = content_hash(
+            [
+                doc.dt_article_id,
+                doc.title,
+                doc.publication_date or "",
+                doc.abstract or "",
+                doc.detail_text or "",
+                doc.pdf_url or "",
+            ]
+        )
+        return doc
+
+    if doc.detail_text and doc.content_hash:
+        return doc
+
     html = fetch_text(doc.canonical_url)
     parser = DetailParser(doc.canonical_url)
     parser.feed(html)

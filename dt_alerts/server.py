@@ -22,6 +22,7 @@ from .notifier import (
 )
 from .worker import regenerate_alert, run_check, scheduler_loop
 from . import wordpress_sync
+from .sources import source_context, source_kind
 from .summarizer import _generate_and_save as _ai_generate_direct
 from .notifier import generate_executive_summary_html, generate_detailed_summary_html, _build_attachments
 
@@ -95,9 +96,7 @@ class AppHandler(BaseHTTPRequestHandler):
                 self.redirect("/admin/login")
                 return
             flash = query.get("flash", [""])[0]
-            status_filter = query.get("status", [""])[0]
-            page = max(1, int(query.get("page", ["1"])[0]) if query.get("page", ["1"])[0].isdigit() else 1)
-            self.respond_html(render_admin(path, self.settings, flash=flash, status_filter=status_filter, page=page))
+            self.respond_html(render_admin(path, self.settings, flash=flash, query=query))
         elif match := re.match(r"^/admin/alerts/(\d+)/preview-email$", path):
             if not self.is_admin():
                 self.redirect("/admin/login")
@@ -137,11 +136,17 @@ class AppHandler(BaseHTTPRequestHandler):
                     render_login(error="Token inválido. Verifica e inténtalo de nuevo.", settings=self.settings),
                     status=HTTPStatus.UNAUTHORIZED,
                 )
-        elif path == "/api/jobs/check-dt":
+        elif path in {"/api/jobs/check-normative", "/api/jobs/check-sii", "/api/jobs/check-dt"}:
             if not self.is_job_authorized():
                 self.respond_json({"error": "No autorizado."}, status=HTTPStatus.UNAUTHORIZED)
                 return
-            result = run_check(self.settings)
+            query = urllib.parse.parse_qs(parsed.query)
+            source_filter = query.get("source", ["all"])[0]
+            if path == "/api/jobs/check-dt":
+                source_filter = "dt"
+            elif path == "/api/jobs/check-sii":
+                source_filter = "sii"
+            result = run_check(self.settings, source_filter=source_filter)
             self.respond_json(result)
         elif match := re.match(r"^/admin/subscribers/(\d+)/(pause|reactivate)$", path):
             self.require_admin()
@@ -409,13 +414,13 @@ class AppHandler(BaseHTTPRequestHandler):
             result = send_notifier_email(
                 self.settings,
                 to=to_email,
-                subject="[Prueba SendGrid] Alertas DT - Configuracion verificada",
+                subject="[Prueba SendGrid] Alertas DT + SII - Configuracion verificada",
                 html_body=(
-                    "<p>Prueba de configuracion SendGrid desde Alertas DT.</p>"
+                    "<p>Prueba de configuracion SendGrid desde Alertas DT + SII.</p>"
                     "<p>Si recibes este correo, el envio de alertas por email funciona correctamente.</p>"
                 ),
                 text_body=(
-                    "Prueba de configuracion SendGrid desde Alertas DT.\n"
+                    "Prueba de configuracion SendGrid desde Alertas DT + SII.\n"
                     "Si recibes este correo, el envio de alertas por email funciona correctamente."
                 ),
             )
@@ -472,9 +477,9 @@ class AppHandler(BaseHTTPRequestHandler):
                 subscriber = db.upsert_subscriber(
                     conn,
                     email=payload.get("email", ""),
-                    whatsapp=None,
+                    whatsapp=payload.get("phone") or None,
                     notify_email=True,
-                    notify_whatsapp=False,
+                    notify_whatsapp=bool_from_form(payload.get("whatsapp_consent")),
                     source_page=payload.get("source_page"),
                     consent=bool_from_form(payload.get("consent")),
                     subscriber_name=payload.get("subscriber_name") or None,
@@ -669,7 +674,6 @@ def render_public_form(
 ) -> str:
     source_page = query.get("source_page", ["wordpress"])[0]
     error_html = f'<p class="eg-error" role="alert">{h(error)}</p>' if error else ""
-    # MVP centrado en email: WhatsApp reservado para fase futura (no se muestra).
     # Tarjeta de formulario: tema claro forzado para lectura y orden (guía EG §5/§19).
     form = f"""
   <form class="eg-card eg-form" data-eg-theme="light" method="post" action="/api/subscribe" novalidate>
@@ -683,9 +687,18 @@ def render_public_form(
       <input class="eg-input" id="eg-email" name="email" type="email" required
              value="{h(email_value)}" placeholder="nombre@empresa.cl" autocomplete="email">
     </div>
+    <div class="eg-field">
+      <label class="eg-label" for="eg-phone">WhatsApp (opcional)</label>
+      <input class="eg-input" id="eg-phone" name="phone" type="tel"
+             placeholder="+56 9 1234 5678" autocomplete="tel">
+    </div>
     <label class="eg-check eg-check--consent">
       <input type="checkbox" name="consent" required>
-      <span>Acepto recibir alertas informativas por email sobre nuevas publicaciones de la Dirección del Trabajo.</span>
+      <span>Acepto recibir alertas informativas por email sobre nuevas publicaciones de la DT y el SII.</span>
+    </label>
+    <label class="eg-check eg-check--whatsapp">
+      <input type="checkbox" name="whatsapp_consent">
+      <span>También acepto recibir alertas por WhatsApp al número indicado cuando el canal esté activo.</span>
     </label>
     <button class="eg-btn eg-btn--primary eg-btn--block" type="submit">Suscribirme a las alertas</button>
     <p class="eg-fineprint">Podrás solicitar la baja cuando quieras. Los resúmenes son informativos y no reemplazan la revisión del documento oficial.</p>
@@ -694,13 +707,13 @@ def render_public_form(
     if embed:
         # En el iframe no mostramos hero ni header: solo la tarjeta funcional.
         body = f'<div class="eg-embed">{form}</div>'
-        return render_page("Alertas DT", body, compact=embed)
+        return render_page("Alertas DT + SII", body, compact=embed)
 
     benefits = [
-        ("🔎", "Monitoreo periódico", "Revisamos las publicaciones de la Dirección del Trabajo por ti."),
+        ("🔎", "Monitoreo periódico", "Revisamos publicaciones oficiales de la DT y el SII por ti."),
         ("📝", "Resumen práctico", "Un resumen claro, sin jerga, listo para tomar decisiones."),
-        ("⚖️", "Impacto laboral", "Qué significa para contadores, remuneraciones y empresas."),
-        ("🔗", "Documento oficial", "Enlace directo a la fuente original de la DT."),
+        ("⚖️", "Impacto tributario", "Qué significa para contadores, declaraciones tributarias y empresas."),
+        ("🔗", "Documento oficial", "Enlace directo a la fuente original DT o SII."),
     ]
     benefit_cards = "".join(
         f'<article class="eg-card eg-benefit"><span class="eg-benefit__icon" aria-hidden="true">{ic}</span>'
@@ -709,7 +722,7 @@ def render_public_form(
     )
     steps = [
         ("1", "Te suscribes con tu email", "Sin instalar nada. Solo tu correo y aceptar recibir alertas."),
-        ("2", "Monitoreamos la DT", "El sistema revisa periódicamente las nuevas publicaciones oficiales."),
+        ("2", "Monitoreamos DT + SII", "El sistema revisa periódicamente las nuevas publicaciones oficiales."),
         ("3", "Generamos un resumen", "Cada documento nuevo se resume con su impacto práctico."),
         ("4", "Recibes la alerta por email", "Te llega un correo claro con el resumen y el enlace oficial."),
     ]
@@ -725,14 +738,18 @@ def render_public_form(
   <span class="eg-glow eg-glow--b" aria-hidden="true"></span>
   <div class="eg-container eg-hero__grid">
     <div class="eg-hero__copy eg-fade-up">
-      <p class="eg-eyebrow">Alertas Dirección del Trabajo</p>
-      <h1 class="eg-hero__title">Alertas DT para <span>contadores y empresas</span></h1>
-      <p class="eg-hero__lead">Monitoreamos nuevas publicaciones de la Dirección del Trabajo y te enviamos un resumen práctico por email, pensado para gestión laboral, contabilidad y empresas.</p>
+      <p class="eg-eyebrow">Alertas normativas DT + SII</p>
+      <h1 class="eg-hero__title">Alertas DT + SII para <span>contadores y empresas</span></h1>
+      <p class="eg-hero__lead">Monitoreamos nuevas publicaciones de la Dirección del Trabajo y del Servicio de Impuestos Internos, y te enviamos un resumen práctico por email.</p>
       <ul class="eg-hero__points">
         <li class="eg-chip">Monitoreo continuo</li>
+        <li class="eg-chip">DT + SII</li>
         <li class="eg-chip">Resumen orientado a contadores</li>
         <li class="eg-chip">Alertas por email</li>
       </ul>
+      <div class="eg-hero__actions">
+        <a class="eg-btn eg-btn--ghost" href="/admin/login">Ingresar al admin</a>
+      </div>
     </div>
     {form}
   </div>
@@ -741,7 +758,7 @@ def render_public_form(
 <section class="eg-section eg-section--light" data-eg-theme="light" data-eg-density="compact">
   <div class="eg-container">
     <p class="eg-eyebrow">Beneficios</p>
-    <h2 class="eg-section__title">Normativa laboral, sin perderte nada</h2>
+    <h2 class="eg-section__title">Normativa tributaria, sin perderte nada</h2>
     <div class="eg-grid-4 eg-benefits">{benefit_cards}</div>
   </div>
 </section>
@@ -754,7 +771,7 @@ def render_public_form(
   </div>
 </section>
 """
-    return render_page("Alertas DT", body, compact=embed)
+    return render_page("Alertas DT + SII", body, compact=embed)
 
 
 def render_thanks(*, embed: bool, updated: bool = False) -> str:
@@ -775,7 +792,7 @@ def render_thanks(*, embed: bool, updated: bool = False) -> str:
     <span class="eg-feedback__icon" aria-hidden="true">&#10003;</span>
     <p class="eg-eyebrow">{h(eyebrow)}</p>
     <h1>{h(title)}</h1>
-    <p class="eg-feedback__lead">Desde ahora recibirás alertas informativas cuando detectemos nuevas publicaciones relevantes de la Dirección del Trabajo.</p>
+    <p class="eg-feedback__lead">Desde ahora recibirás alertas informativas cuando detectemos nuevas publicaciones relevantes de la DT o del SII.</p>
     {back_button}
     <p class="eg-fineprint" style="margin-top:18px;">Este servicio se encuentra en etapa de prueba interna.</p>
   </div>
@@ -795,7 +812,7 @@ def render_login(error: str | None = None, settings: Settings | None = None) -> 
     body = f"""
 <section class="eg-container eg-auth">
   <div class="eg-card eg-auth__card" data-eg-theme="light">
-    <p class="eg-eyebrow">External Group · Alertas DT</p>
+    <p class="eg-eyebrow">External Group · Alertas DT + SII</p>
     <h1>Acceso administrativo</h1>
     <p class="eg-auth__help">Ingresa el token de administración para revisar suscriptores, documentos detectados y alertas.</p>
     {dev_html}
@@ -900,8 +917,8 @@ def _calc_ai_cost(
 
 # Defaults de plantillas de email (fallback si no hay valor en DB)
 EMAIL_SETTINGS_DEFAULTS: dict[str, str] = {
-    "email_subject_template": "Nueva normativa DT: {title}",
-    "email_test_subject_template": "[PRUEBA] Nueva normativa DT: {title}",
+    "email_subject_template": "Nueva normativa: {title}",
+    "email_test_subject_template": "[PRUEBA] Nueva normativa: {title}",
     "email_footer_legal": (
         "Este resumen es informativo y no reemplaza la lectura del documento oficial "
         "ni asesoría profesional."
@@ -1018,13 +1035,29 @@ def icon(name: str, size: int = 20) -> str:
 
 # Metadatos de cada sección admin (título + subtítulo de la topbar).
 SECTION_META = {
-    "/admin": ("Resumen operativo", "Estado general del monitoreo DT, suscriptores y alertas por email."),
+    "/admin": ("Resumen operativo", "Estado general del monitoreo DT + SII, suscriptores y alertas por email."),
     "/admin/subscribers": ("Suscriptores", "Personas inscritas para recibir alertas por email."),
-    "/admin/documents": ("Documentos detectados", "Publicaciones DT encontradas por el monitoreo."),
+    "/admin/documents": ("Documentos detectados", "Publicaciones DT + SII encontradas por el monitoreo."),
     "/admin/alerts": ("Alertas", "Resúmenes generados, listos para revisar y enviar."),
-    "/admin/jobs": ("Monitoreo", "Historial de ejecuciones del monitoreo DT."),
+    "/admin/jobs": ("Monitoreo", "Historial de ejecuciones del monitoreo DT + SII."),
     "/admin/settings": ("Configuración", "Estado técnico e integraciones de la aplicación."),
 }
+
+
+def normalize_source_filter(value: Any) -> str:
+    source = str(value or "all").strip().lower()
+    return source if source in {"all", "dt", "sii"} else "all"
+
+
+def source_filter_label(value: str) -> str:
+    return {"dt": "DT", "sii": "SII"}.get(value, "Todo")
+
+
+def source_badge(item: dict[str, Any]) -> str:
+    kind = source_kind(item)
+    label = source_context(item)["short"]
+    return f'<span class="eg-source-badge" data-source="{h(kind)}">{h(label)}</span>'
+
 
 SIDEBAR_NAV = [
     ("/admin", "Resumen", "dashboard"),
@@ -1074,7 +1107,7 @@ def render_sidebar(path: str, settings: Settings, *, pending_alerts: int = 0) ->
 <div class="eg-brand">
   <div class="eg-brand-logo-wrap">
     <img src="{EG_LOGO_LIGHT}" alt="External Group" style="display:block;width:120px;height:auto;object-fit:contain;">
-    <div class="eg-brand-sub" style="margin-top:6px;">ALERTAS DT</div>
+    <div class="eg-brand-sub" style="margin-top:6px;">ALERTAS DT + SII</div>
   </div>
 </div>
 <div class="eg-hairline"></div>
@@ -1085,27 +1118,36 @@ def render_sidebar(path: str, settings: Settings, *, pending_alerts: int = 0) ->
     <span class="eg-dot" data-status="{h(email_key)}"></span>
     <span>{h(email_label)}</span>
   </div>
-  <div class="eg-side-tag">MVP interno · External Group</div>
+  <div class="eg-side-tag">Piloto interno · External Group</div>
 </div>
 """
 
 
-# Script (una vez por página admin) para el botón "Ejecutar monitoreo".
+# Script (una vez por página admin) para los botones de monitoreo.
 MONITOR_SCRIPT = """
 <script>
 document.querySelectorAll('[data-job-token]').forEach(function(button) {
   button.closest('form').addEventListener('submit', async function(event) {
     event.preventDefault();
+    const original = button.innerHTML;
     button.disabled = true;
-    button.textContent = 'Ejecutando...';
+    button.innerHTML = '<span>Ejecutando...</span>';
     try {
       const token = prompt('JOB_TOKEN');
-      if (!token) { button.disabled = false; button.textContent = 'Ejecutar monitoreo'; return; }
-      await fetch('/api/jobs/check-dt', { method: 'POST', headers: { 'X-Job-Token': token } });
+      if (!token) { button.disabled = false; button.innerHTML = original; return; }
+      const response = await fetch(button.closest('form').getAttribute('action'), {
+        method: 'POST',
+        headers: { 'X-Job-Token': token }
+      });
+      if (!response.ok) {
+        const data = await response.json().catch(function(){ return {}; });
+        alert(data.error || 'No se pudo ejecutar el monitoreo.');
+        return;
+      }
       location.reload();
     } finally {
       button.disabled = false;
-      button.textContent = 'Ejecutar monitoreo';
+      button.innerHTML = original;
     }
   });
 });
@@ -1113,18 +1155,28 @@ document.querySelectorAll('[data-job-token]').forEach(function(button) {
 """
 
 
+def render_monitor_actions() -> str:
+    actions = [
+        ("all", "/api/jobs/check-normative?source=all", "Actualizar todo", "eg-btn--primary"),
+        ("dt", "/api/jobs/check-normative?source=dt", "Actualizar DT", "eg-btn--dt"),
+        ("sii", "/api/jobs/check-normative?source=sii", "Actualizar SII", "eg-btn--sii"),
+    ]
+    forms = []
+    for source, action, label, cls in actions:
+        forms.append(
+            f'<form method="post" action="{action}" class="eg-monitor-form">'
+            f'<button class="eg-btn {cls} eg-btn--sm" type="submit" data-job-token data-source="{source}">'
+            f'{icon("refresh", 15)}<span>{label}</span></button></form>'
+        )
+    return f'<div class="eg-monitor-actions">{"".join(forms)}</div>'
+
+
 def render_topbar(title: str, subtitle: str, settings: Settings, *, show_action: bool = True) -> str:
     email_label, email_key = email_mode(settings)
     auth_label, auth_key = auth_mode(settings)
     action = ""
     if show_action:
-        action = (
-            '<form method="post" action="/api/jobs/check-dt">'
-            '<input type="hidden" name="manual" value="1">'
-            '<button class="eg-btn eg-btn--primary eg-btn--sm" type="submit" '
-            'formaction="/api/jobs/check-dt" data-job-token>'
-            f'{icon("refresh", 18)}<span>Ejecutar monitoreo</span></button></form>'
-        )
+        action = render_monitor_actions()
     neutral_email = " is-neutral" if email_key not in {"active"} else ""
     neutral_auth = " is-neutral" if auth_key not in {"active"} else ""
     return f"""
@@ -1181,11 +1233,32 @@ def render_system_status(settings: Settings, last_job: dict[str, Any] | None) ->
 """
 
 
-def render_admin(path: str, settings: Settings, *, flash: str = "", status_filter: str = "", page: int = 1) -> str:
+def render_admin(
+    path: str,
+    settings: Settings,
+    *,
+    flash: str = "",
+    query: dict[str, list[str]] | None = None,
+) -> str:
+    query = query or {}
+    status_filter = query.get("status", [""])[0]
+    raw_page = query.get("page", ["1"])[0]
+    page = max(1, int(raw_page) if raw_page.isdigit() else 1)
+    document_source_filter = normalize_source_filter(query.get("source", ["all"])[0])
     with db.connect(settings.database_path) as conn:
         subscribers = db.list_subscribers(conn)
         alerts = db.list_alerts(conn)
-        documents = db.list_documents(conn)
+        documents_all = db.list_documents(conn)
+        documents = (
+            db.list_documents(conn, source_filter=document_source_filter)
+            if path == "/admin/documents"
+            else documents_all
+        )
+        document_counts = {
+            "all": db.count_documents(conn),
+            "dt": db.count_documents(conn, "dt"),
+            "sii": db.count_documents(conn, "sii"),
+        }
         jobs = db.latest_jobs(conn)
         sent_deliveries = db.count_sent_deliveries(conn)
 
@@ -1216,19 +1289,23 @@ def render_admin(path: str, settings: Settings, *, flash: str = "", status_filte
     elif path == "/admin/subscribers":
         section = render_db_info(settings, subscribers) + render_subscribers(subscribers)
     elif path == "/admin/documents":
-        section = render_documents(documents)
+        section = render_documents(
+            documents,
+            source_filter=document_source_filter,
+            counts=document_counts,
+        )
     elif path == "/admin/alerts":
         section = render_alerts_table(alerts, status_filter=status_filter, page=page)
     elif path == "/admin/jobs":
         section = (
             '<p class="eg-section-note">El monitoreo revisa las fuentes configuradas de la '
-            "Dirección del Trabajo y registra nuevos documentos sin duplicar URLs ya "
+            "Dirección del Trabajo y Servicio de Impuestos Internos, y registra nuevos documentos sin duplicar URLs ya "
             "detectadas.</p>" + render_jobs(jobs)
         )
     else:  # /admin -> Resumen
         cards = (
             metric_card("users", active_count, "Suscriptores activos", f"{paused_count} pausados", "accent")
-            + metric_card("document", len(documents), "Documentos detectados", "desde fuentes DT", "info")
+            + metric_card("document", len(documents_all), "Documentos detectados", "desde fuentes DT + SII", "info")
             + metric_card("bell", pending_count, "Pendientes de revisión", "requieren validación", "warning")
             + metric_card("check", ready_count, "Listas para enviar", "revisadas y aprobadas", "info")
             + metric_card("send", sent_count, "Alertas enviadas", "a suscriptores activos", "success")
@@ -1306,7 +1383,7 @@ def render_jobs(jobs: list[dict[str, Any]]) -> str:
             '<section class="eg-card eg-panel">'
             '<div class="eg-card-head"><h2>Historial de monitoreo</h2></div>'
             '<div class="eg-empty"><strong>Aún no se ha ejecutado el monitoreo.</strong>'
-            '<span>Usa "Ejecutar monitoreo" para buscar nuevas publicaciones de la DT.</span></div></section>'
+            '<span>Usa "Ejecutar monitoreo" para buscar nuevas publicaciones de la DT y el SII.</span></div></section>'
         )
     rows = "".join(
         f"""
@@ -1384,7 +1461,7 @@ def _test_wordpress_connection(settings: Settings) -> str:
         headers={
             "Authorization": f"Bearer {settings.wordpress_api_token}",
             "Accept": "application/json",
-            "User-Agent": "AlertasDT-Sync/0.1",
+            "User-Agent": "AlertasNormativas-Sync/0.1",
         },
     )
     try:
@@ -1649,7 +1726,7 @@ def render_settings(settings: Settings) -> str:
         db_warn = (
             '<div class="eg-settings-warn">'
             'Para produccion local se recomienda mover la base de datos fuera del repositorio, '
-            'por ejemplo <code>/Users/Shared/AlertasDT/data/dt_alertas.sqlite3</code>.'
+            'por ejemplo <code>/Users/Shared/AlertasNormativas/data/alertas_normativas.sqlite3</code>.'
             '</div>'
         )
 
@@ -1875,8 +1952,8 @@ async function toggleAI(enabled) {{
     AI_DEFAULTS = {
         "ai_summary_style": "Profesional, claro, orientado a contadores y empresas chilenas.",
         "ai_analysis_focus": (
-            "Explicar impactos prácticos en cumplimiento laboral, gestión contable, "
-            "auditoría, remuneraciones y obligaciones documentales."
+            "Explicar impactos prácticos en cumplimiento tributario, gestión contable, "
+            "auditoría, declaraciones, pagos y obligaciones documentales."
         ),
         "ai_review_required": "true",
         "ai_attachments_enabled": "true",
@@ -1929,7 +2006,7 @@ async function toggleAI(enabled) {{
         )
         + _ai_field(
             "ai_analysis_focus", "Enfoque del análisis", multiline=True, rows=2,
-            help_text="Áreas que la IA debe priorizar. Ej: cumplimiento laboral, remuneraciones, auditoría.",
+            help_text="Áreas que la IA debe priorizar. Ej: cumplimiento tributario, declaraciones tributarias, auditoría.",
         )
         + _ai_field(
             "ai_system_prompt", "Instrucciones adicionales al sistema", multiline=True, rows=3,
@@ -2051,7 +2128,7 @@ async function toggleAI(enabled) {{
     footer_default = EMAIL_SETTINGS_DEFAULTS["email_footer_legal"]
 
     fields_html = (
-        _field("email_from_name", "Nombre del remitente", "Alertas DT", settings.email_from_name)
+        _field("email_from_name", "Nombre del remitente", "Alertas DT + SII", settings.email_from_name)
         + _field("email_from", "Email remitente", "alertas@example.com", settings.email_from)
         + _field("email_reply_to", "Email responder a", "soporte@example.com", settings.email_reply_to)
         + _field("email_subject_template", "Asunto (correo real)", tmpl_default, tmpl_default)
@@ -2268,7 +2345,7 @@ def render_subscribers(subscribers: list[dict[str, Any]]) -> str:
     <summary style="font-size:12px;color:var(--eg-muted);cursor:pointer;list-style:none;">
       ℹ️ Sobre notificaciones WhatsApp
     </summary>
-    <p class="eg-note" style="margin-top:6px;">WhatsApp reservado para fase futura: el MVP notifica solo por email.</p>
+    <p class="eg-note" style="margin-top:6px;">WhatsApp Business queda preparado: se simula mientras no existan credenciales, consentimiento y una plantilla aprobada.</p>
   </details>
 </section>
 {_SUBSCRIBERS_JS}
@@ -2650,21 +2727,49 @@ def render_alerts_table(
     )
 
 
-def render_documents(documents: list[dict[str, Any]]) -> str:
+def render_source_tabs(source_filter: str, counts: dict[str, int]) -> str:
+    tabs = [
+        ("all", "/admin/documents", "Todos", counts.get("all", 0)),
+        ("dt", "/admin/documents?source=dt", "DT", counts.get("dt", 0)),
+        ("sii", "/admin/documents?source=sii", "SII", counts.get("sii", 0)),
+    ]
+    items = []
+    for key, href, label, count in tabs:
+        active = " is-active" if key == source_filter else ""
+        items.append(
+            f'<a class="eg-source-tab{active}" data-source="{h(key)}" href="{href}">'
+            f'<span>{h(label)}</span><strong>{h(count)}</strong></a>'
+        )
+    return f'<nav class="eg-source-tabs" aria-label="Filtrar documentos por fuente">{"".join(items)}</nav>'
+
+
+def render_documents(
+    documents: list[dict[str, Any]],
+    *,
+    source_filter: str = "all",
+    counts: dict[str, int] | None = None,
+) -> str:
+    counts = counts or {"all": len(documents), "dt": 0, "sii": 0}
+    subtitle = (
+        "Mostrando documentos de ambas fuentes."
+        if source_filter == "all"
+        else f"Mostrando documentos {source_filter_label(source_filter)}."
+    )
     rows = "".join(
         f"""
-<tr>
+<tr data-source="{h(source_kind(item))}">
   <td>
     <div class="eg-doc-title">{h(item['title'])}</div>
     <div class="eg-doc-desc eg-muted">{h(item.get('abstract') or '')}</div>
   </td>
+  <td>{source_badge(item)}</td>
   <td class="eg-cell-cat">{h(item['category'])}</td>
   <td class="mono">{h(item.get('publication_date') or '—')}</td>
   <td class="mono">{h(item.get('dt_article_id'))}</td>
   <td>{badge(item['status'])}</td>
   <td>
     <a class="eg-btn eg-btn--primary eg-btn--sm" href="{h(item['canonical_url'])}" target="_blank" rel="noopener noreferrer">
-      {icon('external', 14)}<span>Ver en DT</span>
+      {icon('external', 14)}<span>Abrir</span>
     </a>
   </td>
   <td class="eg-cell-actions">
@@ -2685,11 +2790,19 @@ def render_documents(documents: list[dict[str, Any]]) -> str:
     )
     return f"""
 <section class="eg-card eg-panel">
-  <h2>Documentos detectados</h2>
+  <div class="eg-card-head eg-card-head--wrap">
+    <div>
+      <h2>Documentos detectados</h2>
+      <p>{h(subtitle)}</p>
+    </div>
+    <div class="eg-source-tools">
+      {render_source_tabs(source_filter, counts)}
+    </div>
+  </div>
   <div class="eg-table-wrap">
-    <table class="eg-table">
-      <thead><tr><th>Documento</th><th>Categoría</th><th>Fecha</th><th>ID DT</th><th>Estado</th><th>Link</th><th>Acciones</th></tr></thead>
-      <tbody>{rows or empty_row(7, "Aún no hay documentos detectados.", "Ejecuta el monitoreo para buscar nuevas publicaciones de la Dirección del Trabajo.")}</tbody>
+    <table class="eg-table eg-table--documents">
+      <thead><tr><th>Documento</th><th>Fuente</th><th>Categoría</th><th>Fecha</th><th>ID</th><th>Estado</th><th>Link</th><th>Acciones</th></tr></thead>
+      <tbody>{rows or empty_row(8, "Aún no hay documentos para este filtro.", "Ejecuta el monitoreo correspondiente o cambia el botón de fuente.")}</tbody>
     </table>
   </div>
 </section>
@@ -2890,7 +3003,7 @@ def render_alert_preview(alert_id: int, settings: Settings, *, flash: str = "") 
       <dt>Categoría</dt><dd>{h(alert['category'])}</dd>
       <dt>Fecha doc.</dt><dd class="mono">{h(alert.get('publication_date') or '—')}</dd>
       <dt>Asunto</dt><dd class="mono">{h(subject)}</dd>
-      <dt>Fuente</dt><dd><a class="eg-btn eg-btn--primary eg-btn--sm" href="{h(alert['canonical_url'])}" target="_blank" rel="noopener noreferrer">{icon('external', 14)}<span>Ver en DT</span></a></dd>
+      <dt>Fuente</dt><dd><a class="eg-btn eg-btn--primary eg-btn--sm" href="{h(alert['canonical_url'])}" target="_blank" rel="noopener noreferrer">{icon('external', 14)}<span>Ver fuente</span></a></dd>
     </dl>
     <div class="eg-review-actions">
       <a class="eg-btn eg-ghost eg-btn--sm" href="/admin/alerts">{icon("back", 16)}<span>Volver</span></a>
@@ -2936,7 +3049,7 @@ def render_header() -> str:
     <a class="eg-header__brand" href="/" aria-label="External Group · Inicio">
       <img class="eg-logo" src="{EG_LOGO_DARK}" alt="External Group" />
     </a>
-    <span class="eg-header__tag">Alertas DT</span>
+    <span class="eg-header__tag">Alertas DT + SII</span>
   </div>
 </header>
 """
@@ -2948,7 +3061,7 @@ def render_footer() -> str:
 <footer class="eg-footer" data-eg-theme="dark">
   <div class="eg-container eg-footer__inner">
     <img class="eg-logo eg-logo--sm" src="{EG_LOGO_LIGHT}" alt="External Group" />
-    <p class="eg-footer__note">El resumen es informativo y no reemplaza la lectura del documento oficial de la Dirección del Trabajo.</p>
+    <p class="eg-footer__note">El resumen es informativo y no reemplaza la lectura del documento oficial de la DT o del SII.</p>
     <p class="eg-footer__copy">© External Group · Servicios especializados de gestión y tecnología.</p>
   </div>
 </footer>
@@ -3000,7 +3113,7 @@ def render_page(
   <button class="eg-burger" aria-label="Abrir menu" type="button">
     <span></span><span></span><span></span>
   </button>
-  <span class="eg-mobilebar-title">Alertas DT</span>
+  <span class="eg-mobilebar-title">Alertas DT + SII</span>
 </div>
 <div class="eg-shell">
   <aside class="eg-sidebar">{sidebar}</aside>
@@ -3033,7 +3146,7 @@ def render_page(
 
 CSS = """
 /* =====================================================================
-   Alertas DT · Sistema de diseño editorial (prototipo v2)
+   Alertas DT + SII · Sistema de diseño editorial (prototipo v2)
    ===================================================================== */
 
 /* ----- Tokens -------------------------------------------------------- */
@@ -3308,6 +3421,8 @@ body.eg--admin {
   align-items: center;
   gap: 10px;
   flex-shrink: 0;
+  flex-wrap: wrap;
+  justify-content: flex-end;
 }
 .eg-status-pill {
   display: inline-flex;
@@ -3351,6 +3466,12 @@ body.eg--admin {
   margin-bottom: 16px;
 }
 .eg-card-head h2 { margin: 0; font-size: 1rem; }
+.eg-card-head p { margin: 3px 0 0; font-size: 13px; color: var(--eg-subtle); }
+.eg-card-head--wrap {
+  justify-content: space-between;
+  align-items: flex-start;
+  flex-wrap: wrap;
+}
 
 /* ----- Metric grid --------------------------------------------------- */
 .eg-metric-grid {
@@ -3523,6 +3644,28 @@ a.eg-btn--primary:hover { color: #fff !important; }
 a.eg-btn--secondary,
 a.eg-btn--secondary:link,
 a.eg-btn--secondary:visited { color: var(--eg-text) !important; text-decoration: none; }
+.eg-btn--dt {
+  background: color-mix(in srgb, var(--eg-green) 16%, #fff);
+  color: #0F5E51;
+  border: 1px solid color-mix(in srgb, var(--eg-green) 42%, transparent);
+}
+.eg-btn--dt:hover {
+  background: color-mix(in srgb, var(--eg-green) 24%, #fff);
+  color: #0A4A3E;
+}
+.eg-btn--sii {
+  background: var(--eg-blue);
+  color: #fff;
+}
+.eg-btn--sii:hover { background: #0478B4; color: #fff; }
+.eg-monitor-actions {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.eg-monitor-form { margin: 0; }
 .eg-ghost {
   background: transparent;
   color: var(--eg-muted);
@@ -3533,6 +3676,19 @@ a.eg-ghost,
 a.eg-ghost:link,
 a.eg-ghost:visited { color: var(--eg-muted) !important; text-decoration: none; }
 a.eg-ghost:hover { color: var(--eg-text) !important; }
+.eg-btn--ghost {
+  background: transparent;
+  color: #F6FAFC;
+  border: 1px solid rgba(255,255,255,.35);
+}
+.eg-btn--ghost:hover {
+  background: rgba(255,255,255,.12);
+  color: #fff;
+}
+a.eg-btn--ghost,
+a.eg-btn--ghost:link,
+a.eg-btn--ghost:visited { color: #F6FAFC !important; text-decoration: none; }
+a.eg-btn--ghost:hover { color: #fff !important; }
 .eg-btn--sm { padding: 6px 12px; font-size: 13px; }
 .eg-btn--block { width: 100%; justify-content: center; }
 .eg-btn:disabled { opacity: .45; cursor: not-allowed; }
@@ -3562,6 +3718,18 @@ a.eg-ghost:hover { color: var(--eg-text) !important; }
 .eg-table td strong { color: var(--eg-text); font-weight: 700; }
 .eg-table td form { margin: 0; }
 .eg-table td.mono { font-family: var(--font-mono); font-size: 12.5px; }
+.eg-table--documents { table-layout: fixed; }
+.eg-table--documents th:nth-child(1) { width: 24%; }
+.eg-table--documents th:nth-child(2) { width: 7%; }
+.eg-table--documents th:nth-child(3) { width: 20%; }
+.eg-table--documents th:nth-child(4) { width: 9%; }
+.eg-table--documents th:nth-child(5) { width: 9%; }
+.eg-table--documents th:nth-child(6) { width: 11%; }
+.eg-table--documents th:nth-child(7) { width: 8%; }
+.eg-table--documents th:nth-child(8) { width: 12%; }
+.eg-table--documents td { word-break: break-word; }
+.eg-table--documents .eg-btn { justify-content: center; }
+.eg-table--documents .eg-cell-actions .eg-btn { min-width: 100%; }
 .eg-doc-title { font-weight: 700; color: var(--eg-text); font-size: 13.5px; }
 .eg-doc-desc  {
   font-size: 12px;
@@ -3572,6 +3740,66 @@ a.eg-ghost:hover { color: var(--eg-text) !important; }
   -webkit-box-orient: vertical;
   overflow: hidden;
   max-width: 380px;
+}
+.eg-source-tools {
+  display: flex;
+  align-items: center;
+  justify-content: flex-end;
+  gap: 10px;
+  flex-wrap: wrap;
+}
+.eg-source-tabs {
+  display: inline-flex;
+  align-items: center;
+  gap: 6px;
+  flex-wrap: wrap;
+}
+.eg-source-tab {
+  display: inline-flex;
+  align-items: center;
+  gap: 7px;
+  min-height: 34px;
+  padding: 6px 10px;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--eg-border);
+  background: var(--eg-surface);
+  color: var(--eg-muted);
+  font-size: 13px;
+  font-weight: 700;
+}
+.eg-source-tab strong {
+  font-family: var(--font-mono);
+  font-size: 11px;
+  color: inherit;
+}
+.eg-source-tab.is-active {
+  color: var(--eg-text);
+  border-color: color-mix(in srgb, var(--eg-green) 36%, transparent);
+  background: color-mix(in srgb, var(--eg-green) 10%, #fff);
+}
+.eg-source-tab[data-source="sii"].is-active {
+  border-color: color-mix(in srgb, var(--eg-blue) 36%, transparent);
+  background: color-mix(in srgb, var(--eg-blue) 10%, #fff);
+}
+.eg-source-badge {
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  min-width: 42px;
+  padding: 4px 8px;
+  border-radius: 999px;
+  font-size: 11px;
+  line-height: 1;
+  font-weight: 800;
+  letter-spacing: .08em;
+  color: #0F5E51;
+  background: color-mix(in srgb, var(--eg-green) 14%, transparent);
+  border: 1px solid color-mix(in srgb, var(--eg-green) 32%, transparent);
+}
+.eg-source-badge[data-source="sii"] {
+  color: #075985;
+  background: color-mix(in srgb, var(--eg-blue) 12%, transparent);
+  border-color: color-mix(in srgb, var(--eg-blue) 30%, transparent);
 }
 .eg-cell-cat  { font-size: 12.5px; color: var(--eg-muted); white-space: nowrap; }
 .eg-cell-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
@@ -3786,6 +4014,7 @@ textarea.eg-input { resize: vertical; min-height: 56px; }
 .eg-hero__title span { color: var(--eg-green); }
 .eg-hero__lead { font-size: clamp(1rem,1.6vw,1.18rem); color: rgba(255,255,255,.78); margin-bottom: 24px; }
 .eg-hero__points { list-style: none; display: flex; flex-wrap: wrap; gap: 10px; padding: 0; margin: 0; }
+.eg-hero__actions { display: flex; flex-wrap: wrap; gap: 12px; margin-top: 22px; }
 .eg-chip { background: rgba(255,255,255,.10); color: #fff; border: 1px solid rgba(255,255,255,.2); border-radius: 999px; font-size: 13px; font-weight: 600; padding: 5px 14px; }
 .eg-section { padding: var(--eg-section-pad) 0; }
 .eg-section--soft { background: var(--eg-surface-soft); }
@@ -3874,5 +4103,5 @@ def run_server(settings: Settings | None = None) -> None:
         thread = threading.Thread(target=scheduler_loop, args=(settings,), daemon=True)
         thread.start()
     server = ThreadingHTTPServer((settings.app_host, settings.app_port), AppHandler)
-    print(f"Alertas DT escuchando en http://{settings.app_host}:{settings.app_port}")
+    print(f"Alertas DT + SII escuchando en http://{settings.app_host}:{settings.app_port}")
     server.serve_forever()

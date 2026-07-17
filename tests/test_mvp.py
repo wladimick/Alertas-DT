@@ -8,7 +8,7 @@ from pathlib import Path
 
 from dt_alerts import db, notifier, worker
 from dt_alerts.config import get_settings
-from dt_alerts.dt_scraper import parse_listing
+from dt_alerts.dt_scraper import parse_listing, parse_sii_listing
 from dt_alerts.summarizer import summarize_document
 from dt_alerts import wordpress_sync
 
@@ -51,6 +51,18 @@ LISTING_HTML = """
 </div>
 """
 
+SII_LISTING_HTML = """
+<h5 style='margin-bottom:0px;'>
+  <a href='circu27.pdf' target='_blank'>Circular N&deg; 27 del 23 de Junio del 2026</a>
+</h5>
+<p style='margin-top:0px;margin-bottom:0px;'>Pone en conocimiento la pol&iacute;tica de condonaciones contenida en el Decreto N&deg;437.</p>
+<span style='font-size:12px;margin-bottom:10px;'><i>Fuente: Subdirecci&oacute;n Jur&iacute;dica</i></span>
+<h5 style='margin-bottom:0px;'>
+  <a href='circu26.pdf' target='_blank'>Circular N&deg; 26 del 18 de Junio del 2026</a>
+</h5>
+<p>Actualiza instrucciones sobre el recurso de reposici&oacute;n administrativa voluntaria.</p>
+"""
+
 
 class MvpTestCase(unittest.TestCase):
     def test_parse_listing_extracts_canonical_documents(self) -> None:
@@ -67,6 +79,22 @@ class MvpTestCase(unittest.TestCase):
             docs[0].canonical_url,
             "https://www.dt.gob.cl/legislacion/1624/w3-article-127291.html",
         )
+
+    def test_parse_sii_listing_extracts_pdf_documents(self) -> None:
+        docs = parse_sii_listing(
+            SII_LISTING_HTML,
+            "https://www.sii.cl/normativa_legislacion/circulares/2026/indcir2026.htm",
+            "Circulares",
+        )
+        self.assertEqual(len(docs), 2)
+        self.assertEqual(docs[0].dt_article_id, "sii-circu27")
+        self.assertEqual(docs[0].title, "Circular N° 27 del 23 de Junio del 2026")
+        self.assertEqual(docs[0].publication_date, "23/06/2026")
+        self.assertEqual(
+            docs[0].canonical_url,
+            "https://www.sii.cl/normativa_legislacion/circulares/2026/circu27.pdf",
+        )
+        self.assertIn("política de condonaciones", docs[0].abstract)
 
     def test_subscriber_upsert_updates_preferences(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
@@ -232,6 +260,8 @@ class MvpTestCase(unittest.TestCase):
     def test_subject_generation_and_truncation(self) -> None:
         short = notifier.subject_for({"title": "Circular 5"})
         self.assertEqual(short, "Nueva normativa DT: Circular 5")
+        sii_short = notifier.subject_for({"title": "Circular 5", "canonical_url": "https://www.sii.cl/foo"})
+        self.assertEqual(sii_short, "Nueva normativa SII: Circular 5")
         long_title = "x" * 300
         subject = notifier.subject_for({"title": long_title})
         self.assertLessEqual(len(subject), len("Nueva normativa DT: ") + notifier.SUBJECT_MAX)
@@ -288,6 +318,70 @@ class MvpTestCase(unittest.TestCase):
         self.assertEqual(result["status"], "partial")
         self.assertTrue(result["source_errors"])
 
+    def test_job_can_run_dt_sources_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            settings = settings_for(path, alert_on_first_run=True)
+            seen_categories = []
+
+            def fake_fetch(source, limit=25):
+                seen_categories.append(source["category"])
+                return []
+
+            original = worker.fetch_listing
+            worker.fetch_listing = fake_fetch
+            try:
+                result = worker.run_check(settings, source_filter="dt")
+            finally:
+                worker.fetch_listing = original
+        self.assertEqual(result["source_filter"], "dt")
+        self.assertEqual(result["source_count"], 7)
+        self.assertTrue(seen_categories)
+        self.assertTrue(all(category.startswith("DT -") for category in seen_categories))
+
+    def test_job_can_run_sii_sources_only(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            settings = settings_for(path, alert_on_first_run=True)
+            seen_categories = []
+
+            def fake_fetch(source, limit=25):
+                seen_categories.append(source["category"])
+                return []
+
+            original = worker.fetch_listing
+            worker.fetch_listing = fake_fetch
+            try:
+                result = worker.run_check(settings, source_filter="sii")
+            finally:
+                worker.fetch_listing = original
+        self.assertEqual(result["source_filter"], "sii")
+        self.assertEqual(result["source_count"], 5)
+        self.assertTrue(seen_categories)
+        self.assertTrue(all(category.startswith("SII -") for category in seen_categories))
+
+    def test_first_run_baseline_is_calculated_per_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            settings = settings_for(path, alert_on_first_run=False)
+            with db.connect(path) as conn:
+                db.upsert_document(conn, {
+                    "dt_article_id": "dt-1",
+                    "canonical_url": "https://www.dt.gob.cl/legislacion/1624/w3-article-1.html",
+                    "source_url": "https://www.dt.gob.cl/legislacion/1624/w3-channel.html",
+                    "category": "DT - Dictámenes",
+                    "title": "Documento DT",
+                })
+
+            original = worker.fetch_listing
+            worker.fetch_listing = lambda source, limit=25: []
+            try:
+                result = worker.run_check(settings, source_filter="sii")
+            finally:
+                worker.fetch_listing = original
+        self.assertTrue(result["baseline_run"])
+
     def test_duplicate_document_is_not_recreated(self) -> None:
         with tempfile.TemporaryDirectory() as tmp:
             path = Path(tmp) / "t.sqlite3"
@@ -307,17 +401,73 @@ class MvpTestCase(unittest.TestCase):
         self.assertFalse(second_new)
         self.assertEqual(total, 1)
 
+    def test_list_documents_can_filter_by_source(self) -> None:
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            db.init_db(path)
+            with db.connect(path) as conn:
+                db.upsert_document(conn, {
+                    "dt_article_id": "dt-1",
+                    "canonical_url": "https://www.dt.gob.cl/legislacion/1624/w3-article-1.html",
+                    "source_url": "https://www.dt.gob.cl/legislacion/1624/w3-channel.html",
+                    "category": "DT - Dictámenes",
+                    "title": "Documento DT",
+                })
+                db.upsert_document(conn, {
+                    "dt_article_id": "sii-circular-1",
+                    "canonical_url": "https://www.sii.cl/normativa_legislacion/circular1.htm",
+                    "source_url": "https://www.sii.cl/normativa_legislacion/",
+                    "category": "SII - Circulares",
+                    "title": "Documento SII",
+                })
+                dt_docs = db.list_documents(conn, source_filter="dt")
+                sii_docs = db.list_documents(conn, source_filter="sii")
+        self.assertEqual([doc["title"] for doc in dt_docs], ["Documento DT"])
+        self.assertEqual([doc["title"] for doc in sii_docs], ["Documento SII"])
+
+    def test_documents_admin_renders_source_selector_and_badges(self) -> None:
+        from dt_alerts.server import render_documents
+
+        docs = [
+            {
+                "id": 1,
+                "title": "Documento DT",
+                "abstract": "",
+                "category": "DT - Dictámenes",
+                "publication_date": "01/01/2026",
+                "dt_article_id": "dt-1",
+                "status": "baseline",
+                "canonical_url": "https://www.dt.gob.cl/legislacion/1624/w3-article-1.html",
+            },
+            {
+                "id": 2,
+                "title": "Documento SII",
+                "abstract": "",
+                "category": "SII - Circulares",
+                "publication_date": "01/01/2026",
+                "dt_article_id": "sii-circular-1",
+                "status": "baseline",
+                "canonical_url": "https://www.sii.cl/normativa_legislacion/circular1.htm",
+            },
+        ]
+        html = render_documents(docs, source_filter="sii", counts={"all": 2, "dt": 1, "sii": 1})
+        self.assertNotIn("<select", html)
+        self.assertNotIn('name="source"', html)
+        self.assertIn('data-source="dt"', html)
+        self.assertIn('data-source="sii"', html)
+        self.assertIn('class="eg-source-tab is-active" data-source="sii"', html)
+
     def test_fallback_summary_is_pending_review_without_api_key(self) -> None:
         settings = get_settings()
         settings = settings.__class__(**{**settings.__dict__, "openai_api_key": ""})
         result = summarize_document(
             {
-                "title": "Circular sobre remuneraciones",
+                "title": "Circular sobre IVA y multas",
                 "category": "Circulares",
                 "publication_date": "01/01/2026",
                 "canonical_url": "https://example.com",
-                "abstract": "Instruye criterios sobre remuneraciones y registro electrónico.",
-                "detail_text": "Instruye criterios sobre remuneraciones y registro electrónico. Las empresas deben revisar controles de cumplimiento.",
+                "abstract": "Instruye criterios sobre IVA, multas y registro electrónico.",
+                "detail_text": "Instruye criterios sobre IVA, multas y registro electrónico. Las empresas deben revisar controles de cumplimiento tributario.",
             },
             settings,
         )
@@ -586,7 +736,7 @@ class SettingsTestCase(unittest.TestCase):
 
         # Sin template en DB, tmpl es cadena vacia -> se usa el default
         self.assertEqual(tmpl, "")
-        # El fallback en server.py usa subject_for() -> "Nueva normativa DT: ..."
+        # El fallback en server.py usa subject_for(); sin fuente explicita cae en DT.
         default_subject = f"[PRUEBA] {notifier.subject_for({'title': 'Circular 42'})}"
         self.assertEqual(default_subject, "[PRUEBA] Nueva normativa DT: Circular 42")
 
@@ -830,6 +980,9 @@ class AIIntegrationTestCase(unittest.TestCase):
         subject = notifier.subject_for(alert)
         self.assertIn("Circular sin IA", subject)
         self.assertIn("Nueva normativa DT", subject)
+
+        sii_subject = notifier.subject_for({**alert, "canonical_url": "https://www.sii.cl/normativa_legislacion/"})
+        self.assertIn("Nueva normativa SII", sii_subject)
 
     # --- 11. Adjuntos HTML se generan sin exponer secretos ---
     def test_11_html_attachments_no_secrets(self):
@@ -1400,7 +1553,7 @@ class NewPhasesTestCase(unittest.TestCase):
         self.assertIn("Foco en auditoría y RRHH.", user_p)
 
     def test_07_prompt_default_focus_when_missing(self):
-        """Si no hay ai_analysis_focus, se usa el default."""
+        """Si no hay ai_analysis_focus, se usa el default segun la fuente."""
         from dt_alerts.summarizer import build_ai_prompt
         settings = self._make_settings(Path(tempfile.mkdtemp()) / "t.db")
         doc = {
@@ -1409,7 +1562,13 @@ class NewPhasesTestCase(unittest.TestCase):
             "publication_date": "2026-01-01", "canonical_url": "https://example.com",
         }
         _, user_p = build_ai_prompt(doc, settings, {})
+        self.assertIn("Dirección del Trabajo", user_p)
         self.assertIn("cumplimiento laboral", user_p)
+
+        sii_doc = {**doc, "canonical_url": "https://www.sii.cl/normativa_legislacion/circulares/2026/foo.htm"}
+        _, sii_user_p = build_ai_prompt(sii_doc, settings, {})
+        self.assertIn("Servicio de Impuestos Internos", sii_user_p)
+        self.assertIn("cumplimiento tributario", sii_user_p)
 
     def test_08_prompt_no_invented_data_instruction(self):
         """El prompt incluye instrucción de no inventar datos."""
@@ -1550,7 +1709,7 @@ class NewPhasesTestCase(unittest.TestCase):
             "ai_detailed_summary_json": json.dumps({
                 "descripcion": "Descripción del documento.",
                 "impacto_contable": "Afecta los libros contables.",
-                "impacto_laboral": "Modifica las liquidaciones.",
+                "impacto_tributario": "Modifica las declaraciones.",
                 "acciones_recomendadas": "Actualizar plantillas.",
                 "riesgos": "Multas por incumplimiento.",
                 "plazos": "30 días desde publicación.",
@@ -1562,7 +1721,7 @@ class NewPhasesTestCase(unittest.TestCase):
         }
         html_out = generate_detailed_summary_html(1, alert)
         self.assertIn("Impacto contable", html_out)
-        self.assertIn("Impacto laboral", html_out)
+        self.assertIn("Impacto tributario", html_out)
         self.assertIn("Acciones recomendadas", html_out)
         self.assertIn("Afecta los libros contables.", html_out)
 

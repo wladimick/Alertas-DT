@@ -9,6 +9,7 @@ from typing import Any
 
 from . import db
 from .config import Settings, get_settings
+from .sources import source_context
 
 
 @dataclass
@@ -76,6 +77,7 @@ def build_ai_prompt(
 ) -> tuple[str, str]:
     """Returns (system_prompt, user_prompt). Input is truncated to AI_MAX_INPUT_CHARS."""
     source_text = build_source_text(document, settings.ai_max_input_chars)
+    ctx = source_context(document)
 
     style = (
         app_settings.get("ai_summary_style")
@@ -84,15 +86,14 @@ def build_ai_prompt(
     extra = app_settings.get("ai_system_prompt") or ""
     analysis_focus = (
         app_settings.get("ai_analysis_focus")
-        or "Explicar impactos prácticos en cumplimiento laboral, gestión contable, "
-           "auditoría, remuneraciones y obligaciones documentales."
+        or ctx["analysis_focus"]
     )
 
     system_prompt = (
-        "Eres un analista legal-laboral chileno especializado en normativa de la "
-        "Dirección del Trabajo (DT). "
+        f"Eres un analista chileno especializado en normativa {ctx['domain']} de "
+        f"{ctx['institution']} ({ctx['short']}). "
         f"Estilo editorial: {style} "
-        "Tu audiencia son contadores, jefes de RRHH, administradores y empresas chilenas. "
+        f"Tu audiencia son {ctx['audience']}. "
         "No inventes obligaciones, fechas, artículos, montos ni sanciones que no estén en el texto. "
         "Si falta información, indica exactamente 'no informado en el documento'. "
         "No reemplaces la lectura del documento oficial. "
@@ -101,8 +102,8 @@ def build_ai_prompt(
         + (extra.strip() + " " if extra.strip() else "")
     ).strip()
 
-    user_prompt = f"""Analiza este documento de la Dirección del Trabajo de Chile.
-Audiencia: contadores, administradores, RRHH y empresas.
+    user_prompt = f"""Analiza este documento de {ctx['institution']} de Chile.
+Audiencia: {ctx['audience']}.
 Enfoque del análisis: {analysis_focus}
 
 El correo debe contener un resumen breve y los impactos en el día a día del contador.
@@ -114,9 +115,9 @@ Responde ÚNICAMENTE con este JSON (sin markdown, sin texto extra):
   "title": "Título corregido del documento (sin agregar información no presente)",
   "category": "Categoría normativa (ej: Circular, Dictamen, Resolución, Ordinario)",
   "official_date": "Fecha oficial del documento si existe, o null",
-  "source_institution": "Dirección del Trabajo",
+  "source_institution": "{ctx['institution']}",
   "relevance": "bajo|medio|alto",
-  "email_subject": "Nueva normativa DT: [título conciso]",
+  "email_subject": "Nueva normativa {ctx['short']}: [título conciso]",
   "email_summary": "Resumen breve de 2 a 3 párrafos para el cuerpo del correo. Lenguaje claro para contadores.",
   "key_points": [
     "Punto clave 1: qué establece el documento",
@@ -124,11 +125,11 @@ Responde ÚNICAMENTE con este JSON (sin markdown, sin texto extra):
     "Punto clave 3: fecha o vigencia si aplica"
   ],
   "practical_impacts": [
-    {{"title": "Impacto en remuneraciones", "description": "Descripción del impacto en el día a día del contador."}},
-    {{"title": "Impacto en cumplimiento laboral", "description": "Qué debe verificar o ajustar la empresa."}}
+    {{"title": "Impacto tributario", "description": "Descripción del impacto en el día a día del contador."}},
+    {{"title": "Impacto en cumplimiento", "description": "Qué debe verificar o ajustar la empresa o contribuyente."}}
   ],
   "recommended_actions": [
-    "Acción concreta 1 que debe tomar el contador o RRHH",
+    "Acción concreta 1 que debe tomar el contador o asesor tributario",
     "Acción concreta 2 con plazo si corresponde"
   ],
   "executive_summary": {{
@@ -138,12 +139,12 @@ Responde ÚNICAMENTE con este JSON (sin markdown, sin texto extra):
   "detailed_summary": {{
     "descripcion": "Descripción detallada del documento y su alcance.",
     "impacto_contable": "Impacto en registros contables, libros o declaraciones.",
-    "impacto_laboral": "Impacto en contratos, remuneraciones, finiquitos o licencias.",
+    "{ctx['impact_field']}": "{ctx['impact_label']} en el día a día del contador y la empresa.",
     "acciones_recomendadas": "Pasos concretos para cumplir o implementar.",
     "riesgos": "Riesgos de no cumplir, si el documento los menciona.",
     "plazos": "Plazos relevantes mencionados en el documento, o 'no informado'."
   }},
-  "tags": ["Dirección del Trabajo", "Normativa laboral", "Contadores"],
+  "tags": ["{ctx['tags'].replace(', ', '", "')}"],
   "legal_disclaimer": "Este resumen es informativo y no reemplaza la lectura del documento oficial ni asesoría profesional."
 }}
 
@@ -405,7 +406,7 @@ def validate_ai_summary(data: dict[str, Any]) -> dict[str, Any]:
         "title": _clean_str(data.get("title", "")) or None,
         "category": _clean_str(data.get("category", "")) or None,
         "official_date": _clean_str(data.get("official_date") or ""),
-        "source_institution": _clean_str(data.get("source_institution", "Dirección del Trabajo")),
+        "source_institution": _clean_str(data.get("source_institution", "Fuente oficial")),
         "relevance": relevance,
         "email_subject": _clean_str(data.get("email_subject", ""))[:200],
         "email_summary": _clean_str(data.get("email_summary", ""), max_len=5000),
@@ -428,6 +429,7 @@ def validate_ai_summary(data: dict[str, Any]) -> dict[str, Any]:
 
 def generate_fallback_summary(document: dict[str, Any]) -> dict[str, Any]:
     """Generate structured summary locally when AI is disabled or fails."""
+    ctx = source_context(document)
     text = " ".join(
         part
         for part in [document.get("abstract") or "", document.get("detail_text") or ""]
@@ -437,35 +439,35 @@ def generate_fallback_summary(document: dict[str, Any]) -> dict[str, Any]:
     email_summary = _clean_str(" ".join(sentences[:2]))
     if not email_summary:
         email_summary = (
-            f"La DT publicó un nuevo documento en la categoría "
+            f"{ctx['institution']} publicó un nuevo documento en la categoría "
             f"{document.get('category', 'normativa')}. "
             "Consulta el texto oficial para confirmar alcance y vigencia."
         )
 
     key_points = [_clean_str(s) for s in sentences[:4] if _clean_str(s)] or [
-        "Documento publicado por la Dirección del Trabajo.",
+        f"Documento publicado por {ctx['institution']}.",
         "Revisar el texto oficial para confirmar alcance y vigencia.",
     ]
 
     impacts = _infer_impacts(" ".join([document.get("title") or "", text]))
     relevance = _infer_relevance(" ".join([document.get("title") or "", text]))
 
-    title = document.get("title") or "Documento DT"
+    title = document.get("title") or f"Documento {ctx['short']}"
     category = document.get("category") or "Normativa"
-    subject = f"Nueva normativa DT: {_clean_str(title, 100)}"
+    subject = f"Nueva normativa {ctx['short']}: {_clean_str(title, 100)}"
 
     return {
         "title": title,
         "category": category,
         "official_date": document.get("publication_date") or None,
-        "source_institution": "Dirección del Trabajo",
+        "source_institution": ctx["institution"],
         "relevance": relevance,
         "email_subject": subject,
         "email_summary": email_summary,
         "key_points": key_points[:5],
         "practical_impacts": [{"title": i, "description": ""} for i in impacts],
         "recommended_actions": [
-            "Revisar el documento oficial en el sitio de la Dirección del Trabajo.",
+            f"Revisar el documento oficial en el sitio de {ctx['institution']}.",
             "Evaluar impacto en clientes y empresas asesoradas.",
         ],
         "executive_summary": {
@@ -482,7 +484,7 @@ def generate_fallback_summary(document: dict[str, Any]) -> dict[str, Any]:
                 ),
             ],
         },
-        "tags": [category, "Dirección del Trabajo", "Normativa laboral"],
+        "tags": [category, ctx["institution"], f"Normativa {ctx['domain']}"],
         "legal_disclaimer": (
             "Este resumen es informativo y no reemplaza la lectura del documento oficial "
             "ni asesoría profesional."
@@ -549,7 +551,7 @@ def _validated_to_result(
             impacts.append(_clean_str(label))
 
     return SummaryResult(
-        summary=validated.get("email_summary") or "Documento DT detectado.",
+        summary=validated.get("email_summary") or "Documento normativo detectado.",
         key_points=[_clean_str(k) for k in validated.get("key_points", []) if _clean_str(k)][:5],
         practical_impacts=[i for i in impacts if i][:5],
         relevance=validated.get("relevance") or "medio",
@@ -768,7 +770,7 @@ def _stored_to_result(ai_summary: dict[str, Any]) -> SummaryResult:
     else:
         impacts = [str(i) for i in impacts_raw]
     return SummaryResult(
-        summary=ai_summary.get("email_summary") or "Documento DT detectado.",
+        summary=ai_summary.get("email_summary") or "Documento normativo detectado.",
         key_points=[_clean_str(k) for k in key_points if _clean_str(k)][:5],
         practical_impacts=[_clean_str(i) for i in impacts if _clean_str(i)][:5],
         relevance=ai_summary.get("relevance") or "medio",
@@ -834,11 +836,11 @@ def _infer_impacts(text: str) -> list[str]:
     impacts: list[str] = []
     if any(w in lower for w in ["remuner", "sueldo", "gratificación", "cotización"]):
         impacts.append(
-            "Revisar efectos en liquidaciones, remuneraciones, cotizaciones o cálculos laborales."
+            "Revisar efectos en declaraciones, pagos, créditos, registros o cálculos tributarios."
         )
     if any(w in lower for w in ["contrato", "jornada", "turno", "teletrabajo"]):
         impacts.append(
-            "Evaluar ajustes en contratos, anexos, jornadas o políticas internas."
+            "Evaluar ajustes en procesos internos, respaldos, declaraciones o comunicaciones a clientes."
         )
     if any(w in lower for w in ["registro", "libro", "electrónico", "fiscalización"]):
         impacts.append(
@@ -854,18 +856,18 @@ def _infer_impacts(text: str) -> list[str]:
         )
     if not impacts:
         impacts.append(
-            "Determinar si el criterio aplica a clientes, trabajadores o empresas asesoradas."
+            "Determinar si el criterio aplica a clientes, contribuyentes o empresas asesoradas."
         )
         impacts.append(
-            "Guardar el documento oficial como respaldo para futuras revisiones laborales."
+            "Guardar el documento oficial como respaldo para futuras revisiones tributarias."
         )
     return impacts[:5]
 
 
 def _infer_relevance(text: str) -> str:
     lower = text.lower()
-    high = ["multa", "sanción", "cotización", "remuner", "jornada", "registro electrónico", "ley n°"]
-    medium = ["contrato", "fiscalización", "dictamen", "resolución", "circular", "ordinario"]
+    high = ["multa", "sanción", "iva", "renta", "código tributario", "condonación", "fiscalización", "ley n°"]
+    medium = ["declaración", "crédito", "resolución", "circular", "oficio", "jurisprudencia"]
     if any(t in lower for t in high):
         return "alto"
     if any(t in lower for t in medium):

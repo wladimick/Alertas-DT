@@ -28,7 +28,7 @@ class ADT_Shortcode {
             'ajaxUrl' => admin_url( 'admin-ajax.php' ),
             'nonce'   => wp_create_nonce( 'adt_subscribe' ),
             'msgs'    => [
-                'success_new'     => 'Listo, quedaste inscrito en Alertas DT.',
+                'success_new'     => 'Listo, quedaste inscrito en Alertas DT + SII.',
                 'success_updated' => 'Tu suscripción ya existía y fue actualizada correctamente.',
                 'error_email'     => 'Ingresa un correo electrónico válido.',
                 'error_consent'   => 'Debes aceptar recibir alertas para continuar.',
@@ -87,7 +87,7 @@ class ADT_Shortcode {
 
             <label class="eg-check eg-check--consent">
                 <input type="checkbox" name="consent" value="1" required>
-                <span>Acepto recibir alertas informativas por email sobre nuevas publicaciones de la Dirección del Trabajo.</span>
+                <span>Acepto recibir alertas informativas por email sobre nuevas publicaciones de la DT y el SII.</span>
             </label>
 
             <label class="eg-check eg-check--whatsapp" id="adt-whatsapp-check" style="display:none;">
@@ -132,7 +132,7 @@ class ADT_Shortcode {
                 </div>
                 <label class="eg-check eg-check--consent">
                     <input type="checkbox" name="consent" value="1" required>
-                    <span>Acepto recibir alertas informativas por email sobre nuevas publicaciones de la Dirección del Trabajo.</span>
+                    <span>Acepto recibir alertas informativas por email sobre nuevas publicaciones de la DT y el SII.</span>
                 </label>
                 <button class="eg-btn eg-btn--primary eg-btn--block" type="submit">Suscribirme a las alertas</button>
             </form>
@@ -149,7 +149,7 @@ class ADT_Shortcode {
 
         // Honeypot check
         if ( ! empty( $_POST['adt_website'] ) ) {
-            wp_send_json_success( [ 'message' => 'Listo, quedaste inscrito en Alertas DT.' ] );
+            wp_send_json_success( [ 'message' => 'Listo, quedaste inscrito en Alertas DT + SII.' ] );
         }
 
         $email   = isset( $_POST['email'] )   ? sanitize_email( wp_unslash( $_POST['email'] ) )   : '';
@@ -168,7 +168,7 @@ class ADT_Shortcode {
                 'whatsapp_consent' => ! empty( $_POST['whatsapp_consent'] ),
             ] );
             $msg = $result['created']
-                ? 'Listo, quedaste inscrito en Alertas DT.'
+                ? 'Listo, quedaste inscrito en Alertas DT + SII.'
                 : 'Tu suscripción ya existía y fue actualizada correctamente.';
             wp_send_json_success( [ 'message' => $msg, 'created' => $result['created'] ] );
         } catch ( InvalidArgumentException $e ) {

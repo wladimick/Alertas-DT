@@ -1,6 +1,6 @@
 <?php
 /**
- * Shortcode WordPress para insertar el formulario SaaS de Alertas DT.
+ * Shortcode WordPress para insertar el formulario SaaS de Alertas DT + SII.
  *
  * Uso:
  * [dt_alertas_form base_url="https://alertas.tudominio.cl"]
@@ -21,7 +21,7 @@ function dt_alertas_form_shortcode($atts) {
     $height = intval($atts['height']);
 
     return sprintf(
-        '<iframe src="%s" style="width:100%%;min-height:%dpx;border:0;display:block;" loading="lazy" title="Formulario Alertas DT"></iframe>',
+        '<iframe src="%s" style="width:100%%;min-height:%dpx;border:0;display:block;" loading="lazy" title="Formulario Alertas DT + SII"></iframe>',
         $src,
         $height
     );

@@ -1,8 +1,8 @@
 <?php
 /**
- * Plugin Name:       Alertas DT Bridge
+ * Plugin Name:       Alertas DT + SII Bridge
  * Plugin URI:        https://github.com/wladimick/Alertas-DT
- * Description:       Formulario de suscripción Alertas DT y API REST para sincronización con app local.
+ * Description:       Formulario de suscripción Alertas DT + SII y API REST para sincronización con app local.
  * Version:           0.2.0
  * Requires at least: 6.0
  * Requires PHP:      8.0

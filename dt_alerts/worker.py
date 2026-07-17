@@ -6,8 +6,9 @@ import time
 from typing import Any
 
 from . import db
-from .config import DT_SOURCES, Settings, get_settings
+from .config import MONITOR_SOURCES, Settings, get_settings
 from .dt_scraper import ScrapedDocument, content_hash, enrich_document_detail, fetch_listing
+from .sources import source_kind
 from .summarizer import _generate_and_save as _ai_generate, summarize_document
 
 
@@ -16,8 +17,22 @@ if not log.handlers:
     logging.basicConfig(level=logging.INFO, format="%(asctime)s %(levelname)s %(name)s: %(message)s")
 
 
-def run_check(settings: Settings | None = None) -> dict[str, Any]:
+def _normalize_source_filter(source_filter: str | None) -> str:
+    source = (source_filter or "all").strip().lower()
+    return source if source in {"all", "dt", "sii"} else "all"
+
+
+def run_check(
+    settings: Settings | None = None,
+    *,
+    source_filter: str | None = None,
+) -> dict[str, Any]:
     settings = settings or get_settings()
+    normalized_filter = _normalize_source_filter(source_filter)
+    sources = [
+        source for source in MONITOR_SOURCES
+        if normalized_filter == "all" or source_kind(source) == normalized_filter
+    ]
     db.init_db(settings.database_path)
 
     discovered_count = 0
@@ -26,14 +41,22 @@ def run_check(settings: Settings | None = None) -> dict[str, Any]:
     source_errors: list[str] = []
 
     with db.connect(settings.database_path) as conn:
-        job_id = db.start_job(conn, "check-dt")
-        baseline_run = db.count_documents(conn) == 0 and not settings.alert_on_first_run
+        job_type = (
+            "check-normative"
+            if normalized_filter == "all"
+            else f"check-normative:{normalized_filter}"
+        )
+        job_id = db.start_job(conn, job_type)
+        baseline_run = (
+            db.count_documents(conn, source_filter=normalized_filter) == 0
+            and not settings.alert_on_first_run
+        )
         log.info(
-            "Job check-dt iniciado (id=%s, baseline=%s, fuentes=%s)",
-            job_id, baseline_run, len(DT_SOURCES),
+            "Job %s iniciado (id=%s, baseline=%s, fuentes=%s)",
+            job_type, job_id, baseline_run, len(sources),
         )
         try:
-            for source in DT_SOURCES:
+            for source in sources:
                 try:
                     docs = fetch_listing(
                         source, limit=settings.max_listing_documents_per_source
@@ -64,7 +87,7 @@ def run_check(settings: Settings | None = None) -> dict[str, Any]:
 
             status = "success" if not source_errors else "partial"
             log.info(
-                "Job check-dt %s: nuevos=%s procesados=%s envios=%s errores=%s",
+                "Job check-normative %s: nuevos=%s procesados=%s envios=%s errores=%s",
                 status, discovered_count, processed_count, sent_count, len(source_errors),
             )
             db.finish_job(
@@ -78,6 +101,8 @@ def run_check(settings: Settings | None = None) -> dict[str, Any]:
             )
             return {
                 "status": status,
+                "source_filter": normalized_filter,
+                "source_count": len(sources),
                 "baseline_run": baseline_run,
                 "discovered_count": discovered_count,
                 "processed_count": processed_count,
@@ -85,7 +110,7 @@ def run_check(settings: Settings | None = None) -> dict[str, Any]:
                 "source_errors": source_errors,
             }
         except Exception as exc:
-            log.error("Job check-dt falló: %s", exc)
+            log.error("Job check-normative falló: %s", exc)
             db.finish_job(
                 conn,
                 job_id,

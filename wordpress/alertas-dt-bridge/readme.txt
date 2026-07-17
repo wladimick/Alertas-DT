@@ -1,4 +1,4 @@
-=== Alertas DT Bridge ===
+=== Alertas DT + SII Bridge ===
 Contributors:       externalgroup
 Tags:               alertas, dt, dirección del trabajo, suscripción, email
 Requires at least:  6.0
@@ -8,17 +8,17 @@ Stable tag:         0.1.0
 License:            GPL-2.0-or-later
 License URI:        https://www.gnu.org/licenses/gpl-2.0.html
 
-Formulario de suscripción Alertas DT y API REST para sincronización con app Python local.
+Formulario de suscripción Alertas DT + SII y API REST para sincronización con app Python local.
 
 == Descripción ==
 
-Este plugin permite capturar suscriptores en WordPress mediante un shortcode y expone una API REST privada para que la app Python local (Alertas DT) sincronice esos suscriptores a su base SQLite y envíe alertas por email con SendGrid.
+Este plugin permite capturar suscriptores en WordPress mediante un shortcode y expone una API REST privada para que la app Python local (Alertas DT + SII) sincronice esos suscriptores a su base SQLite y envíe alertas por email con SendGrid.
 
 Arquitectura recomendada:
 
 1. WordPress público captura suscriptores con [alertas_dt_form].
 2. App Python local consulta /wp-json/alertas-dt/v1/subscribers.
-3. App Python local monitorea la Dirección del Trabajo y envía alertas por SendGrid.
+3. App Python local monitorea la DT y el SII, y envía alertas por SendGrid.
 
 No se envían correos desde WordPress.
 No se hace scraping desde WordPress.
@@ -28,7 +28,7 @@ La app local no queda expuesta a internet.
 
 1. Sube la carpeta `alertas-dt-bridge` a `wp-content/plugins/`.
 2. Activa el plugin en "Plugins" de WordPress.
-3. Ve a "Alertas DT" en el menú de administración.
+3. Ve a "Alertas DT + SII" en el menú de administración.
 4. Copia el shortcode `[alertas_dt_form]` y pégalo en cualquier página.
 5. Copia el token API y configura la app Python local.
 

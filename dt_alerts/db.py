@@ -293,8 +293,25 @@ def set_subscriber_status(conn: sqlite3.Connection, subscriber_id: int, status: 
     conn.commit()
 
 
-def count_documents(conn: sqlite3.Connection) -> int:
-    row = conn.execute("SELECT COUNT(*) AS total FROM documents").fetchone()
+def _document_source_where(source_filter: str | None = None) -> str:
+    source = (source_filter or "all").strip().lower()
+    if source not in {"dt", "sii"}:
+        return ""
+    sii_clause = (
+        "(LOWER(category) LIKE 'sii -%' "
+        "OR LOWER(canonical_url) LIKE '%sii.cl%' "
+        "OR LOWER(source_url) LIKE '%sii.cl%' "
+        "OR LOWER(dt_article_id) LIKE 'sii%')"
+    )
+    if source == "sii":
+        return f" WHERE {sii_clause}"
+    return f" WHERE NOT {sii_clause}"
+
+
+def count_documents(conn: sqlite3.Connection, source_filter: str | None = None) -> int:
+    row = conn.execute(
+        "SELECT COUNT(*) AS total FROM documents" + _document_source_where(source_filter)
+    ).fetchone()
     return int(row["total"])
 
 
@@ -403,9 +420,16 @@ def set_document_status(conn: sqlite3.Connection, document_id: int, status: str)
     conn.commit()
 
 
-def list_documents(conn: sqlite3.Connection, limit: int = 200) -> list[dict[str, Any]]:
+def list_documents(
+    conn: sqlite3.Connection,
+    limit: int = 200,
+    source_filter: str | None = None,
+) -> list[dict[str, Any]]:
     rows = conn.execute(
-        "SELECT * FROM documents ORDER BY detected_at DESC, id DESC LIMIT ?", (limit,)
+        "SELECT * FROM documents"
+        + _document_source_where(source_filter)
+        + " ORDER BY detected_at DESC, id DESC LIMIT ?",
+        (limit,),
     ).fetchall()
     return [dict(row) for row in rows]
 

@@ -2,42 +2,81 @@ from __future__ import annotations
 
 import os
 from dataclasses import dataclass
+from datetime import datetime
 from pathlib import Path
 
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 DT_BASE_URL = "https://www.dt.gob.cl/legislacion/1624/"
+SII_YEAR = int(os.getenv("SII_YEAR", str(datetime.now().year)))
+SII_BASE_URL = "https://www.sii.cl/normativa_legislacion/"
 
 DT_SOURCES = [
     {
-        "category": "Portada normativa",
+        "category": "DT - Portada normativa",
         "url": "https://www.dt.gob.cl/legislacion/1624/w3-channel.html",
     },
     {
-        "category": "Resoluciones",
+        "category": "DT - Resoluciones",
         "url": "https://www.dt.gob.cl/legislacion/1624/w3-propertyvalue-24000.html",
     },
     {
-        "category": "Dictámenes",
+        "category": "DT - Dictámenes",
         "url": "https://www.dt.gob.cl/legislacion/1624/w3-propertyvalue-22762.html",
     },
     {
-        "category": "Órdenes de Servicio",
+        "category": "DT - Órdenes de Servicio",
         "url": "https://www.dt.gob.cl/legislacion/1624/w3-propertyvalue-28189.html",
     },
     {
-        "category": "Circulares",
+        "category": "DT - Circulares",
         "url": "https://www.dt.gob.cl/legislacion/1624/w3-propertyvalue-81218.html",
     },
     {
-        "category": "Ordinarios",
+        "category": "DT - Ordinarios",
         "url": "https://www.dt.gob.cl/legislacion/1624/w3-propertyvalue-147182.html",
     },
     {
-        "category": "Resumen de Jurisprudencia Administrativa",
+        "category": "DT - Resumen de Jurisprudencia Administrativa",
         "url": "https://www.dt.gob.cl/legislacion/1624/w3-propertyvalue-174414.html",
     },
 ]
+
+SII_SOURCES = [
+    {
+        "category": "SII - Circulares",
+        "url": f"https://www.sii.cl/normativa_legislacion/circulares/{SII_YEAR}/indcir{SII_YEAR}.htm",
+        "type": "sii_listing",
+    },
+    {
+        "category": "SII - Resoluciones",
+        "url": f"https://www.sii.cl/normativa_legislacion/resoluciones/{SII_YEAR}/res_ind{SII_YEAR}.htm",
+        "type": "sii_listing",
+    },
+    {
+        "category": "SII - Jurisprudencia administrativa - Renta",
+        "url": f"https://www.sii.cl/normativa_legislacion/jurisprudencia_administrativa/ley_impuesto_renta/{SII_YEAR}/ley_impuesto_renta_jadm{SII_YEAR}.htm",
+        "type": "sii_jurisprudence",
+        "key": "RENTA",
+        "year": SII_YEAR,
+    },
+    {
+        "category": "SII - Jurisprudencia administrativa - IVA",
+        "url": f"https://www.sii.cl/normativa_legislacion/jurisprudencia_administrativa/ley_impuesto_ventas/{SII_YEAR}/ley_impuesto_ventas_jadm{SII_YEAR}.htm",
+        "type": "sii_jurisprudence",
+        "key": "IVA",
+        "year": SII_YEAR,
+    },
+    {
+        "category": "SII - Jurisprudencia administrativa - Otras normas",
+        "url": f"https://www.sii.cl/normativa_legislacion/jurisprudencia_administrativa/otras_normas/{SII_YEAR}/otras_normas_jadm{SII_YEAR}.htm",
+        "type": "sii_jurisprudence",
+        "key": "OTROS",
+        "year": SII_YEAR,
+    },
+]
+
+MONITOR_SOURCES = DT_SOURCES + SII_SOURCES
 
 
 def env_bool(name: str, default: bool = False) -> bool:
@@ -125,7 +164,7 @@ class Settings:
 
 
 def get_settings() -> Settings:
-    db_path = Path(os.getenv("DATABASE_PATH", "data/dt_alertas.sqlite3"))
+    db_path = Path(os.getenv("DATABASE_PATH", "data/alertas_normativas.sqlite3"))
     if not db_path.is_absolute():
         db_path = PROJECT_ROOT / db_path
 
@@ -152,7 +191,7 @@ def get_settings() -> Settings:
         sendgrid_api_key=os.getenv("SENDGRID_API_KEY", ""),
         resend_api_key=os.getenv("RESEND_API_KEY", ""),
         email_from=os.getenv("EMAIL_FROM", "alertas@example.com"),
-        email_from_name=os.getenv("EMAIL_FROM_NAME", "Alertas DT"),
+        email_from_name=os.getenv("EMAIL_FROM_NAME", "Alertas DT + SII"),
         email_reply_to=os.getenv("EMAIL_REPLY_TO", ""),
         test_email_to=os.getenv("TEST_EMAIL_TO", ""),
         smtp_host=os.getenv("SMTP_HOST", ""),
@@ -164,7 +203,7 @@ def get_settings() -> Settings:
         whatsapp_phone_number_id=os.getenv("WHATSAPP_PHONE_NUMBER_ID", ""),
         whatsapp_access_token=os.getenv("WHATSAPP_ACCESS_TOKEN", ""),
         whatsapp_template_name=os.getenv(
-            "WHATSAPP_TEMPLATE_NAME", "dt_alerta_normativa"
+            "WHATSAPP_TEMPLATE_NAME", "alerta_normativa"
         ),
         whatsapp_language=os.getenv("WHATSAPP_LANGUAGE", "es"),
         # WordPress sync (desactivado por defecto; no rompe si no está configurado)

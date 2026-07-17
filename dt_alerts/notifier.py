@@ -12,6 +12,7 @@ from typing import Any
 
 from . import db
 from .config import Settings
+from .sources import source_context
 
 
 # Paleta External Group para el email (inline styles para compatibilidad).
@@ -49,12 +50,15 @@ def subject_for(alert: dict[str, Any]) -> str:
     """
     Priority:
     1. AI-generated email_subject (ai_email_subject from joined query)
-    2. Fallback: "Nueva normativa DT: {title}"
+    2. Fallback: "Nueva normativa {DT|SII}: {title}"
     """
     ai_subject = (alert.get("ai_email_subject") or "").strip()
     if ai_subject:
         return truncate_subject(ai_subject)
-    return f"Nueva normativa DT: {truncate_subject(alert.get('title') or 'documento')}"
+    return (
+        f"Nueva normativa {source_context(alert)['short']}: "
+        f"{truncate_subject(alert.get('title') or 'documento')}"
+    )
 
 
 def _parse_json_field(value: Any, default: Any = None) -> Any:
@@ -124,11 +128,12 @@ def render_alert_email_text(alert: dict[str, Any]) -> str:
     tags = ai.get("tags") or []
     disclaimer = ai.get("legal_disclaimer") or AI_DISCLAIMER
 
+    ctx = source_context(alert)
     lines = [
-        "EXTERNAL GROUP · ALERTAS DT",
-        "Nueva publicación de la Dirección del Trabajo",
+        "EXTERNAL GROUP · ALERTAS DT + SII",
+        f"Nueva publicación de {ctx['institution']}",
         "",
-        alert.get("title") or "Documento DT",
+        alert.get("title") or "Documento",
         f"Categoría: {alert.get('category') or 'normativa'}",
         f"Fecha: {alert.get('publication_date') or 'sin fecha informada'}",
         f"Relevancia: {alert.get('relevance') or 'media'}",
@@ -294,7 +299,7 @@ def render_alert_email_html(alert: dict[str, Any]) -> str:
     tags = ai.get("tags") or []
     disclaimer = ai.get("legal_disclaimer") or AI_DISCLAIMER
 
-    title = html.escape(alert.get("title") or "Documento DT")
+    title = html.escape(alert.get("title") or "Documento")
     category = html.escape(alert.get("category") or "Normativa")
     pub_date = html.escape(alert.get("publication_date") or "sin fecha informada")
     relevance = html.escape(alert.get("relevance") or "media")
@@ -416,7 +421,7 @@ def render_alert_email_html(alert: dict[str, Any]) -> str:
         f'<div style="width:1px;height:24px;background:#29B78D;opacity:0.4;"></div></td>'
         f'<td style="vertical-align:middle;">'
         f'<span style="font-size:10px;font-weight:700;letter-spacing:0.14em;'
-        f'text-transform:uppercase;color:#29B78D;">Alertas DT</span></td>'
+        f'text-transform:uppercase;color:#29B78D;">Alertas DT + SII</span></td>'
         f'</tr>'
         f'</table>'
         f'</td>'
@@ -436,7 +441,7 @@ def render_alert_email_html(alert: dict[str, Any]) -> str:
         f'{header_html}\n'
         f'<div class="accent-bar"></div>\n'
         f'<div class="doc-card">'
-        f'<div class="doc-type">Nueva publicación · {category}</div>'
+        f'<div class="doc-type">Nueva publicación de {html.escape(source_context(alert)["institution"])} · {category}</div>'
         f'<div class="doc-title">{title}</div>'
         f'<div class="doc-meta">{pub_date} · <span class="relevancia-badge">{relevance}</span></div>'
         f'<div style="height:3px;background:#29B78D;margin-top:22px;"></div>'
@@ -450,12 +455,12 @@ def render_alert_email_html(alert: dict[str, Any]) -> str:
         f'{acciones_html}'
         f'{tags_html}'
         f'<div class="cta-section">'
-        f'<a class="cta-btn" href="{url}" target="_blank">Ver documento oficial en DT →</a>'
+        f'<a class="cta-btn" href="{url}" target="_blank">Ver documento oficial en {html.escape(source_context(alert)["short"])} →</a>'
         f'<div class="cta-sub">Se adjuntan resúmenes en este correo</div>'
         f'</div>\n'
         f'<div class="footer">'
         f'<div class="disclaimer">{disclaimer_esc}</div>'
-        f'<div class="footer-brand"><strong>External Group</strong> · Alertas DT</div>'
+        f'<div class="footer-brand"><strong>External Group</strong> · Alertas DT + SII</div>'
         f'</div>\n'
         f'</div>\n</body>\n</html>'
     )
@@ -482,7 +487,8 @@ def generate_executive_summary_html(document_id: int, alert: dict[str, Any]) -> 
     else:
         executive = {"title": "Resumen ejecutivo", "body": str(raw)}
 
-    doc_title = html.escape(alert.get("title") or "Documento DT")
+    ctx = source_context(alert)
+    doc_title = html.escape(alert.get("title") or "Documento")
     category = html.escape(alert.get("category") or "Normativa")
     pub_date = html.escape(alert.get("publication_date") or "sin fecha")
     relevance = html.escape(alert.get("relevance") or "")
@@ -512,7 +518,7 @@ def generate_executive_summary_html(document_id: int, alert: dict[str, Any]) -> 
         f'<div class="header-brand">'
         f'<img class="header-logo" src="{EG_LOGO_LIGHT}" alt="External Group">'
         f'<div class="header-divider"></div>'
-        f'<span class="header-tag">Alertas DT</span>'
+        f'<span class="header-tag">Alertas DT + SII</span>'
         f'</div>'
         f'<span class="header-badge">Resumen ejecutivo</span>'
         f'</div>\n'
@@ -520,7 +526,7 @@ def generate_executive_summary_html(document_id: int, alert: dict[str, Any]) -> 
         f'<div class="wrapper">\n'
         f'<div class="doc-card">'
         f'<div class="doc-card-header">'
-        f'<div class="doc-type">{category} · Dirección del Trabajo</div>'
+        f'<div class="doc-type">{category} · {html.escape(ctx["institution"])}</div>'
         f'<div class="doc-title">{doc_title}</div>'
         f'<div class="doc-meta"><span>{pub_date}</span>'
         f'{"<span>&middot;</span>" + relevance_badge if relevance_badge else ""}'
@@ -531,11 +537,11 @@ def generate_executive_summary_html(document_id: int, alert: dict[str, Any]) -> 
         f'Contenido generado con apoyo de inteligencia artificial. Revisar antes de tomar decisiones.'
         f'</div>'
         f'{paragraphs_html}'
-        f'<a class="link-btn" href="{url}" target="_blank">Ver documento oficial en DT →</a>'
+        f'<a class="link-btn" href="{url}" target="_blank">Ver documento oficial en {html.escape(ctx["short"])} →</a>'
         f'</div>'
         f'</div>\n'
         f'<div class="disclaimer">{disclaimer}</div>\n'
-        f'<div class="footer"><strong>External Group</strong> · Alertas DT · Documento #{document_id}</div>\n'
+        f'<div class="footer"><strong>External Group</strong> · Alertas DT + SII · Documento #{document_id}</div>\n'
         f'</div>\n</body>\n</html>'
     )
 
@@ -553,7 +559,8 @@ def generate_detailed_summary_html(document_id: int, alert: dict[str, Any]) -> s
     else:
         detailed = {"title": "Resumen detallado", "sections": []}
 
-    doc_title = html.escape(alert.get("title") or "Documento DT")
+    ctx = source_context(alert)
+    doc_title = html.escape(alert.get("title") or "Documento")
     category = html.escape(alert.get("category") or "Normativa")
     pub_date = html.escape(alert.get("publication_date") or "sin fecha")
     relevance = html.escape(alert.get("relevance") or "")
@@ -597,6 +604,7 @@ def generate_detailed_summary_html(document_id: int, alert: dict[str, Any]) -> s
         _FLAT_SECTIONS = [
             ("descripcion", "📄", "Descripción del documento"),
             ("impacto_contable", "📊", "Impacto contable"),
+            ("impacto_tributario", "🧾", "Impacto tributario"),
             ("impacto_laboral", "⚖️", "Impacto laboral"),
         ]
         for key, icon, label in _FLAT_SECTIONS:
@@ -667,7 +675,7 @@ def generate_detailed_summary_html(document_id: int, alert: dict[str, Any]) -> s
         f'<div class="header-brand">'
         f'<img class="header-logo" src="{EG_LOGO_LIGHT}" alt="External Group">'
         f'<div class="header-divider"></div>'
-        f'<span class="header-tag">Alertas DT</span>'
+        f'<span class="header-tag">Alertas DT + SII</span>'
         f'</div>'
         f'<span class="header-badge">Resumen detallado</span>'
         f'</div>\n'
@@ -675,7 +683,7 @@ def generate_detailed_summary_html(document_id: int, alert: dict[str, Any]) -> s
         f'<div class="wrapper">\n'
         f'<div class="doc-card">'
         f'<div class="doc-card-header">'
-        f'<div class="doc-type">{category} · Dirección del Trabajo</div>'
+        f'<div class="doc-type">{category} · {html.escape(ctx["institution"])}</div>'
         f'<div class="doc-title">{doc_title}</div>'
         f'<div class="doc-meta"><span>{pub_date}</span>'
         f'{"<span>&middot;</span>" + relevance_badge if relevance_badge else ""}'
@@ -683,9 +691,9 @@ def generate_detailed_summary_html(document_id: int, alert: dict[str, Any]) -> s
         f'</div>'
         f'</div>\n'
         f'{sections_html}'
-        f'<a class="link-btn" href="{url}" target="_blank">Ver documento oficial en DT →</a>\n'
+        f'<a class="link-btn" href="{url}" target="_blank">Ver documento oficial en {html.escape(ctx["short"])} →</a>\n'
         f'<div class="disclaimer">{disclaimer}</div>\n'
-        f'<div class="footer"><strong>External Group</strong> · Alertas DT · Documento #{document_id}</div>\n'
+        f'<div class="footer"><strong>External Group</strong> · Alertas DT + SII · Documento #{document_id}</div>\n'
         f'</div>\n</body>\n</html>'
     )
 
@@ -1053,7 +1061,7 @@ def dispatch_alert(conn: Any, alert_id: int, settings: Settings) -> int:
 
 
 # --------------------------------------------------------------------------
-# WhatsApp — reservado para fase futura
+# WhatsApp Business Cloud API
 # --------------------------------------------------------------------------
 
 def send_whatsapp_alert(
@@ -1061,8 +1069,62 @@ def send_whatsapp_alert(
     alert: dict[str, Any],
     settings: Settings,
 ) -> dict[str, str | None]:
-    return {
-        "status": "simulated",
-        "provider_message_id": None,
-        "error": "WhatsApp reservado para fase futura; no se envía en el MVP.",
+    phone = subscriber.get("whatsapp") or subscriber.get("phone")
+    if not phone:
+        return {
+            "status": "skipped",
+            "provider_message_id": None,
+            "error": "Suscriptor sin número WhatsApp.",
+        }
+    if (
+        not settings.whatsapp_enabled
+        or not settings.whatsapp_phone_number_id
+        or not settings.whatsapp_access_token
+    ):
+        return {
+            "status": "simulated",
+            "provider_message_id": None,
+            "error": "WhatsApp desactivado o sin credenciales; envío simulado.",
+        }
+
+    payload = {
+        "messaging_product": "whatsapp",
+        "to": phone,
+        "type": "template",
+        "template": {
+            "name": settings.whatsapp_template_name,
+            "language": {"code": settings.whatsapp_language},
+            "components": [
+                {
+                    "type": "body",
+                    "parameters": [
+                        {"type": "text", "text": truncate_subject(alert.get("title") or "Documento", 80)},
+                        {"type": "text", "text": truncate_subject(alert.get("summary") or "", 180)},
+                        {"type": "text", "text": str(alert.get("canonical_url") or "")},
+                    ],
+                }
+            ],
+        },
     }
+    endpoint = (
+        "https://graph.facebook.com/v20.0/"
+        f"{settings.whatsapp_phone_number_id}/messages"
+    )
+    request = urllib.request.Request(
+        endpoint,
+        data=json.dumps(payload).encode("utf-8"),
+        headers={
+            "Authorization": f"Bearer {settings.whatsapp_access_token}",
+            "Content-Type": "application/json",
+        },
+        method="POST",
+    )
+    try:
+        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+            body = json.loads(response.read().decode("utf-8"))
+        message_id = None
+        if body.get("messages"):
+            message_id = body["messages"][0].get("id")
+        return {"status": "sent", "provider_message_id": message_id, "error": None}
+    except Exception as exc:
+        return {"status": "failed", "provider_message_id": None, "error": str(exc)}

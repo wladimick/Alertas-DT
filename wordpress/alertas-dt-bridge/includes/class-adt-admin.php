@@ -23,8 +23,8 @@ class ADT_Admin {
 
     public static function add_menu(): void {
         add_menu_page(
-            'Alertas DT',
-            'Alertas DT',
+            'Alertas DT + SII',
+            'Alertas DT + SII',
             'manage_options',
             'alertas-dt',
             [ __CLASS__, 'render_page' ],
@@ -70,7 +70,7 @@ class ADT_Admin {
         }
         ?>
         <div class="wrap adt-admin">
-            <h1>Alertas DT <span class="adt-version">v<?php echo esc_html( ADT_VERSION ); ?></span></h1>
+            <h1>Alertas DT + SII <span class="adt-version">v<?php echo esc_html( ADT_VERSION ); ?></span></h1>
 
             <?php if ( $reveal_token ) : ?>
                 <div class="notice notice-warning adt-token-reveal" style="border-left-color:#d97706;">
