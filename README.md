@@ -1,191 +1,198 @@
 # Alertas DT + SII
 
-App Python (estándar + SQLite) que monitorea normativa de la Dirección del Trabajo y del Servicio de Impuestos Internos,
-genera resúmenes orientados a contadores y empresas, y envía alertas por email.
-Se integra con WordPress mediante un **plugin bridge** que captura suscriptores en el
-sitio público y los sincroniza a la app local por API REST privada. Diseño visual basado
-en el sistema **External Group**.
+Servicio de monitoreo normativo para contadores y empresas. Revisa publicaciones de
+la Dirección del Trabajo (DT) y del Servicio de Impuestos Internos (SII), detecta
+documentos nuevos, genera resúmenes con impacto práctico y administra el envío de
+alertas por email.
 
-> **Estado:** piloto funcional para revisión interna. No vender como 100% productivo.
-> WhatsApp queda preparado con API Business y solo envía si se configuran credenciales.
+La solución incluye una app Python con SQLite, un panel administrativo y un plugin
+bridge para integrar el formulario de suscripción con WordPress. La interfaz y las
+plantillas de correo usan el sistema visual de External Group.
 
-## Arquitectura recomendada
+> **Estado actual:** versión funcional integrada. Antes de usarla en producción deben
+> configurarse persistencia, credenciales, dominio remitente y ejecución programada.
+> WhatsApp está preparado a nivel de datos y consentimiento, pero requiere Meta
+> WhatsApp Business, credenciales y una plantilla aprobada.
 
-```
+## Funcionalidades
+
+- Monitoreo independiente o conjunto de fuentes DT y SII.
+- Detección de duplicados por URL canónica e identificador oficial.
+- Extracción de título, fecha, categoría, abstract, detalle y contenido PDF cuando
+  está disponible.
+- Resumen local de respaldo o resumen con OpenAI/Azure AI Foundry.
+- Resumen ejecutivo, puntos clave, impactos, acciones recomendadas, relevancia y
+  aviso legal.
+- Registro de uso de IA, límites diarios/mensuales y estimación de costo en USD/CLP.
+- Suscripción por email, WhatsApp opcional, consentimiento y actualización sin
+  duplicados.
+- Panel para administrar suscriptores, planes, documentos, alertas, jobs e
+  integraciones.
+- Revisión manual de alertas antes de enviarlas.
+- Vista previa HTML/texto, correo de prueba y envío masivo a suscriptores activos.
+- Email transaccional con SendGrid y plantillas compatibles con Outlook.
+- Sincronización privada de suscriptores desde WordPress.
+
+No están incluidos los pagos, la facturación ni la activación comercial de planes.
+
+## Arquitectura
+
+```text
 WordPress público
-  └─ Plugin [alertas_dt_form] → wp_alertas_dt_subscribers
-       └─ REST API privada (Bearer token)
-              ↓
-App Python local (computador del cliente)
-  ├─ Sincroniza suscriptores ← WordPress
-  ├─ Monitorea Dirección del Trabajo + Servicio de Impuestos Internos
-  ├─ Genera alertas (IA opcional + fallback)
-  └─ Envía emails con SendGrid
+  `- Plugin [alertas_dt_form]
+       |- guarda suscriptores en WordPress
+       `- expone API REST privada con Bearer token
+                         |
+                         v
+Servicio Python (local o cloud)
+  |- sincroniza suscriptores desde WordPress
+  |- monitorea DT + SII cada 6 horas
+  |- extrae paginas y PDF
+  |- genera resumen local o con IA
+  |- guarda documentos, alertas, envios y errores en SQLite
+  `- envía email con SendGrid
 ```
 
-La app Python **no se expone a internet**. El computador del cliente queda detrás del
-router. Solo WordPress es público.
+La app no necesita recibir conexiones desde WordPress: es la app la que consulta la
+API privada del plugin. Si se despliega en cloud, se recomienda HTTPS, una base de
+datos o disco persistente y un cron externo.
 
----
+## Fuentes monitoreadas
 
----
+### Dirección del Trabajo
 
-## Estado del piloto
+- Portada de normativa.
+- Resoluciones.
+- Dictámenes.
+- Órdenes de Servicio.
+- Circulares.
+- Ordinarios.
+- Resumen de Jurisprudencia Administrativa.
 
-**Qué funciona hoy**
+### Servicio de Impuestos Internos
 
-- Landing pública con diseño External Group.
-- Suscripción por **email** (validación, consentimiento obligatorio, sin duplicados).
-- Panel admin protegido por token: métricas reales, suscriptores, documentos, alertas y jobs.
-- Scraper/monitor DT + SII para dictámenes, ordinarios, circulares, resoluciones y jurisprudencia administrativa, con deduplicación por URL/ID oficial y tolerancia a fallas por fuente.
-- Generación de alertas con resumen, puntos clave, impacto práctico y relevancia (IA opcional + fallback local).
-- Vista previa de email (HTML + texto) desde el admin.
-- Envío transaccional preparado con **SendGrid** y **modo simulado/console** seguro.
-- Acción "Enviar prueba" y flujo de revisión → envío a suscriptores activos.
+- Circulares del año configurado.
+- Resoluciones del año configurado.
+- Jurisprudencia administrativa de Renta.
+- Jurisprudencia administrativa de IVA.
+- Jurisprudencia administrativa de otras normas.
 
-**Qué NO está activo en esta fase**
+`SII_YEAR` usa el año actual por defecto y permite consultar otro período.
 
-- Pagos y planes comerciales.
-- Migración a Postgres (se usa SQLite).
-- Cron productivo externo (si no se configura, el worker interno corre cada N horas).
-- Envío real de email si faltan credenciales (queda simulado/`skipped`).
+## Flujo de operación
 
----
+1. El worker revisa las 12 fuentes configuradas.
+2. Los documentos nuevos se guardan sin duplicar URL o identificador.
+3. Se extrae el contenido de la página y del PDF cuando corresponde.
+4. Se genera una alerta con fallback local o IA.
+5. La alerta queda en `pending_review`; no se envía automáticamente.
+6. Un administrador revisa, genera o regenera el resumen y lo marca como listo.
+7. El administrador envía una prueba o la alerta a los suscriptores activos.
+8. Cada entrega queda registrada con estado y detalle de error.
 
-## UX/UI de la demo
+Con `ALERT_ON_FIRST_RUN=false`, el primer escaneo solo crea una línea base y evita
+enviar normativa histórica.
 
-La interfaz incluye:
+## Panel administrativo
 
-- Landing pública para suscripción por email, con beneficios y "cómo funciona".
-- Formulario embebible para WordPress.
-- Panel administrativo con métricas, suscriptores, documentos, alertas y jobs.
-- Vista previa de email (HTML + texto).
-- Estados visuales para revisión, envío simulado y credenciales pendientes.
-- Microcopy en español (estados técnicos traducidos), responsive y foco accesible.
+El panel usa sidebar y vistas operativas:
 
-## Panel administrativo (sidebar)
+- **Resumen** (`/admin`): métricas, estado del sistema y siguiente acción.
+- **Suscriptores** (`/admin/subscribers`): activar, pausar, eliminar y asignar plan.
+- **Documentos** (`/admin/documents`): botones `Todos`, `DT` y `SII`, fuente visible,
+  regeneracion e ignorado de documentos.
+- **Alertas** (`/admin/alerts`): tabla con filtros por estado, paginación, vista
+  previa, prueba, envío masivo y eliminación.
+- **Monitoreo** (`/admin/jobs`): historial de ejecuciones y errores por fuente.
+- **Configuración** (`/admin/settings`): SendGrid, WordPress, Azure/OpenAI, uso de
+  tokens, costo estimado y configuración editorial.
 
-El admin usa un layout tipo SaaS con **sidebar lateral** e íconos SVG inline (sin
-librerías externas):
-
-- **Sidebar** oscuro con navegación: Resumen, Suscriptores, Documentos, Alertas,
-  Monitoreo. El ítem activo coincide con la ruta. En mobile se convierte en una barra
-  de navegación superior.
-- **Topbar** por sección: título, subtítulo, estado de email (SendGrid real / Console
-  simulado) y de acceso (token / desarrollo), y el botón "Ejecutar monitoreo".
-- **Resumen** (`/admin`): cards de métricas, panel "Estado del sistema" y jobs/alertas
-  recientes.
-- **Alertas** (`/admin/alerts`): tarjetas revisables con resumen recortado y acciones
-  (Vista previa, Marcar lista, Enviar prueba, Enviar).
-- **Documentos** y **Suscriptores**: tablas compactas con estados y acciones.
-- **Monitoreo** (`/admin/jobs`): historial de ejecuciones.
-- **Vista previa de email**: detalle de la alerta + render HTML enmarcado + texto plano.
-
-Rutas admin: `/admin`, `/admin/subscribers`, `/admin/documents`, `/admin/alerts`,
-`/admin/jobs`, `/admin/alerts/{id}/preview-email`.
-
-## Estado de envío de email
-
-Por defecto, la app usa:
-
-```env
-EMAIL_PROVIDER=console
-```
-
-Esto permite probar la interfaz y registrar envíos **simulados** sin enviar correos reales.
-
-Para envío real en Render:
-
-```env
-EMAIL_PROVIDER=sendgrid
-SENDGRID_API_KEY=...
-EMAIL_FROM=alertassii@externalgroup.cl
-```
-
-(No se incluyen credenciales reales en el repositorio; se definen solo en Render.)
-
-## Persistencia de suscriptores
-
-En modo actual, la app usa **SQLite**. Para demos internas funciona, pero en Render el
-filesystem puede **no ser persistente** entre redeploys/restarts si no se configura un
-disco persistente o una base externa.
-
-Importante: el archivo de base (`data/*.sqlite3`) **ya no se versiona** (ver `.gitignore`).
-Antes estaba commiteado y cada redeploy lo sobrescribía con el snapshot del repo, lo que
-hacía "desaparecer" suscriptores creados en producción.
-
-Para producción se recomienda:
-
-1. **Render Persistent Disk** para SQLite, o
-2. **Postgres** administrado.
-
-Si se usa SQLite en Render, configurar `DATABASE_PATH` apuntando a una ruta persistente
-(el mount del disco), por ejemplo:
-
-```env
-DATABASE_PATH=/var/data/alertas_normativas.sqlite3
-```
-
-Sin disco persistente ni base externa, los datos se reinician al redeploy o restart del
-servicio.
+La barra superior permite ejecutar `Actualizar todo`, `Actualizar DT` o
+`Actualizar SII`. El acceso exige `ADMIN_TOKEN`, salvo que se habilite explícitamente
+el modo de desarrollo.
 
 ## Ejecutar localmente
 
+Requiere Python 3.11 o superior.
+
 ```bash
+python -m venv .venv
+pip install -r requirements.txt
 python app.py
 ```
 
-Rutas:
+En Windows se puede activar el entorno con:
 
-- Formulario: `http://localhost:8000/`
-- Embed (iframe): `http://localhost:8000/embed`
-- Admin: `http://localhost:8000/admin/login`
-- Healthcheck: `http://localhost:8000/healthz`
-
-Token admin por defecto en desarrollo: `dev-admin-token`. En producción define `ADMIN_TOKEN` y `JOB_TOKEN`.
-
----
-
-## Rutas principales
-
-```text
-GET   /                         Landing + formulario
-GET   /embed                    Formulario para iframe
-GET   /thanks                   Confirmación de suscripción
-GET   /healthz                  Healthcheck JSON
-GET   /admin/login              Login admin (token)
-GET   /admin                    Resumen (jobs + alertas recientes)
-GET   /admin/subscribers        Suscriptores
-GET   /admin/documents          Documentos detectados
-GET   /admin/alerts             Alertas
-GET   /admin/jobs               Monitoreo (historial de jobs)
-GET   /admin/alerts/{id}/preview-email   Vista previa del email
-POST  /api/subscribe            Alta/actualización de suscriptor
-POST  /api/jobs/check-normative Ejecuta el monitoreo completo (requiere X-Job-Token)
-POST  /admin/subscribers/{id}/pause|reactivate
-POST  /admin/documents/{id}/regenerate|ignore
-POST  /admin/alerts/{id}/ready|send|test
+```powershell
+.\.venv\Scripts\Activate.ps1
 ```
 
----
+Rutas locales:
+
+- Formulario: `http://localhost:8000/`
+- Embed para iframe: `http://localhost:8000/embed`
+- Login admin: `http://localhost:8000/admin/login`
+- Healthcheck: `http://localhost:8000/healthz`
+
+Los valores locales por defecto son solo para desarrollo. En cualquier ambiente
+compartido se deben definir `ADMIN_TOKEN` y `JOB_TOKEN` largos y distintos.
 
 ## Variables de entorno
 
+La aplicación lee la configuración con `os.getenv`. Los secretos deben definirse en
+el servicio cloud, contenedor o proceso; no deben agregarse al repositorio.
+
 ```env
+# Aplicación y seguridad
 APP_HOST=0.0.0.0
-APP_PORT=10000
-APP_BASE_URL=
+APP_PORT=8000
+APP_BASE_URL=https://alertas.example.com
 ADMIN_TOKEN=
 JOB_TOKEN=
-DISABLE_ADMIN_AUTH=False
+DISABLE_ADMIN_AUTH=false
+DATABASE_PATH=data/alertas_normativas.sqlite3
 
-# Email
-EMAIL_PROVIDER=console        # console | sendgrid | resend | smtp
+# Monitoreo
+RUN_WORKER=true
+RUN_ON_STARTUP=false
+CHECK_INTERVAL_HOURS=6
+MAX_LISTING_DOCUMENTS_PER_SOURCE=25
+ALERT_ON_FIRST_RUN=false
+SII_YEAR=2026
+
+# Email: console | sendgrid | resend | smtp
+EMAIL_PROVIDER=console
 SENDGRID_API_KEY=
-EMAIL_FROM=
+EMAIL_FROM=alertas@example.com
 EMAIL_FROM_NAME=Alertas DT + SII
 EMAIL_REPLY_TO=
 TEST_EMAIL_TO=
+
+# IA: disabled | openai | azure
+AI_ENABLED=false
+AI_PROVIDER=disabled
+AI_API_KEY=
+AI_MODEL=
+AI_BASE_URL=
+AI_SUMMARY_TEMPERATURE=0.2
+AI_TIMEOUT_SECONDS=60
+AI_MAX_INPUT_CHARS=45000
+AI_ATTACHMENTS_ENABLED=true
+
+# Límites y costo referencial de IA
+AI_DAILY_TOKEN_LIMIT=50000
+AI_MONTHLY_TOKEN_LIMIT=500000
+AI_WARNING_PERCENT=80
+AI_INPUT_PRICE_PER_1M_USD=2.00
+AI_OUTPUT_PRICE_PER_1M_USD=8.00
+AI_USD_CLP_RATE=921
+
+# WordPress
+WORDPRESS_SYNC_ENABLED=false
+WORDPRESS_API_URL=https://tu-sitio.cl/wp-json/alertas-dt/v1
+WORDPRESS_API_TOKEN=
+WORDPRESS_SYNC_INTERVAL_MINUTES=15
+WORDPRESS_SYNC_LIMIT=100
 
 # WhatsApp Business Cloud API
 WHATSAPP_ENABLED=false
@@ -193,194 +200,149 @@ WHATSAPP_PHONE_NUMBER_ID=
 WHATSAPP_ACCESS_TOKEN=
 WHATSAPP_TEMPLATE_NAME=alerta_normativa
 WHATSAPP_LANGUAGE=es
-
-# IA (opcional). Sin clave o con disabled, el resumen usa fallback local y queda pending_review.
-AI_PROVIDER=disabled           # disabled | openai | azure
-AI_API_KEY=                    # Nunca hardcodear. No se guarda en DB ni en logs.
-AI_MODEL=gpt-4o-mini           # Para Azure: nombre del deployment
-AI_BASE_URL=                   # Solo Azure: https://tu-recurso.openai.azure.com
-AI_SUMMARY_TEMPERATURE=0.2
-AI_TIMEOUT_SECONDS=60
-AI_MAX_INPUT_CHARS=45000
-AI_ATTACHMENTS_ENABLED=true    # Adjunta resumen ejecutivo y detallado al email
-
-# Worker
-RUN_WORKER=True
-RUN_ON_STARTUP=False
-CHECK_INTERVAL_HOURS=6
-ALERT_ON_FIRST_RUN=False
-
-# WordPress Bridge (sincronización de suscriptores)
-WORDPRESS_SYNC_ENABLED=false   # true para activar sincronización
-WORDPRESS_API_URL=             # https://tu-sitio.cl/wp-json/alertas-dt/v1
-WORDPRESS_API_TOKEN=           # Token generado en el admin de WordPress (no hardcodear)
-WORDPRESS_SYNC_INTERVAL_MINUTES=15
-WORDPRESS_SYNC_LIMIT=100
 ```
 
-### Seguridad del admin (`DISABLE_ADMIN_AUTH`)
+### Seguridad del admin
 
-- **Por defecto `False`** (y también `False` si la variable no existe): el admin exige
-  `ADMIN_TOKEN` (login en `/admin/login`).
-- `DISABLE_ADMIN_AUTH=True` es **solo para desarrollo local o una demo controlada**:
-  omite el login y muestra un banner "Modo desarrollo: autenticación admin desactivada".
-- **No usar `DISABLE_ADMIN_AUTH=True` en Render producción.** Producción debe quedar con
-  `DISABLE_ADMIN_AUTH=False` (o sin la variable) y un `ADMIN_TOKEN` largo.
-- Para la demo con César se usa **login con `ADMIN_TOKEN`** (admin no abierto).
+- `DISABLE_ADMIN_AUTH=false` exige login con `ADMIN_TOKEN`.
+- `DISABLE_ADMIN_AUTH=true` se reserva para desarrollo local y muestra un aviso en
+  el panel.
+- Las credenciales de SendGrid, Azure, WordPress y WhatsApp no se guardan en Git.
+- La clave de IA se enmascara en el panel y se redacta de los errores registrados.
 
----
+## Azure AI Foundry
 
-## Integración con IA
+La integración soporta Azure AI Foundry mediante la Responses API v1 y mantiene un
+fallback para Azure OpenAI clásico.
 
-La app genera resúmenes profesionales con OpenAI o Azure OpenAI. Si IA está
-desactivada o falla, usa un fallback local sin romper el monitoreo.
-
-### Seguridad
-
-- `AI_API_KEY` nunca se guarda en la base de datos, nunca aparece en logs, y se
-  enmascara en el admin (solo se muestran los primeros 6 y últimos 4 caracteres).
-- Si la clave aparece en un mensaje de error, se reemplaza por `[REDACTED]`.
-- El raw response de la IA se trunca a 10 000 caracteres al guardarlo.
-
-### Proveedores
-
-**OpenAI:**
 ```env
-AI_PROVIDER=openai
-AI_API_KEY=sk-...          # Variable de entorno — nunca hardcodear
-AI_MODEL=gpt-4o-mini       # o gpt-4o, gpt-4-turbo, etc.
-```
-
-**Azure OpenAI / Azure AI Foundry:**
-```env
+AI_ENABLED=true
 AI_PROVIDER=azure
-AI_API_KEY=...             # API key del recurso Azure — nunca hardcodear
-AI_MODEL=mi-deployment     # Nombre del deployment en Azure
-AI_BASE_URL=https://mi-recurso.openai.azure.com
+AI_API_KEY=
+AI_MODEL=nombre-del-deployment
+AI_BASE_URL=https://tu-recurso.services.ai.azure.com/openai/v1
 ```
 
-**Desactivado (default):**
+Para un endpoint Azure OpenAI clásico, `AI_BASE_URL` puede ser la URL base del recurso;
+la app construye la ruta de `chat/completions` con el deployment indicado en
+`AI_MODEL`.
+
+Desde `/admin/settings` se puede:
+
+- Activar o desactivar la ejecución de IA en tiempo de operación.
+- Probar la conexión.
+- Revisar tokens de entrada, salida y totales.
+- Exportar el historial de uso en CSV.
+- Ver límites y costo estimado en USD y CLP.
+- Editar instrucciones editoriales y plantillas del resumen.
+
+Si la IA está desactivada, no tiene credenciales, excede los límites o falla, el job
+continúa con un resumen local y deja la alerta pendiente de revisión.
+
+## SendGrid
+
+El modo por defecto no envía correos reales:
+
 ```env
-AI_PROVIDER=disabled
+EMAIL_PROVIDER=console
 ```
 
-### Flujo de revisión
+Para envío transaccional:
 
-Toda alerta con resumen IA queda en estado `pending_review`. **No hay envío
-automático.** El operador revisa desde `/admin/alerts`, genera o regenera el
-resumen, y luego decide enviar manualmente.
+```env
+EMAIL_PROVIDER=sendgrid
+SENDGRID_API_KEY=
+EMAIL_FROM=alertas@tu-dominio.cl
+EMAIL_FROM_NAME=Alertas DT + SII
+EMAIL_REPLY_TO=contacto@tu-dominio.cl
+TEST_EMAIL_TO=qa@tu-dominio.cl
+```
 
-### Adjuntos
+Antes de activar el envío se debe verificar el dominio o remitente en SendGrid. El
+panel permite probar la configuración y el correo de cada alerta. Las plantillas usan
+tablas HTML para conservar compatibilidad con Outlook e incluyen enlaces oficiales y,
+cuando están habilitados, resumen ejecutivo y detallado como adjuntos HTML.
 
-Con `AI_ATTACHMENTS_ENABLED=true` y SendGrid, el email incluye dos adjuntos HTML:
-`resumen_ejecutivo_{id}.html` y `resumen_detallado_{id}.html`.
+## WordPress
 
----
+El plugin se encuentra en `wordpress/alertas-dt-bridge/`.
 
-## Cómo probar email simulado
+1. Subir la carpeta a `wp-content/plugins/`.
+2. Activar **Alertas DT + SII** en WordPress.
+3. Insertar el shortcode `[alertas_dt_form]` en la página pública.
+4. Copiar el token generado por el plugin.
+5. Configurar `WORDPRESS_API_URL` y `WORDPRESS_API_TOKEN` en la app.
 
-1. Deja `EMAIL_PROVIDER=console` (valor por defecto).
-2. En el admin (`/admin/alerts`), usa **Vista previa** para ver el email.
-3. Usa **Enviar prueba** (con un correo o `TEST_EMAIL_TO`): se registra como
-   `simulated` y se imprime en consola, sin enviar nada real.
-4. Marca una alerta como **lista** y luego **Enviar**: se simula el envío a los
-   suscriptores activos y se registran las `deliveries`.
+Endpoints del plugin:
 
-Ningún correo real sale sin credenciales explícitas.
+```text
+GET  /wp-json/alertas-dt/v1/health
+GET  /wp-json/alertas-dt/v1/subscribers
+POST /wp-json/alertas-dt/v1/subscribers/synced
+```
 
-## Cómo configurar SendGrid (cuando se quiera enviar real)
+Los endpoints de suscriptores requieren `Authorization: Bearer TOKEN`. La
+sincronización puede ejecutarse manualmente desde el panel o mediante el scheduler.
 
-1. Crear una **API key** en SendGrid (permiso Mail Send).
-2. Verificar el **sender** (dominio o remitente único) que usarás en `EMAIL_FROM`.
-3. En **Render → Environment**, definir las variables (referencia; la API key se pega
-   solo en Render, nunca en el repositorio):
-   ```env
-   EMAIL_PROVIDER=sendgrid
-   SENDGRID_API_KEY=            # se define en Render, no en el código
-   EMAIL_FROM=alertassii@externalgroup.cl
-   EMAIL_FROM_NAME=Alertas DT + SII
-   EMAIL_REPLY_TO=contacto@externalgroup.cl
-   TEST_EMAIL_TO=
-   ```
-4. Probar con **Enviar prueba** desde el admin hacia tu propio correo.
-5. Si falta `SENDGRID_API_KEY`, la app no falla: registra `skipped_missing_credentials`.
+## API y rutas principales
 
-> La app lee estas variables **solo desde el entorno** (`os.getenv`). No hay `.env`
-> versionado ni credenciales en el código; los secretos viven únicamente en Render.
+```text
+GET  /                                  Landing y formulario
+GET  /embed                             Formulario embebible
+GET  /thanks                            Confirmación de suscripción
+GET  /healthz                           Estado del servicio
+POST /api/subscribe                     Alta o actualización de suscriptor
 
-> Compatibilidad: si ya usabas `RESEND_API_KEY` o `SMTP_*`, puedes apuntar
-> `EMAIL_PROVIDER=resend` o `EMAIL_PROVIDER=smtp`. SendGrid es el recomendado.
+POST /api/jobs/check-normative?source=all
+POST /api/jobs/check-normative?source=dt
+POST /api/jobs/check-normative?source=sii
+POST /api/jobs/check-dt
+POST /api/jobs/check-sii
 
----
+GET  /admin
+GET  /admin/subscribers
+GET  /admin/documents?source=dt|sii
+GET  /admin/alerts?status=<estado>&page=<número>
+GET  /admin/jobs
+GET  /admin/settings
+GET  /admin/settings/ai-usage.csv
+GET  /admin/alerts/{id}/preview-email
 
-## Primer escaneo
+POST /admin/subscribers/{id}/pause|reactivate|activate|delete
+POST /admin/subscribers/{id}/plan
+POST /admin/documents/{id}/regenerate|ignore
+POST /admin/alerts/{id}/ready|send|resend|test|delete
+POST /admin/alerts/{id}/generate-ai|regenerate-ai
+POST /admin/settings/ai-toggle
+```
 
-Por seguridad, `ALERT_ON_FIRST_RUN=false` por defecto: el primer monitoreo guarda una
-línea base de documentos ya publicados y no genera una avalancha de alertas antiguas.
-Desde el siguiente escaneo se procesan documentos nuevos como `pending_review`.
+Los jobs HTTP requieren el header `X-Job-Token`.
 
-## Ejecutar el job manualmente
+Ejemplo:
+
+```bash
+curl -X POST "http://localhost:8000/api/jobs/check-normative?source=dt" \
+  -H "X-Job-Token: <JOB_TOKEN>"
+```
+
+También se puede ejecutar el monitoreo completo con:
 
 ```bash
 python -m dt_alerts.worker
 ```
 
-O por HTTP:
+## Persistencia y despliegue
 
-```bash
-curl -X POST http://localhost:8000/api/jobs/check-normative -H "X-Job-Token: <JOB_TOKEN>"
-```
-
-> Las alertas nuevas quedan **pendientes de revisión**: el envío a suscriptores es
-> manual desde el admin, nunca automático.
-
----
-
-## Plugin WordPress (integración recomendada)
-
-El plugin `alertas-dt-bridge` reemplaza el iframe. Captura suscriptores en WordPress
-sin exponer la app local y permite sincronizarlos al computador del cliente.
-
-### Instalación
-
-1. Sube `wordpress/alertas-dt-bridge/` a `wp-content/plugins/`.
-2. Activa el plugin en WordPress → Plugins.
-3. Ve a **Alertas DT + SII** en el menú lateral de WordPress.
-4. Copia el shortcode y pégalo en una página:
-
-   ```
-   [alertas_dt_form]
-   ```
-
-5. Copia el **token API** mostrado en la página de ajustes.
-
-### Configurar la app local para sincronizar
-
-Agrega estas variables de entorno en el computador donde corre la app:
+SQLite es suficiente para operación pequeña siempre que el archivo se ubique en un
+disco persistente. En servicios con filesystem efímero, configurar por ejemplo:
 
 ```env
-WORDPRESS_SYNC_ENABLED=true
-WORDPRESS_API_URL=https://tu-sitio.cl/wp-json/alertas-dt/v1
-WORDPRESS_API_TOKEN=              # Token generado en el admin de WordPress
-WORDPRESS_SYNC_INTERVAL_MINUTES=15
-WORDPRESS_SYNC_LIMIT=100
+DATABASE_PATH=/var/data/alertas_normativas.sqlite3
 ```
 
-La sincronización se puede disparar manualmente desde el admin de la app
-(`/admin/subscribers` → "Sincronizar ahora") o automáticamente cada N minutos
-si integras el scheduler.
-
-### Endpoints REST del plugin
-
-```
-GET  /wp-json/alertas-dt/v1/health             (público)
-GET  /wp-json/alertas-dt/v1/subscribers        (Bearer token)
-POST /wp-json/alertas-dt/v1/subscribers/synced (Bearer token)
-```
-
-Autenticación: `Authorization: Bearer TOKEN`
-
----
+Los archivos `data/*.sqlite3`, `.env` y `__pycache__` están excluidos por
+`.gitignore`. Para mayor volumen o múltiples instancias se recomienda migrar a
+PostgreSQL antes de escalar horizontalmente.
 
 ## Tests
 
@@ -388,12 +350,11 @@ Autenticación: `Authorization: Bearer TOKEN`
 python -m unittest
 ```
 
-Cubren: parseo del listado SII, suscripción (consentimiento, email inválido, dedup/
-actualización), auth admin por defecto, render de email HTML/texto y asunto, modos de
-envío (console/sendgrid sin clave) y robustez del job (sin documentos / error de fuente
-/ duplicados).
+La suite actual contiene 128 pruebas sobre suscripciones, autenticación, scraping DT
+y SII, PDF, deduplicación, fallback e IA, costos, email, WordPress, endpoints y flujos
+administrativos.
 
-## Aviso
+## Aviso legal
 
-El resumen es informativo y no reemplaza la revisión profesional ni la lectura del
-documento oficial de la DT o del SII.
+Los resúmenes son informativos. No reemplazan la lectura del documento oficial ni la
+revisión de un profesional contable, tributario o legal.
