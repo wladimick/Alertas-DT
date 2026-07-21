@@ -11,6 +11,9 @@ __pycache__/
 .venv/
 venv/
 
+# Logs locales (pueden contener respuestas de proveedores; nunca versionar)
+logs/
+
 # Entorno / secretos
 .env
 .env.*

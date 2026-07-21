@@ -333,6 +333,103 @@ panel permite probar la configuración y el correo de cada alerta. Las plantilla
 tablas HTML para conservar compatibilidad con Outlook e incluyen enlaces oficiales y,
 cuando están habilitados, resumen ejecutivo y detallado como adjuntos HTML.
 
+## Certificados TLS en Windows
+
+Alertas-DT usa un contexto SSL explícito y compartido (`dt_alerts/tls.py`) para las
+conexiones salientes de SendGrid, en vez de depender del comportamiento por defecto
+de `urllib`. El objetivo es evitar un problema conocido en Windows corporativo: un
+antivirus, proxy o CA corporativa puede instalar su certificado raíz únicamente en
+el almacén de certificados de Windows. `curl.exe` y PowerShell (Schannel/.NET) confían
+en ese almacén de forma nativa, pero el bundle de certificados que trae Python por
+defecto puede no reflejarlo, produciendo un error de verificación que **no** ocurre
+fuera de Python.
+
+### Error TLS vs. API key inválida — cómo diferenciarlos
+
+- **Error TLS** (`SSL: CERTIFICATE_VERIFY_FAILED`, "self-signed certificate in
+  certificate chain", etc.): ocurre *antes* de que SendGrid llegue a leer la
+  petición. Nunca viene acompañado de un código HTTP de SendGrid. El panel de
+  Alertas-DT lo reporta explícitamente como "Error TLS" e indica el backend usado,
+  aclarando que no es un problema de API key.
+- **API key inválida** (`HTTP 401`) o **remitente/permiso no autorizado**
+  (`HTTP 403`): la conexión TLS ya se completó con éxito; SendGrid respondió con un
+  código HTTP de error. Esto se soluciona revisando la API key o los permisos del
+  remitente en SendGrid, no la configuración TLS.
+- **Payload o remitente inválido** (`HTTP 400`): igual que arriba, la conexión TLS
+  funcionó; el problema está en los datos enviados (remitente no verificado,
+  formato del cuerpo del correo, etc.).
+
+### Almacén de certificados de Windows (`truststore`)
+
+Por defecto, en Windows, Alertas-DT usa el paquete [`truststore`](https://pypi.org/project/truststore/)
+para validar certificados TLS usando el almacén de certificados del propio sistema
+operativo (el mismo que usan `curl.exe` y PowerShell), en vez del bundle de
+certificados que trae Python. Esto es transparente: no requiere configuración.
+
+- **Nunca** se desactiva la verificación de certificados, el chequeo de hostname,
+  ni se acepta un certificado no confiable. `truststore` solo cambia *de dónde* se
+  obtiene la lista de autoridades certificadoras confiables.
+- En sistemas que no son Windows, o si el paquete `truststore` no está instalado,
+  se usa siempre `ssl.create_default_context()` (el comportamiento estándar de
+  Python), sin ningún cambio de comportamiento.
+
+### CA corporativa explícita (opcional): `TLS_CA_BUNDLE`
+
+Si tu organización necesita confiar en una CA corporativa específica que aún no
+esté en el almacén de certificados de Windows, puedes indicarla explícitamente:
+
+```env
+TLS_CA_BUNDLE=C:\ruta\certificado-corporativo.pem
+```
+
+- El archivo debe existir localmente; Alertas-DT **nunca** descarga ni genera
+  certificados automáticamente.
+- Si `TLS_CA_BUNDLE` está configurado, Alertas-DT usa el contexto SSL estándar de
+  Python (no `truststore`) para esa CA, porque `truststore` valida siempre contra
+  el almacén del sistema operativo e ignora cualquier CA cargada manualmente. Si
+  necesitas que el sistema operativo confíe en esa CA (para que `truststore` la
+  use también), instálala en el almacén de certificados de Windows
+  (Ejecutar → `certlm.msc`, o `certutil -addstore Root certificado-corporativo.pem`
+  desde una consola con privilegios).
+- Si el archivo indicado en `TLS_CA_BUNDLE` no existe o no es un certificado
+  válido, el panel de Configuración muestra un error claro y **nunca** se
+  desactiva la validación como solución alterna.
+
+### Cómo pedir el certificado raíz a infraestructura
+
+Si tanto Windows como Python fallan al validar TLS contra SendGrid (es decir, ni
+`curl.exe` ni `Invoke-WebRequest` logran completar la conexión), el problema es de
+red o de certificados, no de la aplicación:
+
+1. Pide al equipo de infraestructura/seguridad el certificado raíz (`.pem`/`.crt`)
+   de la CA corporativa o del antivirus/proxy que inspecciona TLS en esa VM.
+2. Instálalo en el almacén de certificados de Windows ("Entidades de certificación
+   raíz de confianza"), no solo en la aplicación.
+3. Si por política no puede instalarse a nivel de sistema, usa `TLS_CA_BUNDLE`
+   como alternativa explícita solo para Alertas-DT.
+4. Nunca se debe pedir "desactivar la verificación SSL" como solución: no está
+   soportado ni disponible en esta aplicación.
+
+### Diagnóstico en el panel
+
+`/admin/settings`, dentro de la tarjeta de SendGrid, muestra sin información
+sensible: el backend TLS en uso (`truststore` o `ssl estándar`), el sistema
+operativo, si `TLS_CA_BUNDLE` está configurado (solo el nombre de archivo, nunca
+la ruta completa que podría contener el nombre de usuario de Windows) y el
+resultado sanitizado de la última prueba de SendGrid.
+
+### Migrar Alertas-DT a otra máquina virtual Windows
+
+1. Instalar Python 3.11+ y crear el entorno virtual (`python -m venv .venv`).
+2. `pip install -r requirements.txt` (incluye `truststore`).
+3. Copiar `.env` (o `.env.local`) con las variables reales; nunca versionarlo.
+4. Ejecutar `curl.exe -Iv https://api.sendgrid.com` y `Invoke-WebRequest` para
+   confirmar que Windows valida TLS correctamente contra SendGrid antes de
+   configurar la aplicación.
+5. Si esa VM tiene una CA corporativa distinta, seguir la sección anterior
+   ("Cómo pedir el certificado raíz a infraestructura") antes de dar por
+   resuelto cualquier error TLS.
+
 ## WordPress
 
 El plugin se encuentra en `wordpress/alertas-dt-bridge/`.

@@ -10,7 +10,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from . import codex_client, db
+from . import codex_client, db, tls
 from .config import Settings, get_settings
 from .notifier import (
     dispatch_alert,
@@ -424,7 +424,10 @@ class AppHandler(BaseHTTPRequestHandler):
                     "Si recibes este correo, el envio de alertas por email funciona correctamente."
                 ),
             )
-            self.redirect_flash("/admin/settings", flash_for_email_result(result))
+            flash_msg = flash_for_email_result(result)
+            with db.connect(self.settings.database_path) as conn:
+                db.set_setting(conn, "sendgrid_last_test", f"{db.utcnow()} · {flash_msg[:150]}")
+            self.redirect_flash("/admin/settings", flash_msg)
         elif path == "/admin/settings/test-wordpress":
             self.require_admin()
             msg = _test_wordpress_connection(self.settings)
@@ -1702,6 +1705,24 @@ def render_settings(settings: Settings) -> str:
     else:
         sg_estado = pill("simulated", f"{provider} (no SendGrid)")
 
+    # --- Diagnostico TLS (backend usado, sin secretos ni rutas con usuario) ---
+    _tls_context, _tls_info = tls.build_ssl_context()
+    tls_ca_bundle_dd = "No configurado"
+    if _tls_info.ca_bundle_configured:
+        tls_ca_bundle_dd = f"Configurado ({h(_tls_info.ca_bundle_label)})"
+        if _tls_info.error:
+            tls_ca_bundle_dd += f' — <span style="color:var(--eg-danger,#D32F2F);">{h(_tls_info.error)}</span>'
+    sendgrid_last_test = app_cfg.get("sendgrid_last_test", "")
+    tls_diag_block = f"""
+  <h3 style="margin:16px 0 8px;font-size:13px;color:var(--eg-subtle);">Diagnostico TLS</h3>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Backend TLS</dt><dd class="mono">{h(_tls_info.backend)}</dd>
+    <dt>Sistema operativo</dt><dd class="mono">{h(_tls_info.os_name)}</dd>
+    <dt>TLS_CA_BUNDLE</dt><dd>{tls_ca_bundle_dd}</dd>
+    <dt>Ultima prueba SendGrid</dt><dd class="mono">{h(sendgrid_last_test or '—')}</dd>
+  </dl>
+"""
+
     sg_test_btn = ""
     if settings.test_email_to:
         sg_test_btn = f"""
@@ -1729,6 +1750,7 @@ def render_settings(settings: Settings) -> str:
     <dt>TEST_EMAIL_TO</dt><dd class="mono">{h(settings.test_email_to or '—')}</dd>
     <dt>Ultimo envio</dt><dd class="mono">{h(fmt_dt(last_delivery) if last_delivery else '—')}</dd>
   </dl>
+  {tls_diag_block}
   {sg_test_btn}
 </section>
 """

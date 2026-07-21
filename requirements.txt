@@ -1,6 +1,11 @@
 # Dependencias de producción
 pdfplumber==0.11.10
 
+# TLS: usa el almacén de certificados del sistema operativo (Windows/macOS)
+# para conexiones salientes (SendGrid, etc.), evitando desajustes entre el
+# bundle de certificados de Python y el almacén de confianza del sistema.
+truststore
+
 # Proveedor de IA "codex" (opcional): usa la sesión de ChatGPT autenticada en
 # esta máquina en vez de una API key. Solo se importa si AI_PROVIDER=codex.
 openai-codex

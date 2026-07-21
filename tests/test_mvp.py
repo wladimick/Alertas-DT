@@ -1,9 +1,11 @@
 from __future__ import annotations
 
 import json
+import ssl
 import tempfile
 import unittest
 import unittest.mock as mock
+import urllib.error
 from pathlib import Path
 
 from dt_alerts import db, notifier, worker
@@ -2939,6 +2941,257 @@ class CodexProviderTestCase(unittest.TestCase):
         ))
         self.assertEqual(result.status, "pending_review")
         self.assertIsNotNone(result.summary)
+
+
+class TLSAndSendGridTestCase(unittest.TestCase):
+    """Tests para dt_alerts/tls.py y el uso del contexto SSL compartido en SendGrid.
+
+    Todo con mocks: nunca hace conexiones reales ni envía correos reales.
+    """
+
+    def _settings(self, **overrides):
+        return settings_for(
+            Path(":memory:"),
+            email_provider="sendgrid",
+            sendgrid_api_key="SG.fake-key-for-tests-only",
+            email_from="alertas@example.com",
+            **overrides,
+        )
+
+    @staticmethod
+    def _self_signed_pem() -> bytes:
+        import datetime
+
+        from cryptography import x509
+        from cryptography.hazmat.primitives import hashes
+        from cryptography.hazmat.primitives.asymmetric import rsa
+        from cryptography.hazmat.primitives.serialization import Encoding
+        from cryptography.x509.oid import NameOID
+
+        key = rsa.generate_private_key(public_exponent=65537, key_size=2048)
+        name = x509.Name([x509.NameAttribute(NameOID.COMMON_NAME, "Alertas-DT Test CA")])
+        cert = (
+            x509.CertificateBuilder()
+            .subject_name(name)
+            .issuer_name(name)
+            .public_key(key.public_key())
+            .serial_number(x509.random_serial_number())
+            .not_valid_before(datetime.datetime.utcnow())
+            .not_valid_after(datetime.datetime.utcnow() + datetime.timedelta(days=1))
+            .sign(key, hashes.SHA256())
+        )
+        return cert.public_bytes(Encoding.PEM)
+
+    # --- 1. Contexto estandar en sistemas no Windows ---
+    def test_01_standard_context_on_non_windows(self):
+        import os
+
+        from dt_alerts import tls
+        with mock.patch("dt_alerts.tls.platform.system", return_value="Linux"), \
+             mock.patch.dict(os.environ, {"TLS_CA_BUNDLE": ""}):
+            context, info = tls.build_ssl_context()
+        self.assertEqual(info.backend, tls.BACKEND_STANDARD)
+        self.assertEqual(info.os_name, "Linux")
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    # --- 2. truststore seleccionado en Windows ---
+    def test_02_truststore_selected_on_windows(self):
+        import os
+
+        from dt_alerts import tls
+        if tls.truststore is None:
+            self.skipTest("truststore no esta instalado en este entorno")
+        with mock.patch("dt_alerts.tls.platform.system", return_value="Windows"), \
+             mock.patch.dict(os.environ, {"TLS_CA_BUNDLE": ""}):
+            context, info = tls.build_ssl_context()
+        self.assertEqual(info.backend, tls.BACKEND_TRUSTSTORE)
+        self.assertIsInstance(context, tls.truststore.SSLContext)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    # --- 3. Fallback seguro si truststore no esta instalado ---
+    def test_03_fallback_to_standard_when_truststore_missing(self):
+        import os
+
+        from dt_alerts import tls
+        with mock.patch("dt_alerts.tls.platform.system", return_value="Windows"), \
+             mock.patch("dt_alerts.tls.truststore", None), \
+             mock.patch.dict(os.environ, {"TLS_CA_BUNDLE": ""}):
+            context, info = tls.build_ssl_context()
+        self.assertEqual(info.backend, tls.BACKEND_STANDARD)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    # --- 4. TLS_CA_BUNDLE valido se carga y usa contexto estandar (truststore ignora CAs manuales) ---
+    def test_04_valid_ca_bundle_loads_and_uses_standard_backend(self):
+        from dt_alerts import tls
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            ca_path = Path(tmp) / "corporate-ca.pem"
+            ca_path.write_bytes(self._self_signed_pem())
+            with mock.patch("dt_alerts.tls.platform.system", return_value="Windows"), \
+                 mock.patch.dict(os.environ, {"TLS_CA_BUNDLE": str(ca_path)}):
+                context, info = tls.build_ssl_context()
+        self.assertEqual(info.backend, tls.BACKEND_STANDARD)
+        self.assertTrue(info.ca_bundle_configured)
+        self.assertEqual(info.ca_bundle_label, "corporate-ca.pem")
+        self.assertIsNone(info.error)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+
+    # --- 5. TLS_CA_BUNDLE inexistente reporta error sanitizado (sin ruta completa) ---
+    def test_05_missing_ca_bundle_reports_sanitized_error(self):
+        from dt_alerts import tls
+        import os
+        fake_path = r"C:\Users\alguien\ruta\no-existe.pem"
+        with mock.patch.dict(os.environ, {"TLS_CA_BUNDLE": fake_path}):
+            context, info = tls.build_ssl_context()
+        self.assertTrue(info.ca_bundle_configured)
+        self.assertIsNotNone(info.error)
+        self.assertNotIn("alguien", info.error)
+        self.assertNotIn("C:\\Users", info.error)
+        self.assertIn("no-existe.pem", info.error)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    # --- 6. Certificado invalido produce error, nunca bypass de verificacion ---
+    def test_06_invalid_ca_bundle_does_not_bypass_verification(self):
+        from dt_alerts import tls
+        import os
+        with tempfile.TemporaryDirectory() as tmp:
+            bad_path = Path(tmp) / "garbage.pem"
+            bad_path.write_text("esto no es un certificado PEM valido")
+            with mock.patch.dict(os.environ, {"TLS_CA_BUNDLE": str(bad_path)}):
+                context, info = tls.build_ssl_context()
+        self.assertIsNotNone(info.error)
+        self.assertEqual(context.verify_mode, ssl.CERT_REQUIRED)
+        self.assertTrue(context.check_hostname)
+
+    # --- 7. SendGrid usa el contexto SSL compartido (no uno propio) ---
+    def test_07_sendgrid_uses_shared_ssl_context(self):
+        from dt_alerts import tls
+        sentinel_context = object()
+        sentinel_info = tls.TLSBackendInfo(
+            backend="truststore", os_name="Windows",
+            ca_bundle_configured=False, ca_bundle_label="", error=None,
+        )
+        captured = {}
+
+        def fake_urlopen(request, timeout=None, context=None):
+            captured["context"] = context
+            import io
+            resp = mock.MagicMock()
+            resp.headers.get.return_value = "msg-id-123"
+            resp.__enter__.return_value = resp
+            resp.__exit__.return_value = False
+            return resp
+
+        with mock.patch("dt_alerts.notifier.tls.build_ssl_context",
+                        return_value=(sentinel_context, sentinel_info)), \
+             mock.patch("dt_alerts.notifier.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = notifier.send_email(
+                self._settings(), to="dest@example.com", subject="s",
+                html_body="<p>h</p>", text_body="t",
+            )
+        self.assertIs(captured["context"], sentinel_context)
+        self.assertEqual(result["status"], "sent")
+
+    # --- 8. Las claves nunca aparecen en los mensajes de error ---
+    def test_08_sendgrid_error_never_exposes_api_key(self):
+        settings = self._settings()
+
+        def fake_urlopen(request, timeout=None, context=None):
+            raise RuntimeError(f"fallo de red con Authorization: Bearer {settings.sendgrid_api_key}")
+
+        with mock.patch("dt_alerts.notifier.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = notifier.send_email(
+                settings, to="dest@example.com", subject="s",
+                html_body="<p>h</p>", text_body="t",
+            )
+        self.assertNotIn(settings.sendgrid_api_key, result["error"])
+        self.assertNotIn(settings.sendgrid_api_key, result["message"])
+        self.assertIn("[REDACTED]", result["error"])
+
+    # --- 9. HTTP 202 (exito) se registra como envio exitoso ---
+    def test_09_http_202_recorded_as_sent(self):
+        def fake_urlopen(request, timeout=None, context=None):
+            resp = mock.MagicMock()
+            resp.status = 202
+            resp.headers.get.return_value = "msg-id-202"
+            resp.__enter__.return_value = resp
+            resp.__exit__.return_value = False
+            return resp
+
+        with mock.patch("dt_alerts.notifier.urllib.request.urlopen", side_effect=fake_urlopen):
+            result = notifier.send_email(
+                self._settings(), to="dest@example.com", subject="s",
+                html_body="<p>h</p>", text_body="t",
+            )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "sent")
+        self.assertEqual(result["provider_message_id"], "msg-id-202")
+
+    # --- 10. HTTP 401 y 403 se reportan como errores de autenticacion/permisos ---
+    def test_10_http_401_and_403_reported_as_auth_errors(self):
+        import io
+
+        for code, label in ((401, "401"), (403, "403")):
+            def fake_urlopen(request, timeout=None, context=None, _code=code):
+                raise urllib.error.HTTPError(
+                    "https://api.sendgrid.com/v3/mail/send", _code, "auth error",
+                    {}, io.BytesIO(b'{"errors":[{"message":"denied"}]}'),
+                )
+
+            with mock.patch("dt_alerts.notifier.urllib.request.urlopen", side_effect=fake_urlopen):
+                result = notifier.send_email(
+                    self._settings(), to="dest@example.com", subject="s",
+                    html_body="<p>h</p>", text_body="t",
+                )
+            self.assertEqual(result["status"], "failed")
+            self.assertIn(f"HTTP {label}", result["error"])
+
+    # --- 11. Error TLS se reporta distinto de una API key invalida ---
+    def test_11_tls_error_reported_differently_than_invalid_key(self):
+        tls_error = ssl.SSLCertVerificationError()
+        tls_error.verify_message = "self-signed certificate in certificate chain"
+
+        def fake_urlopen_tls(request, timeout=None, context=None):
+            raise urllib.error.URLError(tls_error)
+
+        with mock.patch("dt_alerts.notifier.urllib.request.urlopen", side_effect=fake_urlopen_tls):
+            tls_result = notifier.send_email(
+                self._settings(), to="dest@example.com", subject="s",
+                html_body="<p>h</p>", text_body="t",
+            )
+
+        import io as _io
+
+        def fake_urlopen_401(request, timeout=None, context=None):
+            raise urllib.error.HTTPError(
+                "https://api.sendgrid.com/v3/mail/send", 401, "Unauthorized",
+                {}, _io.BytesIO(b'{"errors":[{"message":"invalid key"}]}'),
+            )
+
+        with mock.patch("dt_alerts.notifier.urllib.request.urlopen", side_effect=fake_urlopen_401):
+            key_result = notifier.send_email(
+                self._settings(), to="dest@example.com", subject="s",
+                html_body="<p>h</p>", text_body="t",
+            )
+
+        self.assertIn("TLS", tls_result["error"])
+        self.assertNotIn("TLS", key_result["error"])
+        self.assertNotIn("HTTP 401", tls_result["error"])
+        self.assertIn("HTTP 401", key_result["error"])
+
+    # --- 12. EMAIL_PROVIDER=console sigue funcionando (sin tocar TLS) ---
+    def test_12_console_provider_still_works(self):
+        settings = settings_for(Path(":memory:"), email_provider="console")
+        result = notifier.send_email(
+            settings, to="dest@example.com", subject="s",
+            html_body="<p>h</p>", text_body="t",
+        )
+        self.assertTrue(result["ok"])
+        self.assertEqual(result["status"], "simulated")
 
 
 class AIToggleFromPanelTestCase(unittest.TestCase):
