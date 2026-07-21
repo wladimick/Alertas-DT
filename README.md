@@ -20,7 +20,8 @@ plantillas de correo usan el sistema visual de External Group.
 - Detección de duplicados por URL canónica e identificador oficial.
 - Extracción de título, fecha, categoría, abstract, detalle y contenido PDF cuando
   está disponible.
-- Resumen local de respaldo o resumen con OpenAI/Azure AI Foundry.
+- Resumen local de respaldo o resumen con OpenAI, Azure AI Foundry o Codex
+  (cuenta ChatGPT de esta máquina, sin API key).
 - Resumen ejecutivo, puntos clave, impactos, acciones recomendadas, relevancia y
   aviso legal.
 - Registro de uso de IA, límites diarios/mensuales y estimación de costo en USD/CLP.
@@ -104,8 +105,8 @@ El panel usa sidebar y vistas operativas:
 - **Alertas** (`/admin/alerts`): tabla con filtros por estado, paginación, vista
   previa, prueba, envío masivo y eliminación.
 - **Monitoreo** (`/admin/jobs`): historial de ejecuciones y errores por fuente.
-- **Configuración** (`/admin/settings`): SendGrid, WordPress, Azure/OpenAI, uso de
-  tokens, costo estimado y configuración editorial.
+- **Configuración** (`/admin/settings`): SendGrid, WordPress, Azure/OpenAI/Codex, uso
+  de tokens, costo estimado y configuración editorial.
 
 La barra superior permite ejecutar `Actualizar todo`, `Actualizar DT` o
 `Actualizar SII`. El acceso exige `ADMIN_TOKEN`, salvo que se habilite explícitamente
@@ -168,7 +169,9 @@ EMAIL_FROM_NAME=Alertas DT + SII
 EMAIL_REPLY_TO=
 TEST_EMAIL_TO=
 
-# IA: disabled | openai | azure
+# IA: disabled | openai | azure | codex
+# codex no requiere AI_API_KEY ni AI_BASE_URL: usa la sesión de ChatGPT
+# autenticada en esta máquina (ver "Codex con cuenta ChatGPT" más abajo).
 AI_ENABLED=false
 AI_PROVIDER=disabled
 AI_API_KEY=
@@ -209,6 +212,8 @@ WHATSAPP_LANGUAGE=es
   el panel.
 - Las credenciales de SendGrid, Azure, WordPress y WhatsApp no se guardan en Git.
 - La clave de IA se enmascara en el panel y se redacta de los errores registrados.
+- La sesión de ChatGPT usada por Codex se guarda en `.codex_home/` (ignorado por
+  Git) y nunca se imprime, registra ni expone en el panel o en los logs.
 
 ## Azure AI Foundry
 
@@ -238,6 +243,71 @@ Desde `/admin/settings` se puede:
 
 Si la IA está desactivada, no tiene credenciales, excede los límites o falla, el job
 continúa con un resumen local y deja la alerta pendiente de revisión.
+
+## Codex con cuenta ChatGPT
+
+El proveedor `codex` usa la sesión de ChatGPT ya autenticada en esta máquina Windows
+(SDK oficial `openai-codex`), en vez de una API key. No requiere `AI_API_KEY` ni
+`AI_BASE_URL`. Cada documento se procesa en un thread nuevo, sin historial
+compartido entre documentos, con sandbox de solo lectura y sin permisos para
+ejecutar comandos ni escribir archivos.
+
+### Instalación de dependencias (Windows)
+
+```powershell
+pip install -r requirements.txt
+```
+
+### Login inicial (una sola vez)
+
+Se ejecuta manualmente, con navegador disponible en esta máquina. Alertas-DT
+nunca dispara este login por sí mismo:
+
+```powershell
+python scripts\codex_login.py
+```
+
+El script comprueba si ya existe una sesión válida, inicia el login por
+navegador si hace falta, e informa si la cuenta quedó autenticada. Nunca
+imprime ni guarda tokens, contraseñas o el contenido de `auth.json`.
+
+### Variables de entorno
+
+```env
+AI_ENABLED=true
+AI_PROVIDER=codex
+```
+
+`AI_API_KEY` y `AI_BASE_URL` se dejan vacíos: no se usan con este proveedor.
+
+### Activación y ejecución
+
+1. Configura `AI_ENABLED=true` y `AI_PROVIDER=codex` en `.env`.
+2. Ejecuta `python scripts\codex_login.py` si aún no hay sesión activa.
+3. Inicia la aplicación normalmente (`python app.py` o el comando habitual).
+4. Desde `/admin/settings` puedes revisar el estado de la sesión y usar
+   "Probar conexión IA" (nunca abre navegador; solo comprueba la sesión existente).
+
+### Sesión asociada al usuario Windows
+
+La sesión de ChatGPT queda asociada al usuario del sistema operativo que ejecuta
+Alertas-DT. Se guarda de forma aislada en `.codex_home/` (dentro del proyecto,
+ignorado por Git) y se reutiliza en cada ejecución sin abrir navegador.
+
+### Si la sesión caduca o se alcanza el límite del plan
+
+Si no hay sesión activa, la sesión caducó, se alcanza el límite del plan ChatGPT,
+falla el SDK o Codex devuelve una respuesta no parseable, Alertas-DT usa
+automáticamente el resumen local de respaldo y continúa funcionando. La alerta
+siempre queda `pending_review` y nunca se envía un correo automáticamente.
+Vuelve a ejecutar `python scripts\codex_login.py` para renovar la sesión.
+
+### Sin API key
+
+Codex no necesita `AI_API_KEY`: los límites de uso dependen del plan de ChatGPT
+(Plus/Pro/Business) asociado a la cuenta autenticada, no de una cuota de API. El
+SDK de Codex no siempre entrega un conteo exacto de tokens a la aplicación, por lo
+que el costo estimado en el panel puede no aplicar a este proveedor.
 
 ## SendGrid
 

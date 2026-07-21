@@ -10,7 +10,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from . import db
+from . import codex_client, db
 from .config import Settings, get_settings
 from .notifier import (
     dispatch_alert,
@@ -431,7 +431,7 @@ class AppHandler(BaseHTTPRequestHandler):
             self.redirect_flash("/admin/settings", msg)
         elif path == "/admin/settings/ai-toggle":
             self.require_admin()
-            if not self.settings.ai_api_key:
+            if not self.settings.ai_api_key and self.settings.ai_provider != "codex":
                 self.respond_json({"error": "API key no configurada."}, status=HTTPStatus.BAD_REQUEST)
                 return
             payload = self.read_payload()
@@ -1515,11 +1515,24 @@ def _test_ai_connection(settings: Settings, app_settings: dict, conn=None) -> st
         return msg
 
     if provider == "disabled":
-        msg = "IA desactivada (AI_PROVIDER=disabled). Configura AI_PROVIDER=openai o azure."
+        msg = "IA desactivada (AI_PROVIDER=disabled). Configura AI_PROVIDER=openai, azure o codex."
         _record("disabled", log_error=msg)
         return msg
 
-    if not settings.ai_api_key:
+    if provider == "codex":
+        if not codex_client.is_codex_sdk_available():
+            msg = "SDK de Codex no instalado. Ejecuta: pip install -r requirements.txt."
+            _record("missing_key", log_error=msg)
+            return msg
+        logged_in, status_text = codex_client.check_login_status()
+        if not logged_in:
+            msg = (
+                f"{status_text} Ejecuta scripts/codex_login.py para autenticarte "
+                "(esta prueba nunca abre el navegador)."
+            )
+            _record("missing_key", log_error=msg)
+            return msg
+    elif not settings.ai_api_key:
         msg = "Sin API key: configura AI_API_KEY en el archivo .env."
         _record("missing_key", log_error=msg)
         return msg
@@ -1815,6 +1828,17 @@ def render_settings(settings: Settings) -> str:
     ai_last_usage = ai_usage.get("last_usage") or {}
     ai_last_error = ai_usage.get("last_error") or {}
 
+    # Codex no usa AI_API_KEY: su "credencial" es la sesión de ChatGPT de esta máquina.
+    codex_sdk_available = False
+    codex_logged_in = False
+    codex_session_msg = ""
+    if ai_provider == "codex":
+        codex_sdk_available = codex_client.is_codex_sdk_available()
+        if codex_sdk_available:
+            codex_logged_in, codex_session_msg = codex_client.check_login_status()
+        else:
+            codex_session_msg = "SDK de Codex no instalado (pip install -r requirements.txt)."
+
     if not ai_runtime_enabled:
         ai_estado = pill("paused", "Apagada")
         ai_estado_key = "paused"
@@ -1824,6 +1848,13 @@ def render_settings(settings: Settings) -> str:
     elif ai_limit_reached:
         ai_estado = pill("error", "Límite alcanzado")
         ai_estado_key = "error"
+    elif ai_provider == "codex":
+        if codex_logged_in:
+            ai_estado = pill("active", "Activa")
+            ai_estado_key = "active"
+        else:
+            ai_estado = pill("error", "Sin sesión ChatGPT")
+            ai_estado_key = "error"
     elif settings.ai_api_key:
         ai_estado = pill("active", "Activa")
         ai_estado_key = "active"
@@ -1833,13 +1864,18 @@ def render_settings(settings: Settings) -> str:
 
     ai_last_test = app_cfg.get("ai_last_test", "")
 
-    has_api_key = bool(settings.ai_api_key)
+    has_api_key = codex_logged_in if ai_provider == "codex" else bool(settings.ai_api_key)
     _toggle_checked = "checked" if ai_runtime_enabled else ""
     _toggle_disabled = "disabled" if not has_api_key else ""
     _toggle_label = "Activa" if ai_runtime_enabled else "Inactiva"
+    _no_key_note_text = (
+        f"{codex_session_msg or 'Sin sesión ChatGPT'} — ejecuta scripts/codex_login.py para habilitar"
+        if ai_provider == "codex" else
+        "Sin API key — configura AI_API_KEY para habilitar"
+    )
     _no_key_note = (
-        '<span id="ai-toggle-note" style="font-size:12px;color:#9CA3AF;margin-left:8px;">'
-        'Sin API key — configura AI_API_KEY para habilitar</span>'
+        f'<span id="ai-toggle-note" style="font-size:12px;color:#9CA3AF;margin-left:8px;">'
+        f'{h(_no_key_note_text)}</span>'
         if not has_api_key else
         '<span id="ai-toggle-note" style="font-size:12px;color:#9CA3AF;margin-left:8px;display:none;"></span>'
     )
@@ -1883,7 +1919,9 @@ async function toggleAI(enabled) {{
 </script>"""
 
     ai_test_btn = ""
-    if ai_runtime_enabled and ai_provider not in ("disabled", "") and settings.ai_api_key and not ai_limit_reached:
+    _codex_has_credentials = ai_provider == "codex" and codex_sdk_available
+    _has_ai_credentials = bool(settings.ai_api_key) or _codex_has_credentials
+    if ai_runtime_enabled and ai_provider not in ("disabled", "") and _has_ai_credentials and not ai_limit_reached:
         ai_test_btn = f"""
   <form method="post" action="/admin/settings/test-ai" style="display:inline">
     <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
@@ -1891,9 +1929,11 @@ async function toggleAI(enabled) {{
     </button>
   </form>"""
     else:
-        reason = "Activa IA y configura AI_PROVIDER + AI_API_KEY para probar."
+        reason = "Activa IA y configura AI_PROVIDER + AI_API_KEY (o AI_PROVIDER=codex con sesión ChatGPT) para probar."
         if ai_limit_reached:
             reason = "Límite IA alcanzado. No se ejecutará prueba."
+        elif ai_provider == "codex" and not codex_sdk_available:
+            reason = "SDK de Codex no instalado. Ejecuta: pip install -r requirements.txt."
         ai_test_btn = (
             f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="button" disabled>'
             f'{icon("cpu", 14)}<span>Probar conexion IA</span></button>'
@@ -2030,6 +2070,30 @@ async function toggleAI(enabled) {{
         )
     )
 
+    ai_api_key_display = (
+        "No requiere API key (usa la sesión de ChatGPT de esta máquina)"
+        if ai_provider == "codex"
+        else mask_secret(settings.ai_api_key)
+    )
+
+    codex_info_block = ""
+    if ai_provider == "codex":
+        codex_status_pill = (
+            pill("active", "Sesión activa") if codex_logged_in
+            else pill("error", "No autenticado")
+        )
+        codex_info_block = f"""
+  <h3 style="margin:16px 0 8px;font-size:13px;color:var(--eg-subtle);">Codex — cuenta ChatGPT</h3>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Autenticación</dt><dd>Cuenta ChatGPT de esta máquina Windows, sin API key.</dd>
+    <dt>Estado sesión</dt><dd>{codex_status_pill}</dd>
+    <dt>Detalle</dt><dd class="mono">{h(codex_session_msg or '—')}</dd>
+    <dt>Iniciar sesión (manual)</dt><dd class="mono">python scripts/codex_login.py</dd>
+    <dt>Límites</dt><dd>Dependen del plan de ChatGPT (Plus/Pro/Business), no de un límite de tokens de API.</dd>
+    <dt>Conteo de tokens</dt><dd>El SDK de Codex no siempre entrega tokens exactos a la aplicación.</dd>
+  </dl>
+"""
+
     # IA core (conexión + uso) — ancho completo
     section_ai_core = f"""
 {_ai_warning_banner}
@@ -2043,7 +2107,7 @@ async function toggleAI(enabled) {{
     <dt>AI_PROVIDER</dt><dd class="mono">{h(ai_provider or 'disabled')}</dd>
     <dt>AI_MODEL</dt><dd class="mono">{h(settings.ai_model or '—')}</dd>
     <dt>AI_BASE_URL</dt><dd class="mono">{h(settings.ai_base_url or '—')}</dd>
-    <dt>AI_API_KEY</dt><dd class="mono">{h(mask_secret(settings.ai_api_key))}</dd>
+    <dt>AI_API_KEY</dt><dd class="mono">{h(ai_api_key_display)}</dd>
     <dt>AI_TIMEOUT_SECONDS</dt><dd class="mono">{h(settings.ai_timeout_seconds)}</dd>
     <dt>AI_MAX_INPUT_CHARS</dt><dd class="mono">{h(settings.ai_max_input_chars)}</dd>
     <dt>AI_ATTACHMENTS_ENABLED</dt><dd class="mono">{h(str(settings.ai_attachments_enabled).lower())}</dd>
@@ -2067,6 +2131,7 @@ async function toggleAI(enabled) {{
     Costo estimado referencial. Puede variar según contrato Azure, modelo y tipo de cambio.
     Configurable con AI_INPUT_PRICE_PER_1M_USD, AI_OUTPUT_PRICE_PER_1M_USD, AI_USD_CLP_RATE.
   </p>
+  {codex_info_block}
   <div class="eg-actions" style="margin-top:14px">{ai_test_btn}</div>
 </section>
 

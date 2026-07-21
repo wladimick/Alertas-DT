@@ -1,2 +1,6 @@
 # Dependencias de producción
 pdfplumber==0.11.10
+
+# Proveedor de IA "codex" (opcional): usa la sesión de ChatGPT autenticada en
+# esta máquina en vez de una API key. Solo se importa si AI_PROVIDER=codex.
+openai-codex

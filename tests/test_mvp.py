@@ -2719,6 +2719,228 @@ class AlertsSendToSubscribersTestCase(unittest.TestCase):
                 server.shutdown()
 
 
+class CodexProviderTestCase(unittest.TestCase):
+    """Tests para el proveedor de IA 'codex' (sesión ChatGPT, sin API key). Todo con mocks: nunca llama al SDK real."""
+
+    def _db_path(self, tmp: str) -> Path:
+        path = Path(tmp) / "t.sqlite3"
+        db.init_db(path)
+        return path
+
+    def _sample_doc_dict(self) -> dict:
+        return {
+            "dt_article_id": "codex-test-1",
+            "canonical_url": "https://www.dt.gob.cl/legislacion/1624/w3-article-codex1.html",
+            "source_url": "https://www.dt.gob.cl/x.html",
+            "category": "Circulares",
+            "title": "Circular de prueba proveedor Codex",
+            "publication_date": "01/01/2026",
+            "abstract": "Instruye criterios de prueba para el proveedor Codex.",
+            "detail_text": "Texto de prueba para el proveedor Codex.",
+            "pdf_url": None,
+            "content_hash": None,
+        }
+
+    def _insert_doc(self, conn) -> int:
+        doc_id, _ = db.upsert_document(conn, self._sample_doc_dict())
+        db.update_document_processed(
+            conn, doc_id, status="processed", detail_text="Texto.",
+            pdf_url=None, content_hash=None, last_error=None,
+        )
+        return doc_id
+
+    def _fake_ai_json(self) -> str:
+        return json.dumps({
+            "title": "Circular DT", "category": "Circulares", "relevance": "medio",
+            "email_subject": "Nueva normativa DT: Circular",
+            "email_summary": "Resumen generado por Codex.",
+            "key_points": ["Punto 1"],
+            "practical_impacts": [{"title": "Impacto", "description": "Desc"}],
+            "recommended_actions": ["Accion 1"],
+            "executive_summary": {"title": "Resumen ejecutivo", "body": "Cuerpo."},
+            "detailed_summary": {"title": "Detalle", "sections": []},
+            "tags": ["DT"], "legal_disclaimer": "Informativo.",
+        })
+
+    # --- 1. Codex funciona sin AI_API_KEY y con sesión activa devuelve JSON válido ---
+    def test_01_codex_works_without_api_key_and_valid_session(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=True, ai_provider="codex", ai_api_key="")
+            self.assertEqual(s.ai_api_key, "")
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch(
+                    "dt_alerts.codex_client.run_codex_prompt",
+                    return_value=(self._fake_ai_json(), 0, 0, 0),
+                ) as mocked:
+                    _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
+                self.assertTrue(mocked.called)
+                ai_row = db.get_ai_summary(conn, doc_id)
+        self.assertEqual(ai_row["status"], "success")
+        self.assertEqual(ai_row["provider"], "codex")
+        self.assertEqual(ai_row["email_summary"], "Resumen generado por Codex.")
+
+    # --- 2. Sesión inexistente/caducada produce fallback local, sin romper ---
+    def test_02_codex_no_session_produces_fallback(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=True, ai_provider="codex", ai_api_key="")
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch(
+                    "dt_alerts.codex_client.is_codex_sdk_available", return_value=True
+                ), mock.patch(
+                    "dt_alerts.codex_client.check_login_status",
+                    return_value=(False, "No hay sesión de ChatGPT activa."),
+                ):
+                    result = _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
+                ai_row = db.get_ai_summary(conn, doc_id)
+        self.assertEqual(ai_row["status"], "fallback")
+        self.assertIsNotNone(ai_row["email_summary"])
+        self.assertEqual(result.status, "pending_review")
+
+    # --- 3. SDK de Codex no disponible produce fallback, sin romper ---
+    def test_03_codex_sdk_unavailable_produces_fallback(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=True, ai_provider="codex", ai_api_key="")
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch(
+                    "dt_alerts.codex_client.is_codex_sdk_available", return_value=False
+                ):
+                    _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
+                ai_row = db.get_ai_summary(conn, doc_id)
+                rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertEqual(ai_row["status"], "fallback")
+        self.assertEqual(rows[0]["status"], "error")
+
+    # --- 4. Respuesta de Codex no parseable produce fallback, sin romper ---
+    def test_04_codex_unparseable_response_produces_fallback(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=True, ai_provider="codex", ai_api_key="")
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch(
+                    "dt_alerts.codex_client.run_codex_prompt",
+                    return_value=("esto no es json {{{{", 0, 0, 0),
+                ):
+                    _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
+                ai_row = db.get_ai_summary(conn, doc_id)
+        self.assertEqual(ai_row["status"], "fallback")
+        self.assertIsNotNone(ai_row["email_summary"])
+
+    # --- 5. Cada documento usa un thread/sesión independiente (sin historial compartido) ---
+    def test_05_codex_each_document_uses_independent_thread(self):
+        from dt_alerts import codex_client
+
+        calls: list[tuple[str, str]] = []
+
+        def fake_run_single_turn(system_prompt, user_prompt, workdir):
+            calls.append((system_prompt, user_prompt))
+            return f"respuesta-independiente-{len(calls)}"
+
+        with tempfile.TemporaryDirectory() as tmp, mock.patch(
+            "dt_alerts.codex_client.is_codex_sdk_available", return_value=True
+        ), mock.patch(
+            "dt_alerts.codex_client.check_login_status", return_value=(True, "Sesión de ChatGPT activa.")
+        ), mock.patch(
+            "dt_alerts.codex_client._isolated_codex_home", return_value=Path(tmp)
+        ), mock.patch(
+            "dt_alerts.codex_client._run_single_turn", side_effect=fake_run_single_turn
+        ):
+            s = settings_for(Path(":memory:"), ai_provider="codex", ai_api_key="", ai_timeout_seconds=5)
+            content1, *_ = codex_client.run_codex_prompt("sys", "documento-1", s)
+            content2, *_ = codex_client.run_codex_prompt("sys", "documento-2", s)
+
+        self.assertEqual(content1, "respuesta-independiente-1")
+        self.assertEqual(content2, "respuesta-independiente-2")
+        self.assertEqual(len(calls), 2, "Debe invocarse un turno nuevo por documento")
+        self.assertEqual(calls[0][1], "documento-1")
+        self.assertEqual(calls[1][1], "documento-2")
+
+    # --- 6. No se exponen credenciales ni rutas sensibles en errores registrados ---
+    def test_06_codex_error_does_not_expose_credentials_or_paths(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=True, ai_provider="codex", ai_api_key="")
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch(
+                    "dt_alerts.codex_client.run_codex_prompt",
+                    side_effect=RuntimeError("Fallo genérico del SDK de Codex."),
+                ):
+                    _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
+                rows = db.get_recent_ai_usage(conn, limit=1)
+        error_text = rows[0]["error"] or ""
+        self.assertNotIn("auth.json", error_text)
+        self.assertNotIn(str(Path.home()), error_text)
+        self.assertNotIn(".codex_home", error_text)
+
+    # --- 7. El proveedor guardado en SQLite es 'codex' y la alerta permanece pending_review ---
+    def test_07_codex_provider_saved_and_alert_stays_pending_review(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=True, ai_provider="codex", ai_api_key="")
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                alert_id = db.create_or_update_alert(
+                    conn, doc_id, summary="Resumen inicial.", key_points=[],
+                    practical_impacts=[], relevance="medio",
+                    status="pending_review", ai_error=None,
+                )
+                with mock.patch(
+                    "dt_alerts.codex_client.run_codex_prompt",
+                    return_value=(self._fake_ai_json(), 0, 0, 0),
+                ):
+                    _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
+                ai_row = db.get_ai_summary(conn, doc_id)
+                alert_row = conn.execute(
+                    "SELECT status FROM alerts WHERE id = ?", (alert_id,)
+                ).fetchone()
+        self.assertEqual(ai_row["provider"], "codex")
+        self.assertEqual(alert_row["status"], "pending_review")
+
+    # --- 8. openai, azure y disabled siguen funcionando sin cambios de comportamiento ---
+    def test_08_openai_still_requires_api_key(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=True, ai_provider="openai", ai_api_key="")
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
+                rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertEqual(rows[0]["status"], "missing_key")
+
+    def test_09_azure_still_requires_base_url(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = settings_for(path, ai_enabled=True, ai_provider="azure",
+                             ai_api_key="fake-key", ai_base_url="")
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
+                rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertEqual(rows[0]["status"], "error")
+
+    def test_10_disabled_provider_still_falls_back(self):
+        result = summarize_document(self._sample_doc_dict(), settings_for(
+            Path(":memory:"), ai_provider="disabled", ai_api_key="",
+        ))
+        self.assertEqual(result.status, "pending_review")
+        self.assertIsNotNone(result.summary)
+
+
 class AIToggleFromPanelTestCase(unittest.TestCase):
     """Tests para feat/ai-toggle-from-panel."""
 

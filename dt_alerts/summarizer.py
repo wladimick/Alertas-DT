@@ -7,7 +7,7 @@ import urllib.request
 from dataclasses import dataclass
 from typing import Any
 
-from . import db
+from . import codex_client, db
 from .config import Settings, get_settings
 from .sources import source_context
 
@@ -317,12 +317,31 @@ def _call_azure_api(system_prompt: str, user_prompt: str, settings: Settings) ->
     )
 
 
+def _call_codex_api(system_prompt: str, user_prompt: str, settings: Settings) -> AIResponse:
+    """
+    Proveedor "codex": usa la sesión de ChatGPT autenticada en esta máquina
+    (dt_alerts.codex_client), sin AI_API_KEY ni AI_BASE_URL. El SDK de Codex
+    no expone conteo de tokens por turno, por lo que se reportan en 0.
+    """
+    content, input_tokens, output_tokens, total_tokens = codex_client.run_codex_prompt(
+        system_prompt, user_prompt, settings
+    )
+    return AIResponse(
+        content=content,
+        input_tokens=input_tokens,
+        output_tokens=output_tokens,
+        total_tokens=total_tokens,
+    )
+
+
 def call_ai_with_usage(system_prompt: str, user_prompt: str, settings: Settings) -> AIResponse:
     provider = settings.ai_provider.lower()
     if provider == "openai":
         return _call_openai_api(system_prompt, user_prompt, settings)
     if provider == "azure":
         return _call_azure_api(system_prompt, user_prompt, settings)
+    if provider == "codex":
+        return _call_codex_api(system_prompt, user_prompt, settings)
     raise ValueError(f"Proveedor IA no soportado: {provider!r}")
 
 
@@ -683,14 +702,14 @@ def _generate_and_save(
         error = "AI_ENABLED=false; resumen generado localmente sin usar API."
         _record("disabled", log_error=error)
 
-    elif provider not in ("openai", "azure"):
+    elif provider not in ("openai", "azure", "codex"):
         validated = generate_fallback_summary(document)
         status = "fallback"
         content_quality = "limited"
         error = f"AI_PROVIDER={provider or 'disabled'}; resumen generado localmente."
         _record("disabled", log_error=error)
 
-    elif not settings.ai_api_key:
+    elif provider != "codex" and not settings.ai_api_key:
         validated = generate_fallback_summary(document)
         status = "fallback"
         content_quality = "limited"
@@ -793,7 +812,7 @@ def summarize_document(doc: dict[str, Any], settings: Settings) -> SummaryResult
     provider = settings.ai_provider.lower()
     ai_api_key = getattr(settings, "ai_api_key", "") or getattr(settings, "openai_api_key", "")
 
-    if provider in ("openai", "azure") and ai_api_key:
+    if (provider in ("openai", "azure") and ai_api_key) or provider == "codex":
         try:
             system_prompt, user_prompt = build_ai_prompt(doc, settings, {})
             raw = call_ai(system_prompt, user_prompt, settings)
