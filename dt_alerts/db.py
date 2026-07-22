@@ -892,6 +892,19 @@ def get_last_ai_error(conn: sqlite3.Connection) -> dict[str, Any] | None:
     return dict(row) if row else None
 
 
+def has_ai_success_after(conn: sqlite3.Connection, after_id: int) -> bool:
+    """
+    True si existe al menos un registro 'success' posterior a `after_id` en
+    ai_usage_logs. Se usa para saber si un error histórico ya quedó resuelto
+    por una llamada exitosa posterior, sin borrar el registro del error.
+    """
+    row = conn.execute(
+        "SELECT 1 FROM ai_usage_logs WHERE status = 'success' AND id > ? LIMIT 1",
+        (after_id,),
+    ).fetchone()
+    return row is not None
+
+
 def get_recent_ai_usage(conn: sqlite3.Connection, limit: int = 5) -> list[dict[str, Any]]:
     """Últimos N registros de uso IA para auditoría en panel de configuración."""
     rows = conn.execute(
@@ -939,6 +952,9 @@ def get_ai_usage_status(
     month = get_ai_usage_month(conn)
     last = get_last_ai_usage(conn)
     last_error = get_last_ai_error(conn)
+    last_error_resolved = (
+        has_ai_success_after(conn, int(last_error["id"])) if last_error else False
+    )
 
     daily_pct = round((today / daily_limit) * 100, 1) if daily_limit > 0 else 0
     monthly_pct = round((month / monthly_limit) * 100, 1) if monthly_limit > 0 else 0
@@ -954,4 +970,5 @@ def get_ai_usage_status(
         "monthly_exceeded": bool(monthly_limit > 0 and month >= monthly_limit),
         "last_usage": last,
         "last_error": last_error,
+        "last_error_resolved": last_error_resolved,
     }

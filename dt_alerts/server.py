@@ -10,7 +10,7 @@ from http.cookies import SimpleCookie
 from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
-from . import db
+from . import codex_client, db, tls
 from .config import Settings, get_settings
 from .notifier import (
     dispatch_alert,
@@ -375,6 +375,14 @@ class AppHandler(BaseHTTPRequestHandler):
                     f"{result['created']} creados, "
                     f"{result['updated']} actualizados."
                 )
+                with db.connect(self.settings.database_path) as conn:
+                    db.set_setting(conn, "wordpress_last_sync_summary", json.dumps({
+                        "received": result["received"],
+                        "created": result["created"],
+                        "updated": result["updated"],
+                        "skipped": result.get("skipped", 0),
+                        "at": db.utcnow(),
+                    }))
             elif result["status"] == "disabled":
                 msg = "Sincronización WordPress desactivada (WORDPRESS_SYNC_ENABLED=false)."
             elif result["status"] == "misconfigured":
@@ -424,14 +432,21 @@ class AppHandler(BaseHTTPRequestHandler):
                     "Si recibes este correo, el envio de alertas por email funciona correctamente."
                 ),
             )
-            self.redirect_flash("/admin/settings", flash_for_email_result(result))
+            flash_msg = flash_for_email_result(result)
+            with db.connect(self.settings.database_path) as conn:
+                db.set_setting(conn, "sendgrid_last_test", f"{db.utcnow()} · {flash_msg[:150]}")
+            self.redirect_flash("/admin/settings", flash_msg)
         elif path == "/admin/settings/test-wordpress":
             self.require_admin()
             msg = _test_wordpress_connection(self.settings)
             self.redirect_flash("/admin/settings", msg)
         elif path == "/admin/settings/ai-toggle":
             self.require_admin()
-            if not self.settings.ai_api_key:
+            from .summarizer import get_effective_ai_provider
+            with db.connect(self.settings.database_path) as conn:
+                app_settings = db.get_all_settings(conn)
+            effective_provider = get_effective_ai_provider(self.settings, app_settings)
+            if not self.settings.ai_api_key and effective_provider != "codex":
                 self.respond_json({"error": "API key no configurada."}, status=HTTPStatus.BAD_REQUEST)
                 return
             payload = self.read_payload()
@@ -441,6 +456,20 @@ class AppHandler(BaseHTTPRequestHandler):
             with db.connect(self.settings.database_path) as conn:
                 db.set_setting(conn, "ai_runtime_enabled", "true" if enabled else "false")
             self.respond_json({"success": True, "enabled": enabled})
+        elif path == "/admin/settings/ai-provider":
+            self.require_admin()
+            from .summarizer import VALID_AI_PROVIDERS
+            payload = self.read_payload()
+            provider = str(payload.get("provider") or "").strip().lower()
+            if provider not in VALID_AI_PROVIDERS:
+                self.redirect_flash(
+                    "/admin/settings",
+                    f"Proveedor no permitido: {provider!r}. No se guardó ningún cambio.",
+                )
+                return
+            with db.connect(self.settings.database_path) as conn:
+                db.set_setting(conn, "ai_active_provider", provider)
+            self.redirect_flash("/admin/settings", f"Proveedor de IA activo actualizado a: {provider}.")
         elif path == "/admin/settings/ai-enable":
             self.require_admin()
             with db.connect(self.settings.database_path) as conn:
@@ -1413,12 +1442,19 @@ def render_jobs(jobs: list[dict[str, Any]]) -> str:
 
 def render_db_info(settings: Settings, subscribers: list[dict[str, Any]]) -> str:
     """Card compacta de WordPress Sync para la vista de suscriptores."""
-    last_update = max((s.get("updated_at") or "" for s in subscribers), default="")
-    wp_synced_count = sum(
-        1 for s in subscribers
-        if "wordpress" in (s.get("source_page") or "").lower()
-        or "wp" in (s.get("source_page") or "").lower()
-    )
+    # Igual que en render_settings: usa el resultado real de la última
+    # sincronización (creados + actualizados), no una heurística por texto en
+    # source_page, que produce falsos negativos (ver fix/ai-provider-selector).
+    with db.connect(settings.database_path) as conn:
+        app_cfg = db.get_all_settings(conn)
+    wp_sync_summary_raw = app_cfg.get("wordpress_last_sync_summary")
+    wp_sync_summary = json.loads(wp_sync_summary_raw) if wp_sync_summary_raw else None
+    if wp_sync_summary:
+        wp_synced_count = int(wp_sync_summary.get("created") or 0) + int(wp_sync_summary.get("updated") or 0)
+        last_update = wp_sync_summary.get("at") or ""
+    else:
+        wp_synced_count = 0
+        last_update = ""
 
     if settings.wordpress_sync_enabled:
         return f"""
@@ -1428,7 +1464,7 @@ def render_db_info(settings: Settings, subscribers: list[dict[str, Any]]) -> str
   </div>
   <dl class="eg-kv eg-kv--2col">
     <dt>Última sincronización</dt><dd class="mono">{fmt_dt(last_update) if last_update else '—'}</dd>
-    <dt>Suscriptores sincronizados</dt><dd class="mono">{wp_synced_count}</dd>
+    <dt>Suscriptores sincronizados (creados + actualizados)</dt><dd class="mono">{wp_synced_count}</dd>
   </dl>
   <form method="post" action="/admin/wordpress/sync" style="margin-top:12px;text-align:center;">
     <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
@@ -1476,8 +1512,12 @@ def _test_wordpress_connection(settings: Settings) -> str:
 
 def _test_ai_connection(settings: Settings, app_settings: dict, conn=None) -> str:
     """Test AI connectivity. Records usage in ai_usage_logs if conn is provided. Never logs API key."""
-    provider = (settings.ai_provider or "disabled").lower()
-    model = settings.ai_model or ""
+    from .summarizer import get_effective_settings, validate_provider_credentials
+
+    effective_settings = get_effective_settings(settings, app_settings)
+    provider = effective_settings.ai_provider
+    # AI_MODEL es el deployment de Azure/OpenAI; Codex nunca lo hereda.
+    model = codex_client.MODEL_LABEL if provider == "codex" else (effective_settings.ai_model or "")
     daily_limit = int(getattr(settings, "ai_daily_token_limit", 50000) or 0)
     monthly_limit = int(getattr(settings, "ai_monthly_token_limit", 500000) or 0)
 
@@ -1514,19 +1554,15 @@ def _test_ai_connection(settings: Settings, app_settings: dict, conn=None) -> st
         _record("disabled", log_error=msg)
         return msg
 
-    if provider == "disabled":
-        msg = "IA desactivada (AI_PROVIDER=disabled). Configura AI_PROVIDER=openai o azure."
+    if provider == "disabled" or not provider:
+        msg = "Proveedor de IA desactivado. Selecciona Azure, Codex u OpenAI en 'Proveedor de IA activo'."
         _record("disabled", log_error=msg)
         return msg
 
-    if not settings.ai_api_key:
-        msg = "Sin API key: configura AI_API_KEY en el archivo .env."
+    credential_problems = validate_provider_credentials(provider, effective_settings)
+    if credential_problems:
+        msg = " ".join(credential_problems)
         _record("missing_key", log_error=msg)
-        return msg
-
-    if provider == "azure" and not settings.ai_base_url:
-        msg = "Azure requiere AI_BASE_URL configurado en el archivo .env."
-        _record("error", log_error=msg)
         return msg
 
     if conn is not None:
@@ -1545,23 +1581,26 @@ def _test_ai_connection(settings: Settings, app_settings: dict, conn=None) -> st
         ai_response = call_ai_with_usage(
             "Responde solo con JSON válido.",
             '{"ok": true, "message": "test"}',
-            settings,
+            effective_settings,
         )
         if ai_response.content:
+            if ai_response.model:
+                model = ai_response.model
             _record(
                 "success",
                 input_tokens=ai_response.input_tokens,
                 output_tokens=ai_response.output_tokens,
                 total_tokens=ai_response.total_tokens,
             )
-            return f"Conexión IA OK ({provider}, modelo: {settings.ai_model or 'default'})."
+            model_label = "sesión ChatGPT" if provider == "codex" else (model or "default")
+            return f"Conexión IA OK ({provider}, modelo: {model_label})."
         msg = "Conexión IA sin respuesta."
         _record("error", log_error=msg)
         return msg
     except Exception as exc:
         error_msg = str(exc)
-        if settings.ai_api_key and settings.ai_api_key in error_msg:
-            error_msg = error_msg.replace(settings.ai_api_key, "[REDACTED]")
+        if effective_settings.ai_api_key and effective_settings.ai_api_key in error_msg:
+            error_msg = error_msg.replace(effective_settings.ai_api_key, "[REDACTED]")
         msg = f"Error al probar IA: {error_msg[:300]}"
         _record("error", log_error=error_msg[:500])
         return msg
@@ -1646,18 +1685,21 @@ def render_settings(settings: Settings) -> str:
         app_cfg = db.get_all_settings(conn)
         wp_subscribers = db.count_table(conn, "subscribers")
 
-    wp_from_wp = sum(
-        1 for _ in [None]  # computed below via raw query
-    )
-    with db.connect(db_path) as conn:
-        wp_row = conn.execute(
-            "SELECT COUNT(*) AS n FROM subscribers WHERE source_page LIKE '%wordpress%' OR source_page LIKE '%wp%'"
-        ).fetchone()
-        wp_synced_count = int(wp_row["n"]) if wp_row else 0
-        last_wp_sync = conn.execute(
-            "SELECT updated_at FROM subscribers WHERE source_page LIKE '%wordpress%' OR source_page LIKE '%wp%' ORDER BY updated_at DESC LIMIT 1"
-        ).fetchone()
-        last_wp_sync_at = last_wp_sync["updated_at"] if last_wp_sync else None
+    # "Suscriptores sincronizados" refleja el resultado real de la ULTIMA
+    # sincronización (creados + actualizados), no una búsqueda heurística por
+    # texto en source_page — esa heurística fallaba en falsos negativos cuando
+    # WordPress informa su propio source_page (ej. el nombre del formulario)
+    # en vez de la palabra "wordpress" o "wp".
+    wp_sync_summary_raw = app_cfg.get("wordpress_last_sync_summary")
+    wp_sync_summary = json.loads(wp_sync_summary_raw) if wp_sync_summary_raw else None
+    if wp_sync_summary:
+        wp_received_count = int(wp_sync_summary.get("received") or 0)
+        wp_synced_count = int(wp_sync_summary.get("created") or 0) + int(wp_sync_summary.get("updated") or 0)
+        last_wp_sync_at = wp_sync_summary.get("at")
+    else:
+        wp_received_count = 0
+        wp_synced_count = 0
+        last_wp_sync_at = None
 
     # --- Estado general ---
     auth_label, auth_key = auth_mode(settings)
@@ -1689,6 +1731,24 @@ def render_settings(settings: Settings) -> str:
     else:
         sg_estado = pill("simulated", f"{provider} (no SendGrid)")
 
+    # --- Diagnostico TLS (backend usado, sin secretos ni rutas con usuario) ---
+    _tls_context, _tls_info = tls.build_ssl_context()
+    tls_ca_bundle_dd = "No configurado"
+    if _tls_info.ca_bundle_configured:
+        tls_ca_bundle_dd = f"Configurado ({h(_tls_info.ca_bundle_label)})"
+        if _tls_info.error:
+            tls_ca_bundle_dd += f' — <span style="color:var(--eg-danger,#D32F2F);">{h(_tls_info.error)}</span>'
+    sendgrid_last_test = app_cfg.get("sendgrid_last_test", "")
+    tls_diag_block = f"""
+  <h3 style="margin:16px 0 8px;font-size:13px;color:var(--eg-subtle);">Diagnostico TLS</h3>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Backend TLS</dt><dd class="mono">{h(_tls_info.backend)}</dd>
+    <dt>Sistema operativo</dt><dd class="mono">{h(_tls_info.os_name)}</dd>
+    <dt>TLS_CA_BUNDLE</dt><dd>{tls_ca_bundle_dd}</dd>
+    <dt>Ultima prueba SendGrid</dt><dd class="mono">{h(sendgrid_last_test or '—')}</dd>
+  </dl>
+"""
+
     sg_test_btn = ""
     if settings.test_email_to:
         sg_test_btn = f"""
@@ -1716,6 +1776,7 @@ def render_settings(settings: Settings) -> str:
     <dt>TEST_EMAIL_TO</dt><dd class="mono">{h(settings.test_email_to or '—')}</dd>
     <dt>Ultimo envio</dt><dd class="mono">{h(fmt_dt(last_delivery) if last_delivery else '—')}</dd>
   </dl>
+  {tls_diag_block}
   {sg_test_btn}
 </section>
 """
@@ -1781,14 +1842,21 @@ def render_settings(settings: Settings) -> str:
     <dt>Intervalo sync</dt><dd class="mono">{h(settings.wordpress_sync_interval_minutes)} min</dd>
     <dt>Limite por sync</dt><dd class="mono">{h(settings.wordpress_sync_limit)}</dd>
     <dt>Ultima sincronizacion</dt><dd class="mono">{h(fmt_dt(last_wp_sync_at) if last_wp_sync_at else '—')}</dd>
-    <dt>Suscriptores sincronizados</dt><dd class="mono">{h(wp_synced_count)}</dd>
+    <dt>Recibidos (última sincronización)</dt><dd class="mono">{h(wp_received_count)}</dd>
+    <dt>Suscriptores sincronizados (creados + actualizados)</dt><dd class="mono">{h(wp_synced_count)}</dd>
   </dl>
   <div class="eg-actions" style="margin-top:14px">{wp_test_btn}{wp_sync_btn}</div>
 </section>
 """
 
     # --- Conexión IA ---
-    ai_provider = settings.ai_provider
+    from .summarizer import VALID_AI_PROVIDERS, get_effective_settings, validate_provider_credentials
+
+    ai_provider_initial = settings.ai_provider
+    effective_settings = get_effective_settings(settings, app_cfg)
+    ai_provider = effective_settings.ai_provider
+    _active_provider_raw = (app_cfg.get("ai_active_provider") or "").strip().lower()
+    ai_provider_source = "panel" if _active_provider_raw in VALID_AI_PROVIDERS else ".env (inicial)"
     ai_env_enabled = bool(getattr(settings, "ai_enabled", False))
     ai_runtime_raw = (app_cfg.get("ai_runtime_enabled") or "").strip().lower()
     if ai_runtime_raw in {"0", "false", "no", "n", "off"}:
@@ -1814,6 +1882,35 @@ def render_settings(settings: Settings) -> str:
     ai_limit_reached = ai_usage.get("daily_exceeded") or ai_usage.get("monthly_exceeded")
     ai_last_usage = ai_usage.get("last_usage") or {}
     ai_last_error = ai_usage.get("last_error") or {}
+    ai_last_error_resolved = ai_usage.get("last_error_resolved", False)
+
+    # "Último error registrado" es histórico: nunca se borra de ai_usage_logs,
+    # pero si hubo una llamada exitosa después no debe parecer un problema vigente.
+    if not ai_last_error:
+        ai_last_error_status = pill("paused", "Sin errores registrados")
+    elif ai_last_error_resolved:
+        ai_last_error_status = pill("active", "Resuelto (hubo una llamada exitosa después)")
+    else:
+        ai_last_error_status = pill("error", "Sin llamada exitosa posterior registrada")
+    ai_last_error_dt = fmt_dt(ai_last_error.get("created_at")) if ai_last_error.get("created_at") else "—"
+
+    # Codex no usa AI_API_KEY: su "credencial" es la sesión de ChatGPT de esta máquina.
+    codex_sdk_available = False
+    codex_logged_in = False
+    codex_session_msg = ""
+    if ai_provider == "codex":
+        codex_sdk_available = codex_client.is_codex_sdk_available()
+        if codex_sdk_available:
+            codex_logged_in, codex_session_msg = codex_client.check_login_status()
+        else:
+            codex_session_msg = "SDK de Codex no instalado (pip install -r requirements.txt)."
+
+    # Validación unificada de credenciales para el proveedor efectivo (misma
+    # función usada por _generate_and_save y _test_ai_connection).
+    credential_problems = (
+        validate_provider_credentials(ai_provider, effective_settings)
+        if ai_provider in ("azure", "codex", "openai") else []
+    )
 
     if not ai_runtime_enabled:
         ai_estado = pill("paused", "Apagada")
@@ -1824,22 +1921,27 @@ def render_settings(settings: Settings) -> str:
     elif ai_limit_reached:
         ai_estado = pill("error", "Límite alcanzado")
         ai_estado_key = "error"
-    elif settings.ai_api_key:
+    elif credential_problems:
+        estado_label = "Sin sesión ChatGPT" if ai_provider == "codex" else "Credenciales incompletas"
+        ai_estado = pill("error", estado_label)
+        ai_estado_key = "error"
+    else:
         ai_estado = pill("active", "Activa")
         ai_estado_key = "active"
-    else:
-        ai_estado = pill("error", "Sin API key")
-        ai_estado_key = "error"
 
     ai_last_test = app_cfg.get("ai_last_test", "")
 
-    has_api_key = bool(settings.ai_api_key)
+    has_api_key = not credential_problems and ai_provider != "disabled"
     _toggle_checked = "checked" if ai_runtime_enabled else ""
     _toggle_disabled = "disabled" if not has_api_key else ""
     _toggle_label = "Activa" if ai_runtime_enabled else "Inactiva"
+    _no_key_note_text = (
+        " ".join(credential_problems) if credential_problems
+        else "Selecciona un proveedor de IA para habilitar"
+    )
     _no_key_note = (
-        '<span id="ai-toggle-note" style="font-size:12px;color:#9CA3AF;margin-left:8px;">'
-        'Sin API key — configura AI_API_KEY para habilitar</span>'
+        f'<span id="ai-toggle-note" style="font-size:12px;color:#9CA3AF;margin-left:8px;">'
+        f'{h(_no_key_note_text)}</span>'
         if not has_api_key else
         '<span id="ai-toggle-note" style="font-size:12px;color:#9CA3AF;margin-left:8px;display:none;"></span>'
     )
@@ -1883,7 +1985,7 @@ async function toggleAI(enabled) {{
 </script>"""
 
     ai_test_btn = ""
-    if ai_runtime_enabled and ai_provider not in ("disabled", "") and settings.ai_api_key and not ai_limit_reached:
+    if ai_runtime_enabled and ai_provider not in ("disabled", "") and not credential_problems and not ai_limit_reached:
         ai_test_btn = f"""
   <form method="post" action="/admin/settings/test-ai" style="display:inline">
     <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
@@ -1891,9 +1993,11 @@ async function toggleAI(enabled) {{
     </button>
   </form>"""
     else:
-        reason = "Activa IA y configura AI_PROVIDER + AI_API_KEY para probar."
+        reason = "Activa IA y selecciona un proveedor con credenciales completas para probar."
         if ai_limit_reached:
             reason = "Límite IA alcanzado. No se ejecutará prueba."
+        elif credential_problems:
+            reason = " ".join(credential_problems)
         ai_test_btn = (
             f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="button" disabled>'
             f'{icon("cpu", 14)}<span>Probar conexion IA</span></button>'
@@ -2030,6 +2134,80 @@ async function toggleAI(enabled) {{
         )
     )
 
+    ai_api_key_display = (
+        "No requiere API key (usa la sesión de ChatGPT de esta máquina)"
+        if ai_provider == "codex"
+        else mask_secret(settings.ai_api_key)
+    )
+
+    codex_info_block = ""
+    if ai_provider == "codex":
+        codex_status_pill = (
+            pill("active", "Sesión activa") if codex_logged_in
+            else pill("error", "No autenticado")
+        )
+        codex_info_block = f"""
+  <h3 style="margin:16px 0 8px;font-size:13px;color:var(--eg-subtle);">Codex — cuenta ChatGPT</h3>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Autenticación</dt><dd>Cuenta ChatGPT de esta máquina Windows, sin API key.</dd>
+    <dt>Estado sesión</dt><dd>{codex_status_pill}</dd>
+    <dt>Detalle</dt><dd class="mono">{h(codex_session_msg or '—')}</dd>
+    <dt>Iniciar sesión (manual)</dt><dd class="mono">.\.venv\Scripts\python.exe scripts\codex_login.py</dd>
+    <dt>Límites</dt><dd>Dependen del plan de ChatGPT (Plus/Pro/Business), no de un límite de tokens de API.</dd>
+    <dt>Conteo de tokens</dt><dd>El SDK de Codex no siempre entrega tokens exactos a la aplicación.</dd>
+  </dl>
+"""
+
+    # --- Proveedor de IA activo (selector) ---
+    _provider_labels = {
+        "azure": "Azure AI",
+        "codex": "Codex con cuenta ChatGPT",
+        "openai": "OpenAI API",
+        "disabled": "Desactivado",
+    }
+
+    def _provider_option(value: str) -> str:
+        selected = "selected" if value == ai_provider else ""
+        return f'<option value="{value}" {selected}>{h(_provider_labels[value])}</option>'
+
+    _provider_select_options = "".join(_provider_option(v) for v in ("azure", "codex", "openai", "disabled"))
+
+    _credential_status_dd = (
+        pill("active", "Listo") if not credential_problems and ai_provider != "disabled"
+        else pill("paused", "No aplica") if ai_provider == "disabled"
+        else f'{pill("error", "Incompleto")} <span style="margin-left:8px;">{h(" ".join(credential_problems))}</span>'
+    )
+
+    section_ai_provider = f"""
+<section class="eg-card eg-panel">
+  <h2>{icon("cpu", 17)} Proveedor de IA activo</h2>
+  <form method="post" action="/admin/settings/ai-provider" style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:16px;">
+    <div class="eg-field" style="margin-bottom:0;">
+      <label class="eg-label" for="ai-provider-select">Proveedor</label>
+      <select class="eg-input" id="ai-provider-select" name="provider">
+        {_provider_select_options}
+      </select>
+    </div>
+    <button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">
+      {icon("check", 14)}<span>Guardar proveedor</span>
+    </button>
+  </form>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Proveedor efectivo</dt><dd class="mono">{h(_provider_labels.get(ai_provider, ai_provider))}</dd>
+    <dt>Proveedor inicial (.env)</dt><dd class="mono">{h(ai_provider_initial or 'disabled')}</dd>
+    <dt>Fuente de la selección</dt><dd class="mono">{h(ai_provider_source)}</dd>
+    <dt>Estado general de la IA</dt><dd>{ai_estado}</dd>
+    <dt>Estado de credenciales</dt><dd>{_credential_status_dd}</dd>
+    <dt>Última prueba</dt><dd class="mono">{h(ai_last_test or '—')}</dd>
+  </dl>
+  <p class="eg-muted" style="font-size:12px;margin-top:8px;">
+    Azure y Codex pueden permanecer configurados simultáneamente en el entorno; este
+    selector solo decide cuál se usa. No existe fallback automático entre proveedores:
+    si el seleccionado falla, se usa el resumen local de respaldo.
+  </p>
+</section>
+"""
+
     # IA core (conexión + uso) — ancho completo
     section_ai_core = f"""
 {_ai_warning_banner}
@@ -2043,7 +2221,7 @@ async function toggleAI(enabled) {{
     <dt>AI_PROVIDER</dt><dd class="mono">{h(ai_provider or 'disabled')}</dd>
     <dt>AI_MODEL</dt><dd class="mono">{h(settings.ai_model or '—')}</dd>
     <dt>AI_BASE_URL</dt><dd class="mono">{h(settings.ai_base_url or '—')}</dd>
-    <dt>AI_API_KEY</dt><dd class="mono">{h(mask_secret(settings.ai_api_key))}</dd>
+    <dt>AI_API_KEY</dt><dd class="mono">{h(ai_api_key_display)}</dd>
     <dt>AI_TIMEOUT_SECONDS</dt><dd class="mono">{h(settings.ai_timeout_seconds)}</dd>
     <dt>AI_MAX_INPUT_CHARS</dt><dd class="mono">{h(settings.ai_max_input_chars)}</dd>
     <dt>AI_ATTACHMENTS_ENABLED</dt><dd class="mono">{h(str(settings.ai_attachments_enabled).lower())}</dd>
@@ -2051,7 +2229,8 @@ async function toggleAI(enabled) {{
     <dt>Uso mes</dt><dd class="mono">{h(ai_usage_month)} / {h(ai_monthly_limit)} tokens · {h(ai_usage.get('monthly_percent', 0))}%</dd>
     <dt>Advertencia límite</dt><dd class="mono">{h(settings.ai_warning_percent)}%</dd>
     <dt>Última llamada IA</dt><dd class="mono">{h((ai_last_usage or {}).get('created_at') or '—')} · {h((ai_last_usage or {}).get('status') or '—')} · {h((ai_last_usage or {}).get('total_tokens') or 0)} tokens</dd>
-    <dt>Último error IA</dt><dd class="mono">{h((ai_last_error or {}).get('error') or '—')}</dd>
+    <dt>Último error registrado</dt><dd class="mono">{h(ai_last_error_dt)} — {h((ai_last_error or {}).get('error') or '—')}</dd>
+    <dt>Estado del último error</dt><dd>{ai_last_error_status}</dd>
     <dt>Ultima prueba IA</dt><dd class="mono">{h(ai_last_test or '—')}</dd>
   </dl>
   <h3 style="margin:16px 0 8px;font-size:13px;color:var(--eg-subtle);">Costo estimado referencial</h3>
@@ -2067,6 +2246,7 @@ async function toggleAI(enabled) {{
     Costo estimado referencial. Puede variar según contrato Azure, modelo y tipo de cambio.
     Configurable con AI_INPUT_PRICE_PER_1M_USD, AI_OUTPUT_PRICE_PER_1M_USD, AI_USD_CLP_RATE.
   </p>
+  {codex_info_block}
   <div class="eg-actions" style="margin-top:14px">{ai_test_btn}</div>
 </section>
 
@@ -2097,7 +2277,7 @@ async function toggleAI(enabled) {{
 </details>
 """
 
-    section_ai = section_ai_core
+    section_ai = section_ai_provider + section_ai_core
 
     # --- Email y plantillas (editable) ---
     def _field(key: str, label: str, placeholder: str, env_val: str, multiline: bool = False) -> str:

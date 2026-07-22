@@ -20,7 +20,8 @@ plantillas de correo usan el sistema visual de External Group.
 - Detección de duplicados por URL canónica e identificador oficial.
 - Extracción de título, fecha, categoría, abstract, detalle y contenido PDF cuando
   está disponible.
-- Resumen local de respaldo o resumen con OpenAI/Azure AI Foundry.
+- Resumen local de respaldo o resumen con OpenAI, Azure AI Foundry o Codex
+  (cuenta ChatGPT de esta máquina, sin API key).
 - Resumen ejecutivo, puntos clave, impactos, acciones recomendadas, relevancia y
   aviso legal.
 - Registro de uso de IA, límites diarios/mensuales y estimación de costo en USD/CLP.
@@ -104,8 +105,8 @@ El panel usa sidebar y vistas operativas:
 - **Alertas** (`/admin/alerts`): tabla con filtros por estado, paginación, vista
   previa, prueba, envío masivo y eliminación.
 - **Monitoreo** (`/admin/jobs`): historial de ejecuciones y errores por fuente.
-- **Configuración** (`/admin/settings`): SendGrid, WordPress, Azure/OpenAI, uso de
-  tokens, costo estimado y configuración editorial.
+- **Configuración** (`/admin/settings`): SendGrid, WordPress, Azure/OpenAI/Codex, uso
+  de tokens, costo estimado y configuración editorial.
 
 La barra superior permite ejecutar `Actualizar todo`, `Actualizar DT` o
 `Actualizar SII`. El acceso exige `ADMIN_TOKEN`, salvo que se habilite explícitamente
@@ -137,10 +138,21 @@ Rutas locales:
 Los valores locales por defecto son solo para desarrollo. En cualquier ambiente
 compartido se deben definir `ADMIN_TOKEN` y `JOB_TOKEN` largos y distintos.
 
+### Variables locales (`.env.local`)
+
+La aplicación carga automáticamente `.env.local` y luego `.env` (en ese orden) al
+arrancar, usando `python-dotenv`. Las variables que ya estén definidas en el
+sistema operativo o en la sesión de PowerShell siempre tienen prioridad y nunca se
+sobrescriben: `.env.local` y `.env` solo rellenan lo que falte. No es necesario
+cargar variables manualmente antes de ejecutar `python app.py`. `.env.local` está
+en `.gitignore` (nunca se versiona); `.env.example` sí se versiona, como plantilla
+sin secretos.
+
 ## Variables de entorno
 
 La aplicación lee la configuración con `os.getenv`. Los secretos deben definirse en
-el servicio cloud, contenedor o proceso; no deben agregarse al repositorio.
+el servicio cloud, contenedor o proceso (o en `.env.local` para desarrollo local);
+no deben agregarse al repositorio.
 
 ```env
 # Aplicación y seguridad
@@ -168,7 +180,9 @@ EMAIL_FROM_NAME=Alertas DT + SII
 EMAIL_REPLY_TO=
 TEST_EMAIL_TO=
 
-# IA: disabled | openai | azure
+# IA: disabled | openai | azure | codex
+# codex no requiere AI_API_KEY ni AI_BASE_URL: usa la sesión de ChatGPT
+# autenticada en esta máquina (ver "Codex con cuenta ChatGPT" más abajo).
 AI_ENABLED=false
 AI_PROVIDER=disabled
 AI_API_KEY=
@@ -209,6 +223,32 @@ WHATSAPP_LANGUAGE=es
   el panel.
 - Las credenciales de SendGrid, Azure, WordPress y WhatsApp no se guardan en Git.
 - La clave de IA se enmascara en el panel y se redacta de los errores registrados.
+- La sesión de ChatGPT usada por Codex se guarda en `.codex_home/` (ignorado por
+  Git) y nunca se imprime, registra ni expone en el panel o en los logs.
+
+## Selector de proveedor de IA (Azure / Codex / OpenAI / desactivado)
+
+`AI_PROVIDER` en `.env`/`.env.local` define el proveedor **inicial**. Desde
+`/admin/settings`, en la tarjeta "Proveedor de IA activo", se puede elegir el
+proveedor **efectivo** en cualquier momento (Azure AI, Codex con cuenta ChatGPT,
+OpenAI API o Desactivado) sin reiniciar la aplicación:
+
+- La selección del panel se guarda en SQLite (`ai_active_provider`) y tiene
+  prioridad sobre `AI_PROVIDER` del entorno mientras exista un valor guardado.
+- Azure y Codex (y OpenAI) pueden permanecer **configurados simultáneamente** en
+  el mismo `.env.local` — cada uno con sus propias credenciales o, en el caso de
+  Codex, su sesión de ChatGPT. Cambiar el selector nunca borra ni modifica la
+  configuración de los demás proveedores.
+- Solo un proveedor está activo a la vez. **No existe fallback automático** entre
+  proveedores (por ejemplo, de Azure a Codex): si el proveedor seleccionado falla
+  o le faltan credenciales, se usa directamente el resumen local de respaldo.
+- Las credenciales (`AI_API_KEY`, etc.) y la sesión de Codex (`.codex_home/`)
+  viven exclusivamente en `.env.local` o en variables del sistema — nunca en
+  SQLite.
+- El panel muestra, para el proveedor activo: proveedor efectivo, proveedor
+  inicial (`.env`), fuente de la selección (panel o `.env`), estado general de la
+  IA, estado de credenciales (qué falta exactamente si algo falta), resultado de
+  la última prueba y el mensaje de error sanitizado más reciente.
 
 ## Azure AI Foundry
 
@@ -227,6 +267,11 @@ Para un endpoint Azure OpenAI clásico, `AI_BASE_URL` puede ser la URL base del 
 la app construye la ruta de `chat/completions` con el deployment indicado en
 `AI_MODEL`.
 
+Para validar Azure: selecciona "Azure AI" en el selector de proveedor de
+`/admin/settings`, revisa que "Estado de credenciales" muestre "Listo" (si falta
+`AI_API_KEY`, `AI_MODEL` o `AI_BASE_URL`, el panel indica exactamente cuál) y usa
+"Probar conexión IA" para una llamada real de verificación.
+
 Desde `/admin/settings` se puede:
 
 - Activar o desactivar la ejecución de IA en tiempo de operación.
@@ -238,6 +283,73 @@ Desde `/admin/settings` se puede:
 
 Si la IA está desactivada, no tiene credenciales, excede los límites o falla, el job
 continúa con un resumen local y deja la alerta pendiente de revisión.
+
+## Codex con cuenta ChatGPT
+
+El proveedor `codex` usa la sesión de ChatGPT ya autenticada en esta máquina Windows
+(SDK oficial `openai-codex`), en vez de una API key. No requiere `AI_API_KEY` ni
+`AI_BASE_URL`. Cada documento se procesa en un thread nuevo, sin historial
+compartido entre documentos, con sandbox de solo lectura y sin permisos para
+ejecutar comandos ni escribir archivos.
+
+### Instalación de dependencias (Windows)
+
+```powershell
+pip install -r requirements.txt
+```
+
+### Login inicial (una sola vez)
+
+Se ejecuta manualmente, con navegador disponible en esta máquina. Alertas-DT
+nunca dispara este login por sí mismo:
+
+```powershell
+python scripts\codex_login.py
+```
+
+El script comprueba si ya existe una sesión válida, inicia el login por
+navegador si hace falta, e informa si la cuenta quedó autenticada. Nunca
+imprime ni guarda tokens, contraseñas o el contenido de `auth.json`.
+
+### Variables de entorno
+
+```env
+AI_ENABLED=true
+AI_PROVIDER=codex
+```
+
+`AI_API_KEY` y `AI_BASE_URL` se dejan vacíos: no se usan con este proveedor.
+
+### Activación y ejecución
+
+1. Ejecuta `.\.venv\Scripts\python.exe scripts\codex_login.py` si aún no hay sesión activa.
+2. Inicia la aplicación normalmente (`python app.py` o el comando habitual).
+3. Selecciona "Codex con cuenta ChatGPT" en "Proveedor de IA activo" desde
+   `/admin/settings` (o define `AI_PROVIDER=codex` en `.env.local` como valor
+   inicial) — el cambio aplica de inmediato, sin reiniciar.
+4. Desde `/admin/settings` puedes revisar el estado de la sesión y usar
+   "Probar conexión IA" (nunca abre navegador; solo comprueba la sesión existente).
+
+### Sesión asociada al usuario Windows
+
+La sesión de ChatGPT queda asociada al usuario del sistema operativo que ejecuta
+Alertas-DT. Se guarda de forma aislada en `.codex_home/` (dentro del proyecto,
+ignorado por Git) y se reutiliza en cada ejecución sin abrir navegador.
+
+### Si la sesión caduca o se alcanza el límite del plan
+
+Si no hay sesión activa, la sesión caducó, se alcanza el límite del plan ChatGPT,
+falla el SDK o Codex devuelve una respuesta no parseable, Alertas-DT usa
+automáticamente el resumen local de respaldo y continúa funcionando. La alerta
+siempre queda `pending_review` y nunca se envía un correo automáticamente.
+Vuelve a ejecutar `python scripts\codex_login.py` para renovar la sesión.
+
+### Sin API key
+
+Codex no necesita `AI_API_KEY`: los límites de uso dependen del plan de ChatGPT
+(Plus/Pro/Business) asociado a la cuenta autenticada, no de una cuota de API. El
+SDK de Codex no siempre entrega un conteo exacto de tokens a la aplicación, por lo
+que el costo estimado en el panel puede no aplicar a este proveedor.
 
 ## SendGrid
 
@@ -262,6 +374,103 @@ Antes de activar el envío se debe verificar el dominio o remitente en SendGrid.
 panel permite probar la configuración y el correo de cada alerta. Las plantillas usan
 tablas HTML para conservar compatibilidad con Outlook e incluyen enlaces oficiales y,
 cuando están habilitados, resumen ejecutivo y detallado como adjuntos HTML.
+
+## Certificados TLS en Windows
+
+Alertas-DT usa un contexto SSL explícito y compartido (`dt_alerts/tls.py`) para las
+conexiones salientes de SendGrid, en vez de depender del comportamiento por defecto
+de `urllib`. El objetivo es evitar un problema conocido en Windows corporativo: un
+antivirus, proxy o CA corporativa puede instalar su certificado raíz únicamente en
+el almacén de certificados de Windows. `curl.exe` y PowerShell (Schannel/.NET) confían
+en ese almacén de forma nativa, pero el bundle de certificados que trae Python por
+defecto puede no reflejarlo, produciendo un error de verificación que **no** ocurre
+fuera de Python.
+
+### Error TLS vs. API key inválida — cómo diferenciarlos
+
+- **Error TLS** (`SSL: CERTIFICATE_VERIFY_FAILED`, "self-signed certificate in
+  certificate chain", etc.): ocurre *antes* de que SendGrid llegue a leer la
+  petición. Nunca viene acompañado de un código HTTP de SendGrid. El panel de
+  Alertas-DT lo reporta explícitamente como "Error TLS" e indica el backend usado,
+  aclarando que no es un problema de API key.
+- **API key inválida** (`HTTP 401`) o **remitente/permiso no autorizado**
+  (`HTTP 403`): la conexión TLS ya se completó con éxito; SendGrid respondió con un
+  código HTTP de error. Esto se soluciona revisando la API key o los permisos del
+  remitente en SendGrid, no la configuración TLS.
+- **Payload o remitente inválido** (`HTTP 400`): igual que arriba, la conexión TLS
+  funcionó; el problema está en los datos enviados (remitente no verificado,
+  formato del cuerpo del correo, etc.).
+
+### Almacén de certificados de Windows (`truststore`)
+
+Por defecto, en Windows, Alertas-DT usa el paquete [`truststore`](https://pypi.org/project/truststore/)
+para validar certificados TLS usando el almacén de certificados del propio sistema
+operativo (el mismo que usan `curl.exe` y PowerShell), en vez del bundle de
+certificados que trae Python. Esto es transparente: no requiere configuración.
+
+- **Nunca** se desactiva la verificación de certificados, el chequeo de hostname,
+  ni se acepta un certificado no confiable. `truststore` solo cambia *de dónde* se
+  obtiene la lista de autoridades certificadoras confiables.
+- En sistemas que no son Windows, o si el paquete `truststore` no está instalado,
+  se usa siempre `ssl.create_default_context()` (el comportamiento estándar de
+  Python), sin ningún cambio de comportamiento.
+
+### CA corporativa explícita (opcional): `TLS_CA_BUNDLE`
+
+Si tu organización necesita confiar en una CA corporativa específica que aún no
+esté en el almacén de certificados de Windows, puedes indicarla explícitamente:
+
+```env
+TLS_CA_BUNDLE=C:\ruta\certificado-corporativo.pem
+```
+
+- El archivo debe existir localmente; Alertas-DT **nunca** descarga ni genera
+  certificados automáticamente.
+- Si `TLS_CA_BUNDLE` está configurado, Alertas-DT usa el contexto SSL estándar de
+  Python (no `truststore`) para esa CA, porque `truststore` valida siempre contra
+  el almacén del sistema operativo e ignora cualquier CA cargada manualmente. Si
+  necesitas que el sistema operativo confíe en esa CA (para que `truststore` la
+  use también), instálala en el almacén de certificados de Windows
+  (Ejecutar → `certlm.msc`, o `certutil -addstore Root certificado-corporativo.pem`
+  desde una consola con privilegios).
+- Si el archivo indicado en `TLS_CA_BUNDLE` no existe o no es un certificado
+  válido, el panel de Configuración muestra un error claro y **nunca** se
+  desactiva la validación como solución alterna.
+
+### Cómo pedir el certificado raíz a infraestructura
+
+Si tanto Windows como Python fallan al validar TLS contra SendGrid (es decir, ni
+`curl.exe` ni `Invoke-WebRequest` logran completar la conexión), el problema es de
+red o de certificados, no de la aplicación:
+
+1. Pide al equipo de infraestructura/seguridad el certificado raíz (`.pem`/`.crt`)
+   de la CA corporativa o del antivirus/proxy que inspecciona TLS en esa VM.
+2. Instálalo en el almacén de certificados de Windows ("Entidades de certificación
+   raíz de confianza"), no solo en la aplicación.
+3. Si por política no puede instalarse a nivel de sistema, usa `TLS_CA_BUNDLE`
+   como alternativa explícita solo para Alertas-DT.
+4. Nunca se debe pedir "desactivar la verificación SSL" como solución: no está
+   soportado ni disponible en esta aplicación.
+
+### Diagnóstico en el panel
+
+`/admin/settings`, dentro de la tarjeta de SendGrid, muestra sin información
+sensible: el backend TLS en uso (`truststore` o `ssl estándar`), el sistema
+operativo, si `TLS_CA_BUNDLE` está configurado (solo el nombre de archivo, nunca
+la ruta completa que podría contener el nombre de usuario de Windows) y el
+resultado sanitizado de la última prueba de SendGrid.
+
+### Migrar Alertas-DT a otra máquina virtual Windows
+
+1. Instalar Python 3.11+ y crear el entorno virtual (`python -m venv .venv`).
+2. `pip install -r requirements.txt` (incluye `truststore`).
+3. Copiar `.env` (o `.env.local`) con las variables reales; nunca versionarlo.
+4. Ejecutar `curl.exe -Iv https://api.sendgrid.com` y `Invoke-WebRequest` para
+   confirmar que Windows valida TLS correctamente contra SendGrid antes de
+   configurar la aplicación.
+5. Si esa VM tiene una CA corporativa distinta, seguir la sección anterior
+   ("Cómo pedir el certificado raíz a infraestructura") antes de dar por
+   resuelto cualquier error TLS.
 
 ## WordPress
 

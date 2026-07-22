@@ -4,13 +4,14 @@ import base64
 import html
 import json
 import smtplib
+import ssl
 import urllib.error
 import urllib.request
 from email.message import EmailMessage
 from email.utils import formataddr
 from typing import Any
 
-from . import db
+from . import db, tls
 from .config import Settings
 from .sources import source_context
 
@@ -719,6 +720,13 @@ def _from_header(settings: Settings) -> str:
     return settings.email_from
 
 
+def _redact_secret(text: str, secret: str | None) -> str:
+    """Reemplaza cualquier ocurrencia literal de `secret` en `text` por [REDACTED]."""
+    if secret and secret in text:
+        return text.replace(secret, "[REDACTED]")
+    return text
+
+
 def send_email(
     settings: Settings,
     *,
@@ -826,8 +834,9 @@ def _send_sendgrid(
         },
         method="POST",
     )
+    ssl_context, _tls_info = tls.build_ssl_context()
     try:
-        with urllib.request.urlopen(request, timeout=30) as response:  # noqa: S310
+        with urllib.request.urlopen(request, timeout=30, context=ssl_context) as response:  # noqa: S310
             message_id = response.headers.get("X-Message-Id")
         return {
             "ok": True, "provider": "sendgrid", "status": "sent",
@@ -835,17 +844,35 @@ def _send_sendgrid(
             "message": "Email enviado con SendGrid.",
         }
     except urllib.error.HTTPError as exc:
-        body = exc.read().decode("utf-8", errors="replace")
+        body = _redact_secret(exc.read().decode("utf-8", errors="replace"), settings.sendgrid_api_key)
         return {
             "ok": False, "provider": "sendgrid", "status": "failed",
             "provider_message_id": None, "error": f"HTTP {exc.code}: {body}",
             "message": f"Error al enviar con SendGrid: HTTP {exc.code}: {body}",
         }
-    except Exception as exc:
+    except urllib.error.URLError as exc:
+        if isinstance(exc.reason, ssl.SSLCertVerificationError):
+            return {
+                "ok": False, "provider": "sendgrid", "status": "failed",
+                "provider_message_id": None,
+                "error": f"Error de verificación TLS ({_tls_info.backend}): {exc.reason.verify_message}",
+                "message": (
+                    f"Error TLS al conectar con SendGrid (backend={_tls_info.backend}). "
+                    "No es un problema de API key. Revisa 'Certificados TLS en Windows' en el README."
+                ),
+            }
+        error_msg = _redact_secret(str(exc), settings.sendgrid_api_key)
         return {
             "ok": False, "provider": "sendgrid", "status": "failed",
-            "provider_message_id": None, "error": str(exc),
-            "message": f"Error al enviar con SendGrid: {exc}",
+            "provider_message_id": None, "error": error_msg,
+            "message": f"Error al enviar con SendGrid: {error_msg}",
+        }
+    except Exception as exc:
+        error_msg = _redact_secret(str(exc), settings.sendgrid_api_key)
+        return {
+            "ok": False, "provider": "sendgrid", "status": "failed",
+            "provider_message_id": None, "error": error_msg,
+            "message": f"Error al enviar con SendGrid: {error_msg}",
         }
 
 

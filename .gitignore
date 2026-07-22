@@ -11,10 +11,24 @@ __pycache__/
 .venv/
 venv/
 
+# Logs locales (pueden contener respuestas de proveedores; nunca versionar)
+logs/
+
 # Entorno / secretos
 .env
 .env.*
+!.env.example
 
 # SO / editor
 .DS_Store
 .claude/
+
+# Codex / sesión ChatGPT (nunca versionar credenciales ni sesiones locales)
+.codex_home/
+**/.codex_home/
+auth.json
+**/auth.json
+
+# Proyecto de referencia de Jorge (no forma parte de Alertas-DT)
+OpenAI-Test-main/
+OpenAI-Test-main.zip
