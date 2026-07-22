@@ -4,7 +4,7 @@ import hashlib
 import json
 import re
 import urllib.request
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from typing import Any
 
 from . import codex_client, db
@@ -64,6 +64,79 @@ def is_ai_runtime_enabled(settings: Settings, app_settings: dict[str, str]) -> b
         return True
     # Sin valor en DB: usar AI_ENABLED del entorno como fallback
     return bool(getattr(settings, "ai_enabled", False))
+
+
+# --------------------------------------------------------------------------
+# Proveedor de IA efectivo (seleccionable desde el panel, sin reiniciar)
+# --------------------------------------------------------------------------
+
+VALID_AI_PROVIDERS = {"disabled", "azure", "codex", "openai"}
+
+
+def get_effective_ai_provider(settings: Settings, app_settings: dict[str, str]) -> str:
+    """
+    Proveedor de IA efectivo y autoritativo:
+    1. Si app_settings['ai_active_provider'] (SQLite) es un valor permitido,
+       ese manda, sin importar AI_PROVIDER en el entorno.
+    2. Si todavía no existe un valor guardado, se usa AI_PROVIDER del entorno
+       como valor inicial.
+    3. Nunca se acepta un valor fuera de VALID_AI_PROVIDERS; en ese caso cae
+       a 'disabled'.
+    """
+    stored = (app_settings.get("ai_active_provider") or "").strip().lower()
+    if stored in VALID_AI_PROVIDERS:
+        return stored
+    env_value = (settings.ai_provider or "").strip().lower()
+    if env_value in VALID_AI_PROVIDERS:
+        return env_value
+    return "disabled"
+
+
+def get_effective_settings(settings: Settings, app_settings: dict[str, str]) -> Settings:
+    """
+    Devuelve una copia de `settings` (Settings es inmutable/frozen) con
+    `ai_provider` reemplazado por el proveedor efectivo. Nunca modifica el
+    objeto Settings original ni ningún estado global.
+    """
+    effective_provider = get_effective_ai_provider(settings, app_settings)
+    if effective_provider == settings.ai_provider:
+        return settings
+    return replace(settings, ai_provider=effective_provider)
+
+
+def validate_provider_credentials(provider: str, settings: Settings) -> list[str]:
+    """
+    Devuelve una lista de problemas legibles ('' = listo) que impiden usar el
+    proveedor indicado con la configuración actual. No revela ni registra
+    ningún secreto; solo indica qué falta.
+    """
+    problems: list[str] = []
+    if provider == "azure":
+        if not settings.ai_api_key:
+            problems.append("Falta AI_API_KEY.")
+        if not settings.ai_model:
+            problems.append("Falta AI_MODEL.")
+        if not settings.ai_base_url:
+            problems.append("Falta AI_BASE_URL.")
+    elif provider == "openai":
+        if not settings.ai_api_key:
+            problems.append("Falta AI_API_KEY.")
+    elif provider == "codex":
+        if not codex_client.is_codex_sdk_available():
+            problems.append(
+                "SDK de Codex no instalado. Ejecuta: pip install -r requirements.txt."
+            )
+        else:
+            logged_in, status_text = codex_client.check_login_status()
+            if not logged_in:
+                problems.append(
+                    f"{status_text} Ejecuta: .\\.venv\\Scripts\\python.exe scripts\\codex_login.py"
+                )
+    elif provider == "disabled":
+        pass
+    else:
+        problems.append(f"Proveedor de IA no soportado: {provider!r}.")
+    return problems
 
 
 # --------------------------------------------------------------------------
@@ -639,8 +712,9 @@ def _generate_and_save(
         if existing and existing.get("status") == "success":
             return _stored_to_result(existing)
 
-    provider = settings.ai_provider.lower()
-    model = settings.ai_model or ""
+    effective_settings = get_effective_settings(settings, app_settings)
+    provider = effective_settings.ai_provider
+    model = effective_settings.ai_model or ""
     operation = "regenerate_summary" if force else "generate_summary"
 
     alert_id: int | None = None
@@ -702,26 +776,26 @@ def _generate_and_save(
         error = "AI_ENABLED=false; resumen generado localmente sin usar API."
         _record("disabled", log_error=error)
 
+    elif provider == "disabled" or not provider:
+        validated = generate_fallback_summary(document)
+        status = "fallback"
+        content_quality = "limited"
+        error = "Proveedor de IA desactivado (ai_active_provider=disabled); resumen generado localmente."
+        _record("disabled", log_error=error)
+
     elif provider not in ("openai", "azure", "codex"):
         validated = generate_fallback_summary(document)
         status = "fallback"
         content_quality = "limited"
-        error = f"AI_PROVIDER={provider or 'disabled'}; resumen generado localmente."
+        error = f"Proveedor de IA no soportado: {provider!r}; resumen generado localmente."
         _record("disabled", log_error=error)
 
-    elif provider != "codex" and not settings.ai_api_key:
+    elif (credential_problems := validate_provider_credentials(provider, effective_settings)):
         validated = generate_fallback_summary(document)
         status = "fallback"
         content_quality = "limited"
-        error = f"AI_API_KEY no configurada para proveedor {provider!r}."
+        error = " ".join(credential_problems)
         _record("missing_key", log_error=error)
-
-    elif provider == "azure" and not settings.ai_base_url:
-        validated = generate_fallback_summary(document)
-        status = "fallback"
-        content_quality = "limited"
-        error = "Azure requiere AI_BASE_URL configurado."
-        _record("error", log_error=error)
 
     elif usage_status.get("daily_exceeded") or usage_status.get("monthly_exceeded"):
         validated = generate_fallback_summary(document)
@@ -741,8 +815,8 @@ def _generate_and_save(
 
     else:
         try:
-            system_prompt, user_prompt = build_ai_prompt(document, settings, app_settings)
-            ai_response = call_ai_with_usage(system_prompt, user_prompt, settings)
+            system_prompt, user_prompt = build_ai_prompt(document, effective_settings, app_settings)
+            ai_response = call_ai_with_usage(system_prompt, user_prompt, effective_settings)
             raw_response = ai_response.content
 
             parsed = parse_ai_response(raw_response)
@@ -761,8 +835,8 @@ def _generate_and_save(
 
         except Exception as exc:
             error_msg = str(exc)
-            if settings.ai_api_key and settings.ai_api_key in error_msg:
-                error_msg = error_msg.replace(settings.ai_api_key, "[REDACTED]")
+            if effective_settings.ai_api_key and effective_settings.ai_api_key in error_msg:
+                error_msg = error_msg.replace(effective_settings.ai_api_key, "[REDACTED]")
             error = f"Error IA: {error_msg[:500]}"
             validated = generate_fallback_summary(document)
             status = "fallback"
@@ -809,13 +883,14 @@ def summarize_document(doc: dict[str, Any], settings: Settings) -> SummaryResult
     When AI is enabled and credentials are present, calls the AI (no DB save).
     Otherwise uses local fallback. Always returns status='pending_review'.
     """
-    provider = settings.ai_provider.lower()
-    ai_api_key = getattr(settings, "ai_api_key", "") or getattr(settings, "openai_api_key", "")
+    provider = get_effective_ai_provider(settings, {})
+    effective_settings = replace(settings, ai_provider=provider) if provider != settings.ai_provider else settings
+    ai_api_key = getattr(effective_settings, "ai_api_key", "") or getattr(effective_settings, "openai_api_key", "")
 
     if (provider in ("openai", "azure") and ai_api_key) or provider == "codex":
         try:
-            system_prompt, user_prompt = build_ai_prompt(doc, settings, {})
-            raw = call_ai(system_prompt, user_prompt, settings)
+            system_prompt, user_prompt = build_ai_prompt(doc, effective_settings, {})
+            raw = call_ai(system_prompt, user_prompt, effective_settings)
             parsed = parse_ai_response(raw)
             if parsed:
                 validated = validate_ai_summary(parsed)

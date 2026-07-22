@@ -5,8 +5,20 @@ from dataclasses import dataclass
 from datetime import datetime
 from pathlib import Path
 
+from dotenv import load_dotenv
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
+
+# Carga automática de variables locales. Las variables ya definidas en el
+# proceso/sistema operativo tienen prioridad y nunca se sobrescriben
+# (override=False). No imprime ni registra ningún valor.
+# La suite de pruebas (tests/__init__.py) define ALERTAS_DT_SKIP_DOTENV=1
+# antes de importar este módulo, para no cargar secretos reales de .env.local
+# en pruebas automatizadas.
+if not os.getenv("ALERTAS_DT_SKIP_DOTENV"):
+    load_dotenv(PROJECT_ROOT / ".env.local", override=False)
+    load_dotenv(PROJECT_ROOT / ".env", override=False)
+
 DT_BASE_URL = "https://www.dt.gob.cl/legislacion/1624/"
 SII_YEAR = int(os.getenv("SII_YEAR", str(datetime.now().year)))
 SII_BASE_URL = "https://www.sii.cl/normativa_legislacion/"

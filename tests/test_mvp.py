@@ -1,5 +1,14 @@
 from __future__ import annotations
 
+import os
+
+# Debe establecerse antes de importar dt_alerts.config (directa o
+# indirectamente): evita cargar secretos reales de .env.local/.env durante
+# las pruebas automatizadas. `unittest discover -s tests` importa este
+# archivo como módulo de nivel superior (no como tests.test_mvp), por lo que
+# tests/__init__.py no se ejecuta primero; por eso la bandera se fija aquí.
+os.environ.setdefault("ALERTAS_DT_SKIP_DOTENV", "1")
+
 import json
 import ssl
 import tempfile
@@ -1342,7 +1351,7 @@ class AIUsageControlTestCase(unittest.TestCase):
             with db.connect(path) as conn:
                 msg = _test_ai_connection(s, {"ai_runtime_enabled": "true"}, conn)
                 rows = db.get_recent_ai_usage(conn, limit=1)
-        self.assertIn("API key", msg)
+        self.assertIn("AI_API_KEY", msg)
         self.assertEqual(rows[0]["status"], "missing_key")
         self.assertEqual(rows[0]["operation"], "test_connection")
 
@@ -2774,6 +2783,11 @@ class CodexProviderTestCase(unittest.TestCase):
             with db.connect(path) as conn:
                 doc_id = self._insert_doc(conn)
                 with mock.patch(
+                    "dt_alerts.codex_client.is_codex_sdk_available", return_value=True
+                ), mock.patch(
+                    "dt_alerts.codex_client.check_login_status",
+                    return_value=(True, "Sesión de ChatGPT activa."),
+                ), mock.patch(
                     "dt_alerts.codex_client.run_codex_prompt",
                     return_value=(self._fake_ai_json(), 0, 0, 0),
                 ) as mocked:
@@ -2819,7 +2833,8 @@ class CodexProviderTestCase(unittest.TestCase):
                 ai_row = db.get_ai_summary(conn, doc_id)
                 rows = db.get_recent_ai_usage(conn, limit=1)
         self.assertEqual(ai_row["status"], "fallback")
-        self.assertEqual(rows[0]["status"], "error")
+        # validate_provider_credentials() unifica SDK ausente bajo 'missing_key'.
+        self.assertEqual(rows[0]["status"], "missing_key")
 
     # --- 4. Respuesta de Codex no parseable produce fallback, sin romper ---
     def test_04_codex_unparseable_response_produces_fallback(self):
@@ -2830,6 +2845,11 @@ class CodexProviderTestCase(unittest.TestCase):
             with db.connect(path) as conn:
                 doc_id = self._insert_doc(conn)
                 with mock.patch(
+                    "dt_alerts.codex_client.is_codex_sdk_available", return_value=True
+                ), mock.patch(
+                    "dt_alerts.codex_client.check_login_status",
+                    return_value=(True, "Sesión de ChatGPT activa."),
+                ), mock.patch(
                     "dt_alerts.codex_client.run_codex_prompt",
                     return_value=("esto no es json {{{{", 0, 0, 0),
                 ):
@@ -2876,6 +2896,11 @@ class CodexProviderTestCase(unittest.TestCase):
             with db.connect(path) as conn:
                 doc_id = self._insert_doc(conn)
                 with mock.patch(
+                    "dt_alerts.codex_client.is_codex_sdk_available", return_value=True
+                ), mock.patch(
+                    "dt_alerts.codex_client.check_login_status",
+                    return_value=(True, "Sesión de ChatGPT activa."),
+                ), mock.patch(
                     "dt_alerts.codex_client.run_codex_prompt",
                     side_effect=RuntimeError("Fallo genérico del SDK de Codex."),
                 ):
@@ -2900,6 +2925,11 @@ class CodexProviderTestCase(unittest.TestCase):
                     status="pending_review", ai_error=None,
                 )
                 with mock.patch(
+                    "dt_alerts.codex_client.is_codex_sdk_available", return_value=True
+                ), mock.patch(
+                    "dt_alerts.codex_client.check_login_status",
+                    return_value=(True, "Sesión de ChatGPT activa."),
+                ), mock.patch(
                     "dt_alerts.codex_client.run_codex_prompt",
                     return_value=(self._fake_ai_json(), 0, 0, 0),
                 ):
@@ -2909,6 +2939,7 @@ class CodexProviderTestCase(unittest.TestCase):
                     "SELECT status FROM alerts WHERE id = ?", (alert_id,)
                 ).fetchone()
         self.assertEqual(ai_row["provider"], "codex")
+        self.assertEqual(ai_row["status"], "success")
         self.assertEqual(alert_row["status"], "pending_review")
 
     # --- 8. openai, azure y disabled siguen funcionando sin cambios de comportamiento ---
@@ -2933,7 +2964,10 @@ class CodexProviderTestCase(unittest.TestCase):
                 doc_id = self._insert_doc(conn)
                 _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
                 rows = db.get_recent_ai_usage(conn, limit=1)
-        self.assertEqual(rows[0]["status"], "error")
+        # Desde feat/ai-provider-selector, validate_provider_credentials() unifica
+        # toda credencial faltante (API key, modelo o base URL) bajo 'missing_key'.
+        self.assertEqual(rows[0]["status"], "missing_key")
+        self.assertIn("AI_BASE_URL", rows[0]["error"])
 
     def test_10_disabled_provider_still_falls_back(self):
         result = summarize_document(self._sample_doc_dict(), settings_for(
@@ -3192,6 +3226,381 @@ class TLSAndSendGridTestCase(unittest.TestCase):
         )
         self.assertTrue(result["ok"])
         self.assertEqual(result["status"], "simulated")
+
+
+class AIProviderSelectorTestCase(unittest.TestCase):
+    """Tests para el selector de proveedor de IA (ai_active_provider) — feat/ai-provider-selector.
+
+    Todo con mocks o subprocesos controlados: nunca llama a Azure/OpenAI/Codex reales.
+    """
+
+    def _db_path(self, tmp: str) -> Path:
+        path = Path(tmp) / "t.sqlite3"
+        db.init_db(path)
+        return path
+
+    def _sample_doc_dict(self, suffix: str = "1") -> dict:
+        return {
+            "dt_article_id": f"selector-test-{suffix}",
+            "canonical_url": f"https://www.dt.gob.cl/legislacion/1624/w3-article-selector{suffix}.html",
+            "source_url": "https://www.dt.gob.cl/x.html",
+            "category": "Circulares",
+            "title": "Circular de prueba selector de proveedor",
+            "publication_date": "01/01/2026",
+            "abstract": "Instruye criterios de prueba para el selector de proveedor.",
+            "detail_text": "Texto de prueba para el selector de proveedor.",
+            "pdf_url": None,
+            "content_hash": None,
+        }
+
+    def _insert_doc(self, conn, suffix: str = "1") -> int:
+        doc_id, _ = db.upsert_document(conn, self._sample_doc_dict(suffix))
+        db.update_document_processed(
+            conn, doc_id, status="processed", detail_text="Texto.",
+            pdf_url=None, content_hash=None, last_error=None,
+        )
+        return doc_id
+
+    def _azure_settings(self, **overrides):
+        defaults = dict(
+            ai_provider="azure", ai_api_key="fake-azure-key",
+            ai_model="gpt-chat-latest",
+            ai_base_url="https://DemoTiboxIA.services.ai.azure.com/openai/v1",
+            ai_enabled=True,
+        )
+        defaults.update(overrides)
+        return settings_for(Path(":memory:"), **defaults)
+
+    def _fake_ai_json(self, provider_label: str) -> str:
+        return json.dumps({
+            "title": "Circular DT", "category": "Circulares", "relevance": "medio",
+            "email_subject": f"Nueva normativa DT: {provider_label}",
+            "email_summary": f"Resumen generado por {provider_label}.",
+            "key_points": ["Punto 1"],
+            "practical_impacts": [{"title": "Impacto", "description": "Desc"}],
+            "recommended_actions": ["Accion 1"],
+            "executive_summary": {"title": "Resumen ejecutivo", "body": "Cuerpo."},
+            "detailed_summary": {"title": "Detalle", "sections": []},
+            "tags": ["DT"], "legal_disclaimer": "Informativo.",
+        })
+
+    # --- 1. Azure seleccionado inicialmente desde .env (sin valor guardado en panel) ---
+    def test_01_azure_initial_from_env(self):
+        from dt_alerts.summarizer import get_effective_ai_provider
+        s = self._azure_settings()
+        self.assertEqual(get_effective_ai_provider(s, {}), "azure")
+
+    # --- 2. Azure seleccionado desde el panel (app_settings manda sobre AI_PROVIDER) ---
+    def test_02_azure_selected_from_panel(self):
+        from dt_alerts.summarizer import get_effective_ai_provider
+        s = settings_for(Path(":memory:"), ai_provider="disabled")
+        self.assertEqual(
+            get_effective_ai_provider(s, {"ai_active_provider": "azure"}), "azure"
+        )
+
+    # --- 3. Codex seleccionado desde el panel (con Azure configurado en el entorno) ---
+    def test_03_codex_selected_from_panel_used_in_generation(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = self._azure_settings(database_path=path)  # Azure configurado en .env...
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch(
+                    "dt_alerts.codex_client.is_codex_sdk_available", return_value=True
+                ), mock.patch(
+                    "dt_alerts.codex_client.check_login_status",
+                    return_value=(True, "Sesión de ChatGPT activa."),
+                ), mock.patch(
+                    "dt_alerts.codex_client.run_codex_prompt",
+                    return_value=(self._fake_ai_json("Codex"), 0, 0, 0),
+                ):
+                    # ...pero el panel tiene seleccionado codex.
+                    _generate_and_save(conn, doc_id, s, {"ai_active_provider": "codex"})
+                ai_row = db.get_ai_summary(conn, doc_id)
+        self.assertEqual(ai_row["provider"], "codex")
+        self.assertEqual(ai_row["status"], "success")
+
+    # --- 4. OpenAI seleccionado desde el panel ---
+    def test_04_openai_selected_from_panel(self):
+        from dt_alerts.summarizer import AIResponse, _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = self._azure_settings(database_path=path, ai_api_key="fake-openai-key")
+            fake_response = AIResponse(content=self._fake_ai_json("OpenAI"), total_tokens=10)
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch(
+                    "dt_alerts.summarizer._call_openai_api", return_value=fake_response
+                ):
+                    _generate_and_save(conn, doc_id, s, {"ai_active_provider": "openai"})
+                ai_row = db.get_ai_summary(conn, doc_id)
+        self.assertEqual(ai_row["provider"], "openai")
+        self.assertEqual(ai_row["status"], "success")
+
+    # --- 5. Disabled seleccionado desde el panel: nunca llama a ningún proveedor externo ---
+    def test_05_disabled_selected_from_panel_uses_fallback_only(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = self._azure_settings(database_path=path)  # credenciales Azure válidas presentes
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch("dt_alerts.summarizer.call_ai_with_usage") as mocked_call:
+                    _generate_and_save(conn, doc_id, s, {"ai_active_provider": "disabled"})
+                ai_row = db.get_ai_summary(conn, doc_id)
+        mocked_call.assert_not_called()
+        self.assertEqual(ai_row["status"], "fallback")
+
+    # --- 6/7. Cambiar de proveedor sin reiniciar (misma conexión y objeto settings) ---
+    def test_06_switch_provider_without_restart(self):
+        from dt_alerts.summarizer import AIResponse, _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = self._azure_settings(database_path=path)
+            with db.connect(path) as conn:
+                doc_id_1 = self._insert_doc(conn, suffix="1")
+
+                fake_azure = AIResponse(content=self._fake_ai_json("Azure"), total_tokens=5)
+                with mock.patch("dt_alerts.summarizer._call_azure_api", return_value=fake_azure):
+                    _generate_and_save(conn, doc_id_1, s, {"ai_active_provider": "azure"})
+                row_1 = db.get_ai_summary(conn, doc_id_1)
+
+                # Mismo objeto `s` y misma conexión: solo cambia el ajuste en DB.
+                doc_id_2 = self._insert_doc(conn, suffix="2")
+                with mock.patch(
+                    "dt_alerts.codex_client.is_codex_sdk_available", return_value=True
+                ), mock.patch(
+                    "dt_alerts.codex_client.check_login_status",
+                    return_value=(True, "Sesión de ChatGPT activa."),
+                ), mock.patch(
+                    "dt_alerts.codex_client.run_codex_prompt",
+                    return_value=(self._fake_ai_json("Codex"), 0, 0, 0),
+                ):
+                    _generate_and_save(conn, doc_id_2, s, {"ai_active_provider": "codex"})
+                row_2 = db.get_ai_summary(conn, doc_id_2)
+
+                # Vuelta a Azure, mismo proceso, sin recrear nada.
+                doc_id_3 = self._insert_doc(conn, suffix="3")
+                with mock.patch("dt_alerts.summarizer._call_azure_api", return_value=fake_azure):
+                    _generate_and_save(conn, doc_id_3, s, {"ai_active_provider": "azure"})
+                row_3 = db.get_ai_summary(conn, doc_id_3)
+        self.assertEqual(row_1["provider"], "azure")
+        self.assertEqual(row_2["provider"], "codex")
+        self.assertEqual(row_3["provider"], "azure")
+
+    # --- 8. El proveedor persiste tras cerrar y volver a abrir la conexión SQLite ---
+    def test_08_provider_persists_across_db_reconnect(self):
+        from dt_alerts.summarizer import get_effective_ai_provider
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                db.set_setting(conn, "ai_active_provider", "codex")
+            # Conexión cerrada y reabierta: nada en memoria persiste salvo la DB.
+            with db.connect(path) as conn:
+                app_settings = db.get_all_settings(conn)
+        s = self._azure_settings(database_path=path)
+        self.assertEqual(get_effective_ai_provider(s, app_settings), "codex")
+
+    # --- 9/10/11. Azure: falta AI_BASE_URL / AI_MODEL / AI_API_KEY, exactamente ---
+    def test_09_azure_missing_base_url_reports_exact_variable(self):
+        from dt_alerts.summarizer import validate_provider_credentials
+        s = self._azure_settings(ai_base_url="")
+        problems = validate_provider_credentials("azure", s)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("AI_BASE_URL", problems[0])
+
+    def test_10_azure_missing_model_reports_exact_variable(self):
+        from dt_alerts.summarizer import validate_provider_credentials
+        s = self._azure_settings(ai_model="")
+        problems = validate_provider_credentials("azure", s)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("AI_MODEL", problems[0])
+
+    def test_11_azure_missing_api_key_reports_exact_variable(self):
+        from dt_alerts.summarizer import validate_provider_credentials
+        s = self._azure_settings(ai_api_key="")
+        problems = validate_provider_credentials("azure", s)
+        self.assertEqual(len(problems), 1)
+        self.assertIn("AI_API_KEY", problems[0])
+
+    # --- 12. Codex no requiere API key ---
+    def test_12_codex_requires_no_api_key(self):
+        from dt_alerts.summarizer import validate_provider_credentials
+        s = settings_for(Path(":memory:"), ai_provider="codex", ai_api_key="")
+        with mock.patch("dt_alerts.codex_client.is_codex_sdk_available", return_value=True), \
+             mock.patch("dt_alerts.codex_client.check_login_status", return_value=(True, "ok")):
+            problems = validate_provider_credentials("codex", s)
+        self.assertEqual(problems, [])
+
+    # --- 13. Codex sin sesión reporta problema (sin exigir API key) ---
+    def test_13_codex_without_session_reports_problem(self):
+        from dt_alerts.summarizer import validate_provider_credentials
+        s = settings_for(Path(":memory:"), ai_provider="codex", ai_api_key="")
+        with mock.patch("dt_alerts.codex_client.is_codex_sdk_available", return_value=True), \
+             mock.patch("dt_alerts.codex_client.check_login_status",
+                        return_value=(False, "No hay sesión de ChatGPT activa.")):
+            problems = validate_provider_credentials("codex", s)
+        self.assertTrue(problems)
+        self.assertIn("codex_login.py", problems[0])
+
+    # --- 14. Codex con sesión activa: listo para usar ---
+    def test_14_codex_with_active_session_is_ready(self):
+        from dt_alerts.summarizer import validate_provider_credentials
+        s = settings_for(Path(":memory:"), ai_provider="codex", ai_api_key="")
+        with mock.patch("dt_alerts.codex_client.is_codex_sdk_available", return_value=True), \
+             mock.patch("dt_alerts.codex_client.check_login_status",
+                        return_value=(True, "Sesión de ChatGPT activa.")):
+            problems = validate_provider_credentials("codex", s)
+        self.assertEqual(problems, [])
+
+    # --- 15/16. El proveedor correcto se registra en ai_usage_logs y ai_summaries ---
+    def test_15_correct_provider_recorded_in_usage_logs_and_summaries(self):
+        from dt_alerts.summarizer import AIResponse, _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = self._azure_settings(database_path=path)
+            fake_response = AIResponse(content=self._fake_ai_json("Azure"), total_tokens=5)
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch("dt_alerts.summarizer._call_azure_api", return_value=fake_response):
+                    _generate_and_save(conn, doc_id, s, {"ai_active_provider": "azure"})
+                ai_row = db.get_ai_summary(conn, doc_id)
+                usage_rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertEqual(ai_row["provider"], "azure")
+        self.assertEqual(usage_rows[0]["provider"], "azure")
+
+    # --- 17. Ninguna API key queda guardada en SQLite ---
+    def test_17_no_api_keys_stored_in_sqlite(self):
+        from dt_alerts.summarizer import AIResponse, _generate_and_save
+        secret = "AZURE-SECRET-KEY-MUST-NOT-BE-STORED-xyz"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = self._azure_settings(database_path=path, ai_api_key=secret)
+            fake_response = AIResponse(content=self._fake_ai_json("Azure"), total_tokens=5)
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch("dt_alerts.summarizer._call_azure_api", return_value=fake_response):
+                    _generate_and_save(conn, doc_id, s, {"ai_active_provider": "azure"})
+            raw = path.read_bytes()
+        self.assertNotIn(secret.encode("utf-8"), raw)
+
+    # --- 18. Las claves no se exponen en mensajes de error ---
+    def test_18_api_key_never_exposed_in_error_messages(self):
+        from dt_alerts.summarizer import _generate_and_save
+        secret = "AZURE-SECRET-KEY-IN-ERROR-abc123"
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = self._azure_settings(database_path=path, ai_api_key=secret)
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch(
+                    "dt_alerts.summarizer._call_azure_api",
+                    side_effect=RuntimeError(f"HTTP 401: token {secret} invalido"),
+                ):
+                    _generate_and_save(conn, doc_id, s, {"ai_active_provider": "azure"})
+                rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertNotIn(secret, rows[0]["error"] or "")
+        self.assertIn("[REDACTED]", rows[0]["error"] or "")
+
+    # --- 19. El fallback local sigue funcionando cuando el proveedor falla ---
+    def test_19_local_fallback_still_works_on_provider_failure(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = self._azure_settings(database_path=path)
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch(
+                    "dt_alerts.summarizer._call_azure_api",
+                    side_effect=RuntimeError("Azure no disponible"),
+                ):
+                    result = _generate_and_save(conn, doc_id, s, {"ai_active_provider": "azure"})
+        self.assertIsNotNone(result.summary)
+        self.assertEqual(result.status, "pending_review")
+
+    # --- 20. La alerta permanece pending_review sin importar el proveedor ---
+    def test_20_alert_stays_pending_review_regardless_of_provider(self):
+        from dt_alerts.summarizer import AIResponse, _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = self._azure_settings(database_path=path)
+            fake_response = AIResponse(content=self._fake_ai_json("Azure"), total_tokens=5)
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                alert_id = db.create_or_update_alert(
+                    conn, doc_id, summary="Inicial.", key_points=[], practical_impacts=[],
+                    relevance="medio", status="pending_review", ai_error=None,
+                )
+                with mock.patch("dt_alerts.summarizer._call_azure_api", return_value=fake_response):
+                    result = _generate_and_save(conn, doc_id, s, {"ai_active_provider": "azure"})
+                alert_row = conn.execute(
+                    "SELECT status FROM alerts WHERE id = ?", (alert_id,)
+                ).fetchone()
+        self.assertEqual(result.status, "pending_review")
+        self.assertEqual(alert_row["status"], "pending_review")
+
+    # --- 21. .env se carga automáticamente (subproceso real, sin la bandera de tests) ---
+    # Usa una variable exclusiva (no un campo de Settings) para no depender de,
+    # ni colisionar con, el contenido real de .env.local de este desarrollador.
+    # .env.local usa exactamente el mismo mecanismo de carga (misma línea de
+    # código en dt_alerts/config.py), por lo que probar vía .env es equivalente
+    # y evita tocar el archivo real que contiene secretos.
+    def test_21_env_file_loads_automatically_end_to_end(self):
+        import subprocess
+        import sys as _sys
+
+        project_root = Path(__file__).resolve().parent.parent
+        venv_python = project_root / ".venv" / "Scripts" / "python.exe"
+        if not venv_python.is_file():
+            venv_python = Path(_sys.executable)
+
+        env_path = project_root / ".env"
+        if env_path.exists():
+            self.skipTest(".env ya existe en este repo; se omite para no sobreescribirlo.")
+
+        marker = "dotenv-autoload-marker-value-12345"
+        env_path.write_text(f"ALERTASDT_TEST_DOTENV_MARKER={marker}\n", encoding="utf-8")
+        try:
+            clean_env = dict(os.environ)
+            clean_env.pop("ALERTAS_DT_SKIP_DOTENV", None)
+            clean_env.pop("ALERTASDT_TEST_DOTENV_MARKER", None)
+            proc = subprocess.run(
+                [str(venv_python), "-c",
+                 "import dt_alerts.config, os; print(os.environ.get('ALERTASDT_TEST_DOTENV_MARKER', ''))"],
+                cwd=str(project_root), capture_output=True, text=True, timeout=30, env=clean_env,
+            )
+            self.assertEqual(proc.stdout.strip(), marker, proc.stderr)
+        finally:
+            env_path.unlink(missing_ok=True)
+
+    # --- 22. Las variables reales del sistema tienen prioridad sobre .env/.env.local ---
+    def test_22_system_env_var_has_priority_over_dotenv_file(self):
+        import subprocess
+        import sys as _sys
+
+        project_root = Path(__file__).resolve().parent.parent
+        venv_python = project_root / ".venv" / "Scripts" / "python.exe"
+        if not venv_python.is_file():
+            venv_python = Path(_sys.executable)
+
+        env_path = project_root / ".env"
+        if env_path.exists():
+            self.skipTest(".env ya existe en este repo; se omite para no sobreescribirlo.")
+
+        env_path.write_text("ALERTASDT_TEST_DOTENV_MARKER=valor-del-archivo\n", encoding="utf-8")
+        try:
+            clean_env = dict(os.environ)
+            clean_env.pop("ALERTAS_DT_SKIP_DOTENV", None)
+            clean_env["ALERTASDT_TEST_DOTENV_MARKER"] = "valor-del-sistema"
+            proc = subprocess.run(
+                [str(venv_python), "-c",
+                 "import dt_alerts.config, os; print(os.environ.get('ALERTASDT_TEST_DOTENV_MARKER', ''))"],
+                cwd=str(project_root), capture_output=True, text=True, timeout=30, env=clean_env,
+            )
+            self.assertEqual(proc.stdout.strip(), "valor-del-sistema", proc.stderr)
+        finally:
+            env_path.unlink(missing_ok=True)
 
 
 class AIToggleFromPanelTestCase(unittest.TestCase):

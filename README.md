@@ -138,10 +138,21 @@ Rutas locales:
 Los valores locales por defecto son solo para desarrollo. En cualquier ambiente
 compartido se deben definir `ADMIN_TOKEN` y `JOB_TOKEN` largos y distintos.
 
+### Variables locales (`.env.local`)
+
+La aplicación carga automáticamente `.env.local` y luego `.env` (en ese orden) al
+arrancar, usando `python-dotenv`. Las variables que ya estén definidas en el
+sistema operativo o en la sesión de PowerShell siempre tienen prioridad y nunca se
+sobrescriben: `.env.local` y `.env` solo rellenan lo que falte. No es necesario
+cargar variables manualmente antes de ejecutar `python app.py`. `.env.local` está
+en `.gitignore` (nunca se versiona); `.env.example` sí se versiona, como plantilla
+sin secretos.
+
 ## Variables de entorno
 
 La aplicación lee la configuración con `os.getenv`. Los secretos deben definirse en
-el servicio cloud, contenedor o proceso; no deben agregarse al repositorio.
+el servicio cloud, contenedor o proceso (o en `.env.local` para desarrollo local);
+no deben agregarse al repositorio.
 
 ```env
 # Aplicación y seguridad
@@ -215,6 +226,30 @@ WHATSAPP_LANGUAGE=es
 - La sesión de ChatGPT usada por Codex se guarda en `.codex_home/` (ignorado por
   Git) y nunca se imprime, registra ni expone en el panel o en los logs.
 
+## Selector de proveedor de IA (Azure / Codex / OpenAI / desactivado)
+
+`AI_PROVIDER` en `.env`/`.env.local` define el proveedor **inicial**. Desde
+`/admin/settings`, en la tarjeta "Proveedor de IA activo", se puede elegir el
+proveedor **efectivo** en cualquier momento (Azure AI, Codex con cuenta ChatGPT,
+OpenAI API o Desactivado) sin reiniciar la aplicación:
+
+- La selección del panel se guarda en SQLite (`ai_active_provider`) y tiene
+  prioridad sobre `AI_PROVIDER` del entorno mientras exista un valor guardado.
+- Azure y Codex (y OpenAI) pueden permanecer **configurados simultáneamente** en
+  el mismo `.env.local` — cada uno con sus propias credenciales o, en el caso de
+  Codex, su sesión de ChatGPT. Cambiar el selector nunca borra ni modifica la
+  configuración de los demás proveedores.
+- Solo un proveedor está activo a la vez. **No existe fallback automático** entre
+  proveedores (por ejemplo, de Azure a Codex): si el proveedor seleccionado falla
+  o le faltan credenciales, se usa directamente el resumen local de respaldo.
+- Las credenciales (`AI_API_KEY`, etc.) y la sesión de Codex (`.codex_home/`)
+  viven exclusivamente en `.env.local` o en variables del sistema — nunca en
+  SQLite.
+- El panel muestra, para el proveedor activo: proveedor efectivo, proveedor
+  inicial (`.env`), fuente de la selección (panel o `.env`), estado general de la
+  IA, estado de credenciales (qué falta exactamente si algo falta), resultado de
+  la última prueba y el mensaje de error sanitizado más reciente.
+
 ## Azure AI Foundry
 
 La integración soporta Azure AI Foundry mediante la Responses API v1 y mantiene un
@@ -231,6 +266,11 @@ AI_BASE_URL=https://tu-recurso.services.ai.azure.com/openai/v1
 Para un endpoint Azure OpenAI clásico, `AI_BASE_URL` puede ser la URL base del recurso;
 la app construye la ruta de `chat/completions` con el deployment indicado en
 `AI_MODEL`.
+
+Para validar Azure: selecciona "Azure AI" en el selector de proveedor de
+`/admin/settings`, revisa que "Estado de credenciales" muestre "Listo" (si falta
+`AI_API_KEY`, `AI_MODEL` o `AI_BASE_URL`, el panel indica exactamente cuál) y usa
+"Probar conexión IA" para una llamada real de verificación.
 
 Desde `/admin/settings` se puede:
 
@@ -282,9 +322,11 @@ AI_PROVIDER=codex
 
 ### Activación y ejecución
 
-1. Configura `AI_ENABLED=true` y `AI_PROVIDER=codex` en `.env`.
-2. Ejecuta `python scripts\codex_login.py` si aún no hay sesión activa.
-3. Inicia la aplicación normalmente (`python app.py` o el comando habitual).
+1. Ejecuta `.\.venv\Scripts\python.exe scripts\codex_login.py` si aún no hay sesión activa.
+2. Inicia la aplicación normalmente (`python app.py` o el comando habitual).
+3. Selecciona "Codex con cuenta ChatGPT" en "Proveedor de IA activo" desde
+   `/admin/settings` (o define `AI_PROVIDER=codex` en `.env.local` como valor
+   inicial) — el cambio aplica de inmediato, sin reiniciar.
 4. Desde `/admin/settings` puedes revisar el estado de la sesión y usar
    "Probar conexión IA" (nunca abre navegador; solo comprueba la sesión existente).
 

@@ -1,6 +1,10 @@
 # Dependencias de producción
 pdfplumber==0.11.10
 
+# Carga automática de .env.local / .env (las variables reales del sistema
+# siempre tienen prioridad; ver dt_alerts/config.py).
+python-dotenv
+
 # TLS: usa el almacén de certificados del sistema operativo (Windows/macOS)
 # para conexiones salientes (SendGrid, etc.), evitando desajustes entre el
 # bundle de certificados de Python y el almacén de confianza del sistema.

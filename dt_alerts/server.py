@@ -434,7 +434,11 @@ class AppHandler(BaseHTTPRequestHandler):
             self.redirect_flash("/admin/settings", msg)
         elif path == "/admin/settings/ai-toggle":
             self.require_admin()
-            if not self.settings.ai_api_key and self.settings.ai_provider != "codex":
+            from .summarizer import get_effective_ai_provider
+            with db.connect(self.settings.database_path) as conn:
+                app_settings = db.get_all_settings(conn)
+            effective_provider = get_effective_ai_provider(self.settings, app_settings)
+            if not self.settings.ai_api_key and effective_provider != "codex":
                 self.respond_json({"error": "API key no configurada."}, status=HTTPStatus.BAD_REQUEST)
                 return
             payload = self.read_payload()
@@ -444,6 +448,20 @@ class AppHandler(BaseHTTPRequestHandler):
             with db.connect(self.settings.database_path) as conn:
                 db.set_setting(conn, "ai_runtime_enabled", "true" if enabled else "false")
             self.respond_json({"success": True, "enabled": enabled})
+        elif path == "/admin/settings/ai-provider":
+            self.require_admin()
+            from .summarizer import VALID_AI_PROVIDERS
+            payload = self.read_payload()
+            provider = str(payload.get("provider") or "").strip().lower()
+            if provider not in VALID_AI_PROVIDERS:
+                self.redirect_flash(
+                    "/admin/settings",
+                    f"Proveedor no permitido: {provider!r}. No se guardó ningún cambio.",
+                )
+                return
+            with db.connect(self.settings.database_path) as conn:
+                db.set_setting(conn, "ai_active_provider", provider)
+            self.redirect_flash("/admin/settings", f"Proveedor de IA activo actualizado a: {provider}.")
         elif path == "/admin/settings/ai-enable":
             self.require_admin()
             with db.connect(self.settings.database_path) as conn:
@@ -1479,8 +1497,11 @@ def _test_wordpress_connection(settings: Settings) -> str:
 
 def _test_ai_connection(settings: Settings, app_settings: dict, conn=None) -> str:
     """Test AI connectivity. Records usage in ai_usage_logs if conn is provided. Never logs API key."""
-    provider = (settings.ai_provider or "disabled").lower()
-    model = settings.ai_model or ""
+    from .summarizer import get_effective_settings, validate_provider_credentials
+
+    effective_settings = get_effective_settings(settings, app_settings)
+    provider = effective_settings.ai_provider
+    model = effective_settings.ai_model or ""
     daily_limit = int(getattr(settings, "ai_daily_token_limit", 50000) or 0)
     monthly_limit = int(getattr(settings, "ai_monthly_token_limit", 500000) or 0)
 
@@ -1517,32 +1538,15 @@ def _test_ai_connection(settings: Settings, app_settings: dict, conn=None) -> st
         _record("disabled", log_error=msg)
         return msg
 
-    if provider == "disabled":
-        msg = "IA desactivada (AI_PROVIDER=disabled). Configura AI_PROVIDER=openai, azure o codex."
+    if provider == "disabled" or not provider:
+        msg = "Proveedor de IA desactivado. Selecciona Azure, Codex u OpenAI en 'Proveedor de IA activo'."
         _record("disabled", log_error=msg)
         return msg
 
-    if provider == "codex":
-        if not codex_client.is_codex_sdk_available():
-            msg = "SDK de Codex no instalado. Ejecuta: pip install -r requirements.txt."
-            _record("missing_key", log_error=msg)
-            return msg
-        logged_in, status_text = codex_client.check_login_status()
-        if not logged_in:
-            msg = (
-                f"{status_text} Ejecuta scripts/codex_login.py para autenticarte "
-                "(esta prueba nunca abre el navegador)."
-            )
-            _record("missing_key", log_error=msg)
-            return msg
-    elif not settings.ai_api_key:
-        msg = "Sin API key: configura AI_API_KEY en el archivo .env."
+    credential_problems = validate_provider_credentials(provider, effective_settings)
+    if credential_problems:
+        msg = " ".join(credential_problems)
         _record("missing_key", log_error=msg)
-        return msg
-
-    if provider == "azure" and not settings.ai_base_url:
-        msg = "Azure requiere AI_BASE_URL configurado en el archivo .env."
-        _record("error", log_error=msg)
         return msg
 
     if conn is not None:
@@ -1561,7 +1565,7 @@ def _test_ai_connection(settings: Settings, app_settings: dict, conn=None) -> st
         ai_response = call_ai_with_usage(
             "Responde solo con JSON válido.",
             '{"ok": true, "message": "test"}',
-            settings,
+            effective_settings,
         )
         if ai_response.content:
             _record(
@@ -1570,14 +1574,15 @@ def _test_ai_connection(settings: Settings, app_settings: dict, conn=None) -> st
                 output_tokens=ai_response.output_tokens,
                 total_tokens=ai_response.total_tokens,
             )
-            return f"Conexión IA OK ({provider}, modelo: {settings.ai_model or 'default'})."
+            model_label = "sesión ChatGPT" if provider == "codex" else (model or "default")
+            return f"Conexión IA OK ({provider}, modelo: {model_label})."
         msg = "Conexión IA sin respuesta."
         _record("error", log_error=msg)
         return msg
     except Exception as exc:
         error_msg = str(exc)
-        if settings.ai_api_key and settings.ai_api_key in error_msg:
-            error_msg = error_msg.replace(settings.ai_api_key, "[REDACTED]")
+        if effective_settings.ai_api_key and effective_settings.ai_api_key in error_msg:
+            error_msg = error_msg.replace(effective_settings.ai_api_key, "[REDACTED]")
         msg = f"Error al probar IA: {error_msg[:300]}"
         _record("error", log_error=error_msg[:500])
         return msg
@@ -1823,7 +1828,13 @@ def render_settings(settings: Settings) -> str:
 """
 
     # --- Conexión IA ---
-    ai_provider = settings.ai_provider
+    from .summarizer import VALID_AI_PROVIDERS, get_effective_settings, validate_provider_credentials
+
+    ai_provider_initial = settings.ai_provider
+    effective_settings = get_effective_settings(settings, app_cfg)
+    ai_provider = effective_settings.ai_provider
+    _active_provider_raw = (app_cfg.get("ai_active_provider") or "").strip().lower()
+    ai_provider_source = "panel" if _active_provider_raw in VALID_AI_PROVIDERS else ".env (inicial)"
     ai_env_enabled = bool(getattr(settings, "ai_enabled", False))
     ai_runtime_raw = (app_cfg.get("ai_runtime_enabled") or "").strip().lower()
     if ai_runtime_raw in {"0", "false", "no", "n", "off"}:
@@ -1861,6 +1872,13 @@ def render_settings(settings: Settings) -> str:
         else:
             codex_session_msg = "SDK de Codex no instalado (pip install -r requirements.txt)."
 
+    # Validación unificada de credenciales para el proveedor efectivo (misma
+    # función usada por _generate_and_save y _test_ai_connection).
+    credential_problems = (
+        validate_provider_credentials(ai_provider, effective_settings)
+        if ai_provider in ("azure", "codex", "openai") else []
+    )
+
     if not ai_runtime_enabled:
         ai_estado = pill("paused", "Apagada")
         ai_estado_key = "paused"
@@ -1870,30 +1888,23 @@ def render_settings(settings: Settings) -> str:
     elif ai_limit_reached:
         ai_estado = pill("error", "Límite alcanzado")
         ai_estado_key = "error"
-    elif ai_provider == "codex":
-        if codex_logged_in:
-            ai_estado = pill("active", "Activa")
-            ai_estado_key = "active"
-        else:
-            ai_estado = pill("error", "Sin sesión ChatGPT")
-            ai_estado_key = "error"
-    elif settings.ai_api_key:
+    elif credential_problems:
+        estado_label = "Sin sesión ChatGPT" if ai_provider == "codex" else "Credenciales incompletas"
+        ai_estado = pill("error", estado_label)
+        ai_estado_key = "error"
+    else:
         ai_estado = pill("active", "Activa")
         ai_estado_key = "active"
-    else:
-        ai_estado = pill("error", "Sin API key")
-        ai_estado_key = "error"
 
     ai_last_test = app_cfg.get("ai_last_test", "")
 
-    has_api_key = codex_logged_in if ai_provider == "codex" else bool(settings.ai_api_key)
+    has_api_key = not credential_problems and ai_provider != "disabled"
     _toggle_checked = "checked" if ai_runtime_enabled else ""
     _toggle_disabled = "disabled" if not has_api_key else ""
     _toggle_label = "Activa" if ai_runtime_enabled else "Inactiva"
     _no_key_note_text = (
-        f"{codex_session_msg or 'Sin sesión ChatGPT'} — ejecuta scripts/codex_login.py para habilitar"
-        if ai_provider == "codex" else
-        "Sin API key — configura AI_API_KEY para habilitar"
+        " ".join(credential_problems) if credential_problems
+        else "Selecciona un proveedor de IA para habilitar"
     )
     _no_key_note = (
         f'<span id="ai-toggle-note" style="font-size:12px;color:#9CA3AF;margin-left:8px;">'
@@ -1941,9 +1952,7 @@ async function toggleAI(enabled) {{
 </script>"""
 
     ai_test_btn = ""
-    _codex_has_credentials = ai_provider == "codex" and codex_sdk_available
-    _has_ai_credentials = bool(settings.ai_api_key) or _codex_has_credentials
-    if ai_runtime_enabled and ai_provider not in ("disabled", "") and _has_ai_credentials and not ai_limit_reached:
+    if ai_runtime_enabled and ai_provider not in ("disabled", "") and not credential_problems and not ai_limit_reached:
         ai_test_btn = f"""
   <form method="post" action="/admin/settings/test-ai" style="display:inline">
     <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
@@ -1951,11 +1960,11 @@ async function toggleAI(enabled) {{
     </button>
   </form>"""
     else:
-        reason = "Activa IA y configura AI_PROVIDER + AI_API_KEY (o AI_PROVIDER=codex con sesión ChatGPT) para probar."
+        reason = "Activa IA y selecciona un proveedor con credenciales completas para probar."
         if ai_limit_reached:
             reason = "Límite IA alcanzado. No se ejecutará prueba."
-        elif ai_provider == "codex" and not codex_sdk_available:
-            reason = "SDK de Codex no instalado. Ejecuta: pip install -r requirements.txt."
+        elif credential_problems:
+            reason = " ".join(credential_problems)
         ai_test_btn = (
             f'<button class="eg-btn eg-btn--secondary eg-btn--sm" type="button" disabled>'
             f'{icon("cpu", 14)}<span>Probar conexion IA</span></button>'
@@ -2110,10 +2119,60 @@ async function toggleAI(enabled) {{
     <dt>Autenticación</dt><dd>Cuenta ChatGPT de esta máquina Windows, sin API key.</dd>
     <dt>Estado sesión</dt><dd>{codex_status_pill}</dd>
     <dt>Detalle</dt><dd class="mono">{h(codex_session_msg or '—')}</dd>
-    <dt>Iniciar sesión (manual)</dt><dd class="mono">python scripts/codex_login.py</dd>
+    <dt>Iniciar sesión (manual)</dt><dd class="mono">.\.venv\Scripts\python.exe scripts\codex_login.py</dd>
     <dt>Límites</dt><dd>Dependen del plan de ChatGPT (Plus/Pro/Business), no de un límite de tokens de API.</dd>
     <dt>Conteo de tokens</dt><dd>El SDK de Codex no siempre entrega tokens exactos a la aplicación.</dd>
   </dl>
+"""
+
+    # --- Proveedor de IA activo (selector) ---
+    _provider_labels = {
+        "azure": "Azure AI",
+        "codex": "Codex con cuenta ChatGPT",
+        "openai": "OpenAI API",
+        "disabled": "Desactivado",
+    }
+
+    def _provider_option(value: str) -> str:
+        selected = "selected" if value == ai_provider else ""
+        return f'<option value="{value}" {selected}>{h(_provider_labels[value])}</option>'
+
+    _provider_select_options = "".join(_provider_option(v) for v in ("azure", "codex", "openai", "disabled"))
+
+    _credential_status_dd = (
+        pill("active", "Listo") if not credential_problems and ai_provider != "disabled"
+        else pill("paused", "No aplica") if ai_provider == "disabled"
+        else f'{pill("error", "Incompleto")} <span style="margin-left:8px;">{h(" ".join(credential_problems))}</span>'
+    )
+
+    section_ai_provider = f"""
+<section class="eg-card eg-panel">
+  <h2>{icon("cpu", 17)} Proveedor de IA activo</h2>
+  <form method="post" action="/admin/settings/ai-provider" style="display:flex;gap:10px;align-items:flex-end;flex-wrap:wrap;margin-bottom:16px;">
+    <div class="eg-field" style="margin-bottom:0;">
+      <label class="eg-label" for="ai-provider-select">Proveedor</label>
+      <select class="eg-input" id="ai-provider-select" name="provider">
+        {_provider_select_options}
+      </select>
+    </div>
+    <button class="eg-btn eg-btn--primary eg-btn--sm" type="submit">
+      {icon("check", 14)}<span>Guardar proveedor</span>
+    </button>
+  </form>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Proveedor efectivo</dt><dd class="mono">{h(_provider_labels.get(ai_provider, ai_provider))}</dd>
+    <dt>Proveedor inicial (.env)</dt><dd class="mono">{h(ai_provider_initial or 'disabled')}</dd>
+    <dt>Fuente de la selección</dt><dd class="mono">{h(ai_provider_source)}</dd>
+    <dt>Estado general de la IA</dt><dd>{ai_estado}</dd>
+    <dt>Estado de credenciales</dt><dd>{_credential_status_dd}</dd>
+    <dt>Última prueba</dt><dd class="mono">{h(ai_last_test or '—')}</dd>
+  </dl>
+  <p class="eg-muted" style="font-size:12px;margin-top:8px;">
+    Azure y Codex pueden permanecer configurados simultáneamente en el entorno; este
+    selector solo decide cuál se usa. No existe fallback automático entre proveedores:
+    si el seleccionado falla, se usa el resumen local de respaldo.
+  </p>
+</section>
 """
 
     # IA core (conexión + uso) — ancho completo
@@ -2184,7 +2243,7 @@ async function toggleAI(enabled) {{
 </details>
 """
 
-    section_ai = section_ai_core
+    section_ai = section_ai_provider + section_ai_core
 
     # --- Email y plantillas (editable) ---
     def _field(key: str, label: str, placeholder: str, env_val: str, multiline: bool = False) -> str:
