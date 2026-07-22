@@ -22,6 +22,11 @@ from .config import PROJECT_ROOT, Settings
 
 CODEX_HOME_DIR = PROJECT_ROOT / ".codex_home"
 
+# Identificador de modelo registrado cuando el SDK de Codex no informa un
+# nombre de modelo real por turno (ver run_codex_prompt). Nunca debe
+# confundirse con AI_MODEL (que corresponde al deployment de Azure/OpenAI).
+MODEL_LABEL = "codex-chatgpt"
+
 
 def is_codex_sdk_available() -> bool:
     try:
@@ -133,16 +138,20 @@ def run_codex_prompt(
     system_prompt: str,
     user_prompt: str,
     settings: Settings,
-) -> tuple[str, int, int, int]:
+) -> tuple[str, str, int, int, int]:
     """
     Ejecuta un único turno de Codex para un documento y devuelve
-    (content, input_tokens, output_tokens, total_tokens).
+    (content, model, input_tokens, output_tokens, total_tokens).
 
     - Thread y cliente nuevos por llamada: sin historial compartido entre documentos.
     - Sandbox de solo lectura y aprobaciones denegadas: no escribe archivos,
       no ejecuta comandos, no usa herramientas ni MCP adicionales.
     - Cierra siempre el thread y el cliente, incluso si falla.
     - No requiere AI_API_KEY ni AI_BASE_URL: usa la sesión de ChatGPT del sistema.
+    - El SDK de Codex no expone el nombre de modelo real por turno a través de
+      la API pública que usamos, por lo que se reporta MODEL_LABEL
+      ("codex-chatgpt"). Nunca se usa AI_MODEL (ese valor es del deployment
+      Azure/OpenAI, no de Codex).
     - El SDK de Codex no expone conteo de tokens por turno; se reportan en 0.
     """
     if not is_codex_sdk_available():
@@ -169,4 +178,4 @@ def run_codex_prompt(
         except concurrent.futures.TimeoutError as exc:
             raise RuntimeError(f"Codex no respondió dentro de {timeout}s.") from exc
 
-    return content, 0, 0, 0
+    return content, MODEL_LABEL, 0, 0, 0

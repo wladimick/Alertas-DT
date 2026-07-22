@@ -2789,7 +2789,7 @@ class CodexProviderTestCase(unittest.TestCase):
                     return_value=(True, "Sesión de ChatGPT activa."),
                 ), mock.patch(
                     "dt_alerts.codex_client.run_codex_prompt",
-                    return_value=(self._fake_ai_json(), 0, 0, 0),
+                    return_value=(self._fake_ai_json(), "codex-chatgpt", 0, 0, 0),
                 ) as mocked:
                     _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
                 self.assertTrue(mocked.called)
@@ -2851,7 +2851,7 @@ class CodexProviderTestCase(unittest.TestCase):
                     return_value=(True, "Sesión de ChatGPT activa."),
                 ), mock.patch(
                     "dt_alerts.codex_client.run_codex_prompt",
-                    return_value=("esto no es json {{{{", 0, 0, 0),
+                    return_value=("esto no es json {{{{", "codex-chatgpt", 0, 0, 0),
                 ):
                     _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
                 ai_row = db.get_ai_summary(conn, doc_id)
@@ -2931,7 +2931,7 @@ class CodexProviderTestCase(unittest.TestCase):
                     return_value=(True, "Sesión de ChatGPT activa."),
                 ), mock.patch(
                     "dt_alerts.codex_client.run_codex_prompt",
-                    return_value=(self._fake_ai_json(), 0, 0, 0),
+                    return_value=(self._fake_ai_json(), "codex-chatgpt", 0, 0, 0),
                 ):
                     _generate_and_save(conn, doc_id, s, {"ai_runtime_enabled": "true"})
                 ai_row = db.get_ai_summary(conn, doc_id)
@@ -3313,7 +3313,7 @@ class AIProviderSelectorTestCase(unittest.TestCase):
                     return_value=(True, "Sesión de ChatGPT activa."),
                 ), mock.patch(
                     "dt_alerts.codex_client.run_codex_prompt",
-                    return_value=(self._fake_ai_json("Codex"), 0, 0, 0),
+                    return_value=(self._fake_ai_json("Codex"), "codex-chatgpt", 0, 0, 0),
                 ):
                     # ...pero el panel tiene seleccionado codex.
                     _generate_and_save(conn, doc_id, s, {"ai_active_provider": "codex"})
@@ -3375,7 +3375,7 @@ class AIProviderSelectorTestCase(unittest.TestCase):
                     return_value=(True, "Sesión de ChatGPT activa."),
                 ), mock.patch(
                     "dt_alerts.codex_client.run_codex_prompt",
-                    return_value=(self._fake_ai_json("Codex"), 0, 0, 0),
+                    return_value=(self._fake_ai_json("Codex"), "codex-chatgpt", 0, 0, 0),
                 ):
                     _generate_and_save(conn, doc_id_2, s, {"ai_active_provider": "codex"})
                 row_2 = db.get_ai_summary(conn, doc_id_2)
@@ -3469,6 +3469,94 @@ class AIProviderSelectorTestCase(unittest.TestCase):
                 usage_rows = db.get_recent_ai_usage(conn, limit=1)
         self.assertEqual(ai_row["provider"], "azure")
         self.assertEqual(usage_rows[0]["provider"], "azure")
+
+    # --- 15b. Azure registra el modelo real configurado (AI_MODEL) ---
+    def test_15b_azure_records_configured_model(self):
+        from dt_alerts.summarizer import AIResponse, _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = self._azure_settings(database_path=path, ai_model="gpt-chat-latest")
+            fake_response = AIResponse(
+                content=self._fake_ai_json("Azure"), total_tokens=5, model="gpt-chat-latest",
+            )
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch("dt_alerts.summarizer._call_azure_api", return_value=fake_response):
+                    _generate_and_save(conn, doc_id, s, {"ai_active_provider": "azure"})
+                ai_row = db.get_ai_summary(conn, doc_id)
+                usage_rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertEqual(ai_row["model"], "gpt-chat-latest")
+        self.assertEqual(usage_rows[0]["model"], "gpt-chat-latest")
+
+    # --- 15c. Codex NUNCA hereda AI_MODEL de Azure (aunque esté configurado en el entorno) ---
+    def test_15c_codex_does_not_inherit_azure_model(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            # AI_MODEL sigue configurado con el deployment de Azure en el entorno.
+            s = self._azure_settings(database_path=path, ai_model="gpt-chat-latest")
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch(
+                    "dt_alerts.codex_client.is_codex_sdk_available", return_value=True
+                ), mock.patch(
+                    "dt_alerts.codex_client.check_login_status",
+                    return_value=(True, "Sesión de ChatGPT activa."),
+                ), mock.patch(
+                    "dt_alerts.codex_client.run_codex_prompt",
+                    return_value=(self._fake_ai_json("Codex"), "codex-chatgpt", 0, 0, 0),
+                ):
+                    _generate_and_save(conn, doc_id, s, {"ai_active_provider": "codex"})
+                ai_row = db.get_ai_summary(conn, doc_id)
+                usage_rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertNotEqual(ai_row["model"], "gpt-chat-latest")
+        self.assertNotEqual(usage_rows[0]["model"], "gpt-chat-latest")
+
+    # --- 15d. Codex registra 'codex-chatgpt' cuando el SDK no informa un modelo real ---
+    def test_15d_codex_records_codex_chatgpt_label_by_default(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = self._azure_settings(database_path=path, ai_model="gpt-chat-latest")
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch(
+                    "dt_alerts.codex_client.is_codex_sdk_available", return_value=True
+                ), mock.patch(
+                    "dt_alerts.codex_client.check_login_status",
+                    return_value=(True, "Sesión de ChatGPT activa."),
+                ), mock.patch(
+                    "dt_alerts.codex_client.run_codex_prompt",
+                    return_value=(self._fake_ai_json("Codex"), "codex-chatgpt", 0, 0, 0),
+                ):
+                    _generate_and_save(conn, doc_id, s, {"ai_active_provider": "codex"})
+                ai_row = db.get_ai_summary(conn, doc_id)
+                usage_rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertEqual(ai_row["model"], "codex-chatgpt")
+        self.assertEqual(usage_rows[0]["model"], "codex-chatgpt")
+
+    # --- 15e. Codex registra el modelo real si el SDK lo informa (no el fallback fijo) ---
+    def test_15e_codex_records_real_sdk_reported_model_when_available(self):
+        from dt_alerts.summarizer import _generate_and_save
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            s = self._azure_settings(database_path=path, ai_model="gpt-chat-latest")
+            with db.connect(path) as conn:
+                doc_id = self._insert_doc(conn)
+                with mock.patch(
+                    "dt_alerts.codex_client.is_codex_sdk_available", return_value=True
+                ), mock.patch(
+                    "dt_alerts.codex_client.check_login_status",
+                    return_value=(True, "Sesión de ChatGPT activa."),
+                ), mock.patch(
+                    "dt_alerts.codex_client.run_codex_prompt",
+                    return_value=(self._fake_ai_json("Codex"), "gpt-5-codex", 0, 0, 0),
+                ):
+                    _generate_and_save(conn, doc_id, s, {"ai_active_provider": "codex"})
+                ai_row = db.get_ai_summary(conn, doc_id)
+                usage_rows = db.get_recent_ai_usage(conn, limit=1)
+        self.assertEqual(ai_row["model"], "gpt-5-codex")
+        self.assertEqual(usage_rows[0]["model"], "gpt-5-codex")
 
     # --- 17. Ninguna API key queda guardada en SQLite ---
     def test_17_no_api_keys_stored_in_sqlite(self):
@@ -3690,6 +3778,218 @@ class AIToggleFromPanelTestCase(unittest.TestCase):
         self.assertFalse(is_ai_runtime_enabled(settings_off_env, {}))
         # Sin valor en DB, ai_enabled=True → usa .env como fallback → True
         self.assertTrue(is_ai_runtime_enabled(settings_on, {}))
+
+
+class WordPressSyncPanelTestCase(unittest.TestCase):
+    """Tests para el contador 'Suscriptores sincronizados' del panel (fix/admin-metrics)."""
+
+    def _start_server(self, tmp_path: Path, **settings_overrides):
+        import threading
+        from http.server import ThreadingHTTPServer
+        from dt_alerts.server import AppHandler
+
+        class _H(AppHandler):
+            pass
+
+        db.init_db(tmp_path)
+        # database_path debe ser un Path real (no str): render_settings llama
+        # métodos de Path (ej. .exists()) sobre este valor.
+        base = get_settings().__class__(
+            **{**get_settings().__dict__,
+               "database_path": tmp_path,
+               "disable_admin_auth": True,
+               **settings_overrides}
+        )
+        _H.settings = base
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+        t = threading.Thread(target=server.serve_forever)
+        t.daemon = True
+        t.start()
+        return server, server.server_address[1]
+
+    def _post(self, port: int, path: str) -> int:
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("POST", path, body=b"")
+        resp = conn.getresponse()
+        resp.read()
+        return resp.status
+
+    def _get(self, port: int, path: str) -> str:
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        return resp.read().decode("utf-8", errors="replace")
+
+    # --- 4 recibidos, 1 creado, 3 actualizados: el contador debe mostrar 4, no 0 ---
+    def test_synced_counter_reflects_created_plus_updated(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            server, port = self._start_server(
+                path, wordpress_sync_enabled=True,
+                wordpress_api_url="http://fake", wordpress_api_token="tok",
+            )
+            try:
+                # 3 suscriptores YA existen, creados por un canal que no
+                # contiene "wordpress" ni "wp" en source_page — con la
+                # heurística anterior el contador quedaba en 0 tras el sync.
+                with db.connect(path) as conn:
+                    for i in range(3):
+                        db.upsert_subscriber(
+                            conn, email=f"existente{i}@example.com", whatsapp=None,
+                            notify_email=True, notify_whatsapp=False,
+                            source_page="formulario-sitio-externo", consent=True,
+                        )
+                # db.utcnow() trunca a segundos: cruzar el segundo evita que
+                # wordpress_sync clasifique una actualización como creación
+                # solo porque created_at/updated_at coinciden por resolución.
+                import time as _time
+                _time.sleep(1.1)
+
+                fake_page = {
+                    "ok": True, "total": 4, "limit": 100,
+                    "subscribers": [
+                        {"id": 1, "email": "existente0@example.com", "consent": True, "source_page": "form"},
+                        {"id": 2, "email": "existente1@example.com", "consent": True, "source_page": "form"},
+                        {"id": 3, "email": "existente2@example.com", "consent": True, "source_page": "form"},
+                        {"id": 4, "email": "nuevo@example.com", "consent": True, "source_page": "form"},
+                    ],
+                }
+                with mock.patch(
+                    "dt_alerts.wordpress_sync._fetch_subscribers", return_value=fake_page
+                ), mock.patch("dt_alerts.wordpress_sync._mark_synced"):
+                    status = self._post(port, "/admin/wordpress/sync")
+                self.assertIn(status, (200, 303, 302))
+
+                with db.connect(path) as conn:
+                    summary_raw = db.get_setting(conn, "wordpress_last_sync_summary")
+                self.assertIsNotNone(summary_raw)
+                summary = json.loads(summary_raw)
+                self.assertEqual(summary["received"], 4)
+                self.assertEqual(summary["created"], 1)
+                self.assertEqual(summary["updated"], 3)
+
+                html = self._get(port, "/admin/settings")
+                self.assertIn("Suscriptores sincronizados", html)
+                # El contador (creados + actualizados = 1 + 3 = 4) debe
+                # aparecer junto a la etiqueta, no un 0 residual.
+                idx = html.find("Suscriptores sincronizados")
+                snippet = html[idx: idx + 200]
+                self.assertIn(">4<", snippet)
+            finally:
+                server.shutdown()
+
+
+class AILastErrorDisplayTestCase(unittest.TestCase):
+    """Tests para que 'Último error registrado' no parezca un error vigente
+    tras una llamada exitosa posterior (fix/admin-metrics)."""
+
+    def _db_path(self, tmp: str) -> Path:
+        path = Path(tmp) / "t.sqlite3"
+        db.init_db(path)
+        return path
+
+    # --- has_ai_success_after() / get_ai_usage_status(): resuelto vs no resuelto ---
+    def test_01_last_error_marked_resolved_after_later_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                db.record_ai_usage(
+                    conn, operation="generate_summary", status="error",
+                    error="Azure requiere AI_BASE_URL configurado.",
+                    daily_limit=50000, monthly_limit=500000,
+                )
+                db.record_ai_usage(
+                    conn, operation="generate_summary", status="success",
+                    total_tokens=10, daily_limit=50000, monthly_limit=500000,
+                )
+                usage_status = db.get_ai_usage_status(conn, daily_limit=50000, monthly_limit=500000)
+        self.assertTrue(usage_status["last_error"])
+        self.assertTrue(usage_status["last_error_resolved"])
+
+    def test_02_last_error_not_resolved_without_later_success(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                db.record_ai_usage(
+                    conn, operation="generate_summary", status="error",
+                    error="Azure requiere AI_BASE_URL configurado.",
+                    daily_limit=50000, monthly_limit=500000,
+                )
+                usage_status = db.get_ai_usage_status(conn, daily_limit=50000, monthly_limit=500000)
+        self.assertTrue(usage_status["last_error"])
+        self.assertFalse(usage_status["last_error_resolved"])
+
+    def test_03_historical_error_row_is_never_deleted(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = self._db_path(tmp)
+            with db.connect(path) as conn:
+                db.record_ai_usage(
+                    conn, operation="generate_summary", status="error",
+                    error="Azure requiere AI_BASE_URL configurado.",
+                    daily_limit=50000, monthly_limit=500000,
+                )
+                db.record_ai_usage(
+                    conn, operation="generate_summary", status="success",
+                    total_tokens=10, daily_limit=50000, monthly_limit=500000,
+                )
+                rows = db.get_recent_ai_usage(conn, limit=10)
+        statuses = [r["status"] for r in rows]
+        self.assertIn("error", statuses)
+        self.assertIn("success", statuses)
+
+    # --- Panel: la etiqueta y el estado no deben parecer un error vigente ---
+    def _start_server(self, tmp_path: Path, **settings_overrides):
+        import threading
+        from http.server import ThreadingHTTPServer
+        from dt_alerts.server import AppHandler
+
+        class _H(AppHandler):
+            pass
+
+        db.init_db(tmp_path)
+        base = get_settings().__class__(
+            **{**get_settings().__dict__,
+               "database_path": tmp_path,
+               "disable_admin_auth": True,
+               **settings_overrides}
+        )
+        _H.settings = base
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+        t = threading.Thread(target=server.serve_forever)
+        t.daemon = True
+        t.start()
+        return server, server.server_address[1]
+
+    def _get(self, port: int, path: str) -> str:
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        return resp.read().decode("utf-8", errors="replace")
+
+    def test_04_panel_shows_resolved_status_and_timestamp(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            server, port = self._start_server(path, ai_provider="azure", ai_api_key="fake")
+            try:
+                with db.connect(path) as conn:
+                    db.record_ai_usage(
+                        conn, operation="generate_summary", status="error",
+                        error="Azure requiere AI_BASE_URL configurado.",
+                        daily_limit=50000, monthly_limit=500000,
+                    )
+                    db.record_ai_usage(
+                        conn, operation="generate_summary", status="success",
+                        total_tokens=10, daily_limit=50000, monthly_limit=500000,
+                    )
+                html = self._get(port, "/admin/settings")
+            finally:
+                server.shutdown()
+        self.assertIn("Último error registrado", html)
+        self.assertIn("Resuelto", html)
+        self.assertIn("Azure requiere AI_BASE_URL configurado.", html)
 
 
 class GenerateVsRegenerateBtnTestCase(unittest.TestCase):

@@ -375,6 +375,14 @@ class AppHandler(BaseHTTPRequestHandler):
                     f"{result['created']} creados, "
                     f"{result['updated']} actualizados."
                 )
+                with db.connect(self.settings.database_path) as conn:
+                    db.set_setting(conn, "wordpress_last_sync_summary", json.dumps({
+                        "received": result["received"],
+                        "created": result["created"],
+                        "updated": result["updated"],
+                        "skipped": result.get("skipped", 0),
+                        "at": db.utcnow(),
+                    }))
             elif result["status"] == "disabled":
                 msg = "Sincronización WordPress desactivada (WORDPRESS_SYNC_ENABLED=false)."
             elif result["status"] == "misconfigured":
@@ -1434,12 +1442,19 @@ def render_jobs(jobs: list[dict[str, Any]]) -> str:
 
 def render_db_info(settings: Settings, subscribers: list[dict[str, Any]]) -> str:
     """Card compacta de WordPress Sync para la vista de suscriptores."""
-    last_update = max((s.get("updated_at") or "" for s in subscribers), default="")
-    wp_synced_count = sum(
-        1 for s in subscribers
-        if "wordpress" in (s.get("source_page") or "").lower()
-        or "wp" in (s.get("source_page") or "").lower()
-    )
+    # Igual que en render_settings: usa el resultado real de la última
+    # sincronización (creados + actualizados), no una heurística por texto en
+    # source_page, que produce falsos negativos (ver fix/ai-provider-selector).
+    with db.connect(settings.database_path) as conn:
+        app_cfg = db.get_all_settings(conn)
+    wp_sync_summary_raw = app_cfg.get("wordpress_last_sync_summary")
+    wp_sync_summary = json.loads(wp_sync_summary_raw) if wp_sync_summary_raw else None
+    if wp_sync_summary:
+        wp_synced_count = int(wp_sync_summary.get("created") or 0) + int(wp_sync_summary.get("updated") or 0)
+        last_update = wp_sync_summary.get("at") or ""
+    else:
+        wp_synced_count = 0
+        last_update = ""
 
     if settings.wordpress_sync_enabled:
         return f"""
@@ -1449,7 +1464,7 @@ def render_db_info(settings: Settings, subscribers: list[dict[str, Any]]) -> str
   </div>
   <dl class="eg-kv eg-kv--2col">
     <dt>Última sincronización</dt><dd class="mono">{fmt_dt(last_update) if last_update else '—'}</dd>
-    <dt>Suscriptores sincronizados</dt><dd class="mono">{wp_synced_count}</dd>
+    <dt>Suscriptores sincronizados (creados + actualizados)</dt><dd class="mono">{wp_synced_count}</dd>
   </dl>
   <form method="post" action="/admin/wordpress/sync" style="margin-top:12px;text-align:center;">
     <button class="eg-btn eg-btn--secondary eg-btn--sm" type="submit">
@@ -1501,7 +1516,8 @@ def _test_ai_connection(settings: Settings, app_settings: dict, conn=None) -> st
 
     effective_settings = get_effective_settings(settings, app_settings)
     provider = effective_settings.ai_provider
-    model = effective_settings.ai_model or ""
+    # AI_MODEL es el deployment de Azure/OpenAI; Codex nunca lo hereda.
+    model = codex_client.MODEL_LABEL if provider == "codex" else (effective_settings.ai_model or "")
     daily_limit = int(getattr(settings, "ai_daily_token_limit", 50000) or 0)
     monthly_limit = int(getattr(settings, "ai_monthly_token_limit", 500000) or 0)
 
@@ -1568,6 +1584,8 @@ def _test_ai_connection(settings: Settings, app_settings: dict, conn=None) -> st
             effective_settings,
         )
         if ai_response.content:
+            if ai_response.model:
+                model = ai_response.model
             _record(
                 "success",
                 input_tokens=ai_response.input_tokens,
@@ -1667,18 +1685,21 @@ def render_settings(settings: Settings) -> str:
         app_cfg = db.get_all_settings(conn)
         wp_subscribers = db.count_table(conn, "subscribers")
 
-    wp_from_wp = sum(
-        1 for _ in [None]  # computed below via raw query
-    )
-    with db.connect(db_path) as conn:
-        wp_row = conn.execute(
-            "SELECT COUNT(*) AS n FROM subscribers WHERE source_page LIKE '%wordpress%' OR source_page LIKE '%wp%'"
-        ).fetchone()
-        wp_synced_count = int(wp_row["n"]) if wp_row else 0
-        last_wp_sync = conn.execute(
-            "SELECT updated_at FROM subscribers WHERE source_page LIKE '%wordpress%' OR source_page LIKE '%wp%' ORDER BY updated_at DESC LIMIT 1"
-        ).fetchone()
-        last_wp_sync_at = last_wp_sync["updated_at"] if last_wp_sync else None
+    # "Suscriptores sincronizados" refleja el resultado real de la ULTIMA
+    # sincronización (creados + actualizados), no una búsqueda heurística por
+    # texto en source_page — esa heurística fallaba en falsos negativos cuando
+    # WordPress informa su propio source_page (ej. el nombre del formulario)
+    # en vez de la palabra "wordpress" o "wp".
+    wp_sync_summary_raw = app_cfg.get("wordpress_last_sync_summary")
+    wp_sync_summary = json.loads(wp_sync_summary_raw) if wp_sync_summary_raw else None
+    if wp_sync_summary:
+        wp_received_count = int(wp_sync_summary.get("received") or 0)
+        wp_synced_count = int(wp_sync_summary.get("created") or 0) + int(wp_sync_summary.get("updated") or 0)
+        last_wp_sync_at = wp_sync_summary.get("at")
+    else:
+        wp_received_count = 0
+        wp_synced_count = 0
+        last_wp_sync_at = None
 
     # --- Estado general ---
     auth_label, auth_key = auth_mode(settings)
@@ -1821,7 +1842,8 @@ def render_settings(settings: Settings) -> str:
     <dt>Intervalo sync</dt><dd class="mono">{h(settings.wordpress_sync_interval_minutes)} min</dd>
     <dt>Limite por sync</dt><dd class="mono">{h(settings.wordpress_sync_limit)}</dd>
     <dt>Ultima sincronizacion</dt><dd class="mono">{h(fmt_dt(last_wp_sync_at) if last_wp_sync_at else '—')}</dd>
-    <dt>Suscriptores sincronizados</dt><dd class="mono">{h(wp_synced_count)}</dd>
+    <dt>Recibidos (última sincronización)</dt><dd class="mono">{h(wp_received_count)}</dd>
+    <dt>Suscriptores sincronizados (creados + actualizados)</dt><dd class="mono">{h(wp_synced_count)}</dd>
   </dl>
   <div class="eg-actions" style="margin-top:14px">{wp_test_btn}{wp_sync_btn}</div>
 </section>
@@ -1860,6 +1882,17 @@ def render_settings(settings: Settings) -> str:
     ai_limit_reached = ai_usage.get("daily_exceeded") or ai_usage.get("monthly_exceeded")
     ai_last_usage = ai_usage.get("last_usage") or {}
     ai_last_error = ai_usage.get("last_error") or {}
+    ai_last_error_resolved = ai_usage.get("last_error_resolved", False)
+
+    # "Último error registrado" es histórico: nunca se borra de ai_usage_logs,
+    # pero si hubo una llamada exitosa después no debe parecer un problema vigente.
+    if not ai_last_error:
+        ai_last_error_status = pill("paused", "Sin errores registrados")
+    elif ai_last_error_resolved:
+        ai_last_error_status = pill("active", "Resuelto (hubo una llamada exitosa después)")
+    else:
+        ai_last_error_status = pill("error", "Sin llamada exitosa posterior registrada")
+    ai_last_error_dt = fmt_dt(ai_last_error.get("created_at")) if ai_last_error.get("created_at") else "—"
 
     # Codex no usa AI_API_KEY: su "credencial" es la sesión de ChatGPT de esta máquina.
     codex_sdk_available = False
@@ -2196,7 +2229,8 @@ async function toggleAI(enabled) {{
     <dt>Uso mes</dt><dd class="mono">{h(ai_usage_month)} / {h(ai_monthly_limit)} tokens · {h(ai_usage.get('monthly_percent', 0))}%</dd>
     <dt>Advertencia límite</dt><dd class="mono">{h(settings.ai_warning_percent)}%</dd>
     <dt>Última llamada IA</dt><dd class="mono">{h((ai_last_usage or {}).get('created_at') or '—')} · {h((ai_last_usage or {}).get('status') or '—')} · {h((ai_last_usage or {}).get('total_tokens') or 0)} tokens</dd>
-    <dt>Último error IA</dt><dd class="mono">{h((ai_last_error or {}).get('error') or '—')}</dd>
+    <dt>Último error registrado</dt><dd class="mono">{h(ai_last_error_dt)} — {h((ai_last_error or {}).get('error') or '—')}</dd>
+    <dt>Estado del último error</dt><dd>{ai_last_error_status}</dd>
     <dt>Ultima prueba IA</dt><dd class="mono">{h(ai_last_test or '—')}</dd>
   </dl>
   <h3 style="margin:16px 0 8px;font-size:13px;color:var(--eg-subtle);">Costo estimado referencial</h3>

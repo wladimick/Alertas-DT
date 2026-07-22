@@ -29,6 +29,7 @@ class AIResponse:
     input_tokens: int = 0
     output_tokens: int = 0
     total_tokens: int = 0
+    model: str = ""
 
 
 # --------------------------------------------------------------------------
@@ -295,6 +296,7 @@ def _call_openai_api(system_prompt: str, user_prompt: str, settings: Settings) -
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
+        model=body.get("model") or settings.ai_model or "gpt-4o-mini",
     )
 
 
@@ -350,6 +352,7 @@ def _call_azure_api(system_prompt: str, user_prompt: str, settings: Settings) ->
             input_tokens=input_tokens,
             output_tokens=output_tokens,
             total_tokens=total_tokens,
+            model=body.get("model") or deployment,
         )
 
     # Fallback Azure OpenAI clásico /chat/completions
@@ -387,6 +390,7 @@ def _call_azure_api(system_prompt: str, user_prompt: str, settings: Settings) ->
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
+        model=body.get("model") or deployment,
     )
 
 
@@ -396,7 +400,7 @@ def _call_codex_api(system_prompt: str, user_prompt: str, settings: Settings) ->
     (dt_alerts.codex_client), sin AI_API_KEY ni AI_BASE_URL. El SDK de Codex
     no expone conteo de tokens por turno, por lo que se reportan en 0.
     """
-    content, input_tokens, output_tokens, total_tokens = codex_client.run_codex_prompt(
+    content, model, input_tokens, output_tokens, total_tokens = codex_client.run_codex_prompt(
         system_prompt, user_prompt, settings
     )
     return AIResponse(
@@ -404,6 +408,7 @@ def _call_codex_api(system_prompt: str, user_prompt: str, settings: Settings) ->
         input_tokens=input_tokens,
         output_tokens=output_tokens,
         total_tokens=total_tokens,
+        model=model or codex_client.MODEL_LABEL,
     )
 
 
@@ -714,7 +719,10 @@ def _generate_and_save(
 
     effective_settings = get_effective_settings(settings, app_settings)
     provider = effective_settings.ai_provider
-    model = effective_settings.ai_model or ""
+    # AI_MODEL es el deployment de Azure/OpenAI; Codex nunca lo hereda, incluso
+    # en rutas de fallback donde no llegó a llamarse a la API (ver AIResponse.model
+    # para el valor real reportado por una llamada exitosa).
+    model = codex_client.MODEL_LABEL if provider == "codex" else (effective_settings.ai_model or "")
     operation = "regenerate_summary" if force else "generate_summary"
 
     alert_id: int | None = None
@@ -824,6 +832,10 @@ def _generate_and_save(
                 validated = validate_ai_summary(parsed)
                 status = "success"
                 content_quality = "full"
+                # Preferir el modelo real informado por la llamada (ej. el
+                # que devuelve la API), si vino informado.
+                if ai_response.model:
+                    model = ai_response.model
                 _record(
                     "success",
                     input_tokens=ai_response.input_tokens,
