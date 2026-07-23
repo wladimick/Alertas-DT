@@ -3992,6 +3992,232 @@ class AILastErrorDisplayTestCase(unittest.TestCase):
         self.assertIn("Azure requiere AI_BASE_URL configurado.", html)
 
 
+class DashboardV2TestCase(unittest.TestCase):
+    """Tests para el dashboard operativo /admin (feat/alerts-ui-v2)."""
+
+    def _start_server(self, tmp_path: Path, **settings_overrides):
+        import threading
+        from http.server import ThreadingHTTPServer
+        from dt_alerts.server import AppHandler
+
+        class _H(AppHandler):
+            pass
+
+        db.init_db(tmp_path)
+        base = get_settings().__class__(
+            **{**get_settings().__dict__,
+               "database_path": tmp_path,
+               "disable_admin_auth": True,
+               **settings_overrides}
+        )
+        _H.settings = base
+        server = ThreadingHTTPServer(("127.0.0.1", 0), _H)
+        t = threading.Thread(target=server.serve_forever)
+        t.daemon = True
+        t.start()
+        return server, server.server_address[1]
+
+    def _get(self, port: int, path: str) -> tuple[int, str]:
+        import http.client
+        conn = http.client.HTTPConnection("127.0.0.1", port, timeout=10)
+        conn.request("GET", path)
+        resp = conn.getresponse()
+        return resp.status, resp.read().decode("utf-8", errors="replace")
+
+    def _insert_alert(self, conn, suffix: str, status: str) -> int:
+        doc = {
+            "dt_article_id": f"dash-{suffix}",
+            "canonical_url": f"https://www.dt.gob.cl/legislacion/1624/w3-article-dash{suffix}.html",
+            "source_url": "https://www.dt.gob.cl/x.html",
+            "category": "Circulares",
+            "title": f"Documento de prueba dashboard {suffix}",
+            "publication_date": "01/01/2026",
+            "abstract": "Abstract.",
+            "detail_text": "Texto.",
+            "pdf_url": None,
+            "content_hash": None,
+        }
+        doc_id, _ = db.upsert_document(conn, doc)
+        db.update_document_processed(
+            conn, doc_id, status="processed", detail_text="Texto.",
+            pdf_url=None, content_hash=None, last_error=None,
+        )
+        db.create_or_update_alert(
+            conn, doc_id, summary="Resumen.", key_points=[], practical_impacts=[],
+            relevance="medio", status=status, ai_error=None,
+        )
+        return doc_id
+
+    # --- 1. El dashboard responde correctamente e incluye los bloques nuevos ---
+    def test_01_dashboard_responds_ok(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            server, port = self._start_server(path)
+            try:
+                status, body = self._get(port, "/admin")
+            finally:
+                server.shutdown()
+        self.assertEqual(status, 200)
+        self.assertIn("Alertas que requieren atención", body)
+        self.assertIn("Salud del sistema", body)
+
+    # --- 2. Muestra el contador real de alertas pendientes ---
+    def test_02_dashboard_shows_alert_counts(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            server, port = self._start_server(path)
+            try:
+                with db.connect(path) as conn:
+                    self._insert_alert(conn, "1", "pending_review")
+                    self._insert_alert(conn, "2", "pending_review")
+                status, body = self._get(port, "/admin")
+            finally:
+                server.shutdown()
+        idx = body.find("Pendientes de revisión")
+        self.assertGreater(idx, 0)
+        snippet = body[max(0, idx - 200):idx]
+        self.assertIn(">2<", snippet)
+
+    # --- 3. Máximo 5 alertas en el bloque de atención ---
+    def test_03_attention_block_shows_at_most_5(self):
+        from dt_alerts.server import _dashboard_attention_alerts, render_dashboard_attention
+        alerts = [
+            {"id": i, "status": "pending_review", "title": f"Doc {i}", "category": "Circulares",
+             "canonical_url": "https://www.dt.gob.cl/x.html", "created_at": "2026-01-01T00:00:00+00:00"}
+            for i in range(1, 8)
+        ]
+        attention = _dashboard_attention_alerts(alerts)
+        self.assertEqual(len(attention), 7)  # todas calificaban, sin recortar aun
+        html = render_dashboard_attention(attention)
+        # Cuenta solo filas de datos (el <thead><tr> no lleva el link "Ver").
+        self.assertEqual(html.count("preview-email"), 5)
+
+    # --- 4. Nunca muestra alertas enviadas (status='sent') en el bloque de atención ---
+    def test_04_sent_alerts_excluded_from_attention(self):
+        from dt_alerts.server import _dashboard_attention_alerts
+        alerts = [
+            {"id": 1, "status": "sent", "title": "Enviada", "category": "Circulares",
+             "canonical_url": "https://www.dt.gob.cl/x.html", "created_at": "2026-01-01T00:00:00+00:00"},
+            {"id": 2, "status": "pending_review", "title": "Pendiente", "category": "Circulares",
+             "canonical_url": "https://www.dt.gob.cl/x.html", "created_at": "2026-01-01T00:00:00+00:00"},
+        ]
+        attention = _dashboard_attention_alerts(alerts)
+        statuses = [a["status"] for a in attention]
+        self.assertNotIn("sent", statuses)
+        self.assertIn("pending_review", statuses)
+
+    # --- 5. Ordena error y fallback antes de pendientes/listas para enviar ---
+    def test_05_attention_orders_error_and_fallback_first(self):
+        from dt_alerts.server import _dashboard_attention_alerts
+        alerts = [
+            {"id": 1, "status": "ready", "title": "Lista", "category": "Circulares",
+             "canonical_url": "https://www.dt.gob.cl/x.html", "created_at": "2026-01-01T00:00:00+00:00"},
+            {"id": 2, "status": "pending_review", "title": "Pendiente", "category": "Circulares",
+             "canonical_url": "https://www.dt.gob.cl/x.html", "created_at": "2026-01-01T00:00:00+00:00"},
+            {"id": 3, "status": "error", "title": "Con error", "category": "Circulares",
+             "canonical_url": "https://www.dt.gob.cl/x.html", "created_at": "2026-01-01T00:00:00+00:00"},
+            {"id": 4, "status": "fallback", "title": "Fallback", "category": "Circulares",
+             "canonical_url": "https://www.dt.gob.cl/x.html", "created_at": "2026-01-01T00:00:00+00:00"},
+        ]
+        attention = _dashboard_attention_alerts(alerts)
+        self.assertEqual([a["status"] for a in attention], ["error", "fallback", "pending_review", "ready"])
+
+    # --- 6. Estado saludable ("Todo operativo") cuando todo esta correcto ---
+    def test_06_healthy_conclusion_when_all_active(self):
+        from dt_alerts.server import _dashboard_conclusion
+        rows = [
+            {"name": "SendGrid", "state": "active", "detail": "ok"},
+            {"name": "WordPress Sync", "state": "disabled", "detail": "ok"},
+            {"name": "Acceso administrativo", "state": "active", "detail": "ok"},
+        ]
+        settings = settings_for(Path(":memory:"), ai_provider="azure", ai_enabled=True,
+                                ai_api_key="k", ai_model="m", ai_base_url="https://x")
+        text, state = _dashboard_conclusion(rows, settings, {})
+        self.assertEqual(text, "Todo operativo")
+        self.assertEqual(state, "active")
+
+    # --- 7. Un error historico de IA con exito posterior aparece como 'Resuelto' ---
+    def test_07_historical_ai_error_shown_as_resolved(self):
+        from dt_alerts.server import _ai_provider_health
+        settings = settings_for(Path(":memory:"), ai_provider="azure", ai_enabled=True,
+                                ai_api_key="k", ai_model="m", ai_base_url="https://x")
+        ai_usage_status = {
+            "last_error": {"created_at": "2026-01-01T00:00:00+00:00", "error": "Azure requiere AI_BASE_URL configurado."},
+            "last_error_resolved": True,
+            "last_usage": {"created_at": "2026-01-02T00:00:00+00:00"},
+        }
+        entry = _ai_provider_health(settings, {}, ai_usage_status)
+        self.assertEqual(entry["state"], "active")
+        self.assertIn("Resuelto", entry["detail"])
+
+    # --- 7b. Un error de IA sin exito posterior sigue como error activo ---
+    def test_07b_ai_error_without_later_success_stays_active_error(self):
+        from dt_alerts.server import _ai_provider_health
+        settings = settings_for(Path(":memory:"), ai_provider="azure", ai_enabled=True,
+                                ai_api_key="k", ai_model="m", ai_base_url="https://x")
+        ai_usage_status = {
+            "last_error": {"created_at": "2026-01-01T00:00:00+00:00", "error": "Azure requiere AI_BASE_URL configurado."},
+            "last_error_resolved": False,
+            "last_usage": None,
+        }
+        entry = _ai_provider_health(settings, {}, ai_usage_status)
+        self.assertEqual(entry["state"], "error")
+
+    # --- 8. Las excepciones tecnicas completas no aparecen directamente en el dashboard ---
+    def test_08_full_exception_never_shown_raw(self):
+        from dt_alerts.server import _sanitize_error_text
+        long_error = (
+            "SSLCertVerificationError: [SSL: CERTIFICATE_VERIFY_FAILED] certificate verify failed: "
+            "self-signed certificate in certificate chain (_ssl.c:1000) traceback extendido con muchas "
+            "lineas adicionales de detalle tecnico que no deberian mostrarse completas en el dashboard"
+        )
+        self.assertGreater(len(long_error), 140)
+        sanitized = _sanitize_error_text(long_error)
+        self.assertLessEqual(len(sanitized), 140)
+        self.assertTrue(sanitized.endswith("…"))
+
+    def test_08b_dashboard_does_not_render_full_job_error(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            server, port = self._start_server(path)
+            long_error = "DT - Circulares: " + ("error tecnico extendido de red SSL " * 10)
+            try:
+                with db.connect(path) as conn:
+                    job_id = db.start_job(conn, "check-normative")
+                    db.finish_job(conn, job_id, status="failed", error=long_error)
+                status, body = self._get(port, "/admin")
+            finally:
+                server.shutdown()
+        self.assertNotIn(long_error, body)
+
+    # --- 9. El enlace a Monitoreo esta presente ---
+    def test_09_monitor_link_present(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            server, port = self._start_server(path)
+            try:
+                status, body = self._get(port, "/admin")
+            finally:
+                server.shutdown()
+        self.assertIn("Ver historial de monitoreo", body)
+        self.assertIn('href="/admin/jobs"', body)
+
+    # --- 10. Los enlaces de los KPI usan filtros/rutas reales ---
+    def test_10_kpi_links_use_valid_filters(self):
+        with tempfile.TemporaryDirectory() as tmp:
+            path = Path(tmp) / "t.sqlite3"
+            server, port = self._start_server(path)
+            try:
+                status, body = self._get(port, "/admin")
+            finally:
+                server.shutdown()
+        self.assertIn('href="/admin/subscribers"', body)
+        self.assertIn('href="/admin/documents"', body)
+        self.assertIn('href="/admin/alerts?status=pending_review"', body)
+        self.assertIn('href="/admin/alerts?status=ready"', body)
+        self.assertIn('href="/admin/alerts?status=sent"', body)
+
+
 class GenerateVsRegenerateBtnTestCase(unittest.TestCase):
     """Tests para feat/generate-vs-regenerate-btn."""
 

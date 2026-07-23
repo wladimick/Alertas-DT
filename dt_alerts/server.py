@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from . import codex_client, db, tls
-from .config import Settings, get_settings
+from .config import DT_SOURCES, SII_SOURCES, Settings, get_settings
 from .notifier import (
     dispatch_alert,
     render_alert_email_html,
@@ -1223,16 +1223,17 @@ def render_topbar(title: str, subtitle: str, settings: Settings, *, show_action:
 """
 
 
-def metric_card(ic: str, value: Any, label: str, sub: str, tone: str = "muted") -> str:
+def metric_card(ic: str, value: Any, label: str, sub: str, tone: str = "muted", href: str = "") -> str:
     ico_cls = _TONE_ICO.get(tone, "eg-ico-slate")
-    return (
-        f'<div class="eg-metric">'
+    inner = (
         f'<div class="eg-metric-ico {ico_cls}">{icon(ic, 19)}</div>'
         f'<div class="eg-metric-num">{h(value)}</div>'
         f'<div class="eg-metric-label">{h(label)}</div>'
         f'<div class="eg-metric-sub">{h(sub)}</div>'
-        f'</div>'
     )
+    if href:
+        return f'<a class="eg-metric eg-metric--link" href="{h(href)}">{inner}</a>'
+    return f'<div class="eg-metric">{inner}</div>'
 
 
 def render_system_status(settings: Settings, last_job: dict[str, Any] | None) -> str:
@@ -1258,6 +1259,326 @@ def render_system_status(settings: Settings, last_job: dict[str, Any] | None) ->
     <dt>Último monitoreo</dt><dd class="mono">{h(last_job_html)}</dd>
     {last_error}
   </dl>
+</section>
+"""
+
+
+# --------------------------------------------------------------------------
+# Dashboard operativo v2 (feat/alerts-ui-v2): alertas que requieren atención,
+# salud del sistema compacta y resumen de monitoreo. Reutiliza badges, pills,
+# colores y botones ya usados en /admin/alerts para mantener un solo lenguaje
+# visual (ver docs/ui-alertas-admin-v2.md).
+# --------------------------------------------------------------------------
+
+_ATTENTION_STATUSES = {"error", "fallback", "pending_review", "ready_to_send", "ready"}
+_ATTENTION_PRIORITY = {"error": 0, "fallback": 1, "pending_review": 2, "ready_to_send": 3, "ready": 3}
+
+
+def _dashboard_attention_alerts(alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Alertas que requieren acción administrativa, en orden de prioridad:
+    error > fallback > pendiente de revisión > lista para enviar.
+    Nunca incluye alertas ya enviadas (status='sent').
+    """
+    candidates = [a for a in alerts if a.get("status") in _ATTENTION_STATUSES]
+    candidates.sort(key=lambda a: _ATTENTION_PRIORITY.get(a.get("status"), 9))
+    return candidates
+
+
+def _dashboard_attention_row(item: dict[str, Any]) -> str:
+    title_raw = item.get("title") or ""
+    title_trunc = (title_raw[:50] + "…") if len(title_raw) > 50 else title_raw
+    return (
+        f'<tr>'
+        f'<td style="padding:10px 8px;font-size:13px;" title="{h(title_raw)}">{h(title_trunc)}</td>'
+        f'<td style="padding:10px 8px;">{source_badge(item)}</td>'
+        f'<td class="eg-cell-cat" style="padding:10px 8px;">{h(item.get("category") or "—")}</td>'
+        f'<td style="padding:10px 8px;">{_alert_status_badge(item.get("status") or "")}</td>'
+        f'<td style="padding:10px 8px;font-size:12px;color:var(--eg-subtle);white-space:nowrap;">'
+        f'{_fmt_short_date(item.get("created_at"))}</td>'
+        f'<td style="padding:10px 8px;">'
+        f'<a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/alerts/{item["id"]}/preview-email">Ver</a>'
+        f'</td>'
+        f'</tr>'
+    )
+
+
+def render_dashboard_attention(attention_alerts: list[dict[str, Any]]) -> str:
+    """Tarjeta 'Alertas que requieren atención': máximo 5, con enlace a la vista completa."""
+    if not attention_alerts:
+        return (
+            '<section class="eg-card eg-panel">'
+            '<div class="eg-card-head"><h2>Alertas que requieren atención</h2></div>'
+            '<div class="eg-empty"><strong>No hay alertas que requieren atención.</strong></div>'
+            '</section>'
+        )
+    statuses_present = {a.get("status") for a in attention_alerts}
+    ver_todas_href = (
+        f"/admin/alerts?status={next(iter(statuses_present))}"
+        if len(statuses_present) == 1 else "/admin/alerts"
+    )
+    rows = "".join(_dashboard_attention_row(item) for item in attention_alerts[:5])
+    return f"""
+<section class="eg-card eg-panel">
+  <div class="eg-card-head eg-card-head--wrap">
+    <h2>Alertas que requieren atención</h2>
+    <a class="eg-btn eg-btn--secondary eg-btn--sm" href="{ver_todas_href}">Ver todas las alertas</a>
+  </div>
+  <div class="eg-table-wrap">
+    <table class="eg-table">
+      <thead><tr>
+        <th>Documento</th><th style="width:70px;">Fuente</th><th style="width:140px;">Categoría</th>
+        <th style="width:150px;">Estado</th><th style="width:70px;">Fecha</th><th style="width:70px;"></th>
+      </tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+  </div>
+</section>
+"""
+
+
+_HEALTH_STATE_LABELS = {
+    "active": "Operativo",
+    "warning": "Advertencia",
+    "error": "Error activo",
+    "disabled": "Desactivado",
+    "nodata": "Sin datos",
+}
+
+
+def _sanitize_error_text(text: str, limit: int = 140) -> str:
+    """Resumen sanitizado y acotado (~140 caracteres) de un error técnico."""
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 1].rstrip() + "…"
+
+
+def _health_entry(
+    name: str, state: str, detail: str, *, error_at: str = "", monitor_link: str = "",
+) -> dict[str, Any]:
+    return {"name": name, "state": state, "detail": detail, "error_at": error_at, "monitor_link": monitor_link}
+
+
+def _sendgrid_health(conn: Any, settings: Settings) -> dict[str, Any]:
+    _label, key = email_mode(settings)
+    if key == "simulated":
+        return _health_entry("SendGrid", "disabled", "Modo simulado (EMAIL_PROVIDER=console).")
+    if key == "pending_review":
+        return _health_entry(
+            "SendGrid", "error", "Sin credenciales: falta SENDGRID_API_KEY.",
+            monitor_link="/admin/settings",
+        )
+    row = conn.execute(
+        "SELECT status, error, created_at FROM deliveries WHERE channel='email' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return _health_entry("SendGrid", "nodata", "Configurado; sin envíos registrados aún.")
+    if row["status"] in ("sent", "simulated"):
+        return _health_entry("SendGrid", "active", f"Último envío exitoso ({fmt_dt(row['created_at'])}).")
+    return _health_entry(
+        "SendGrid", "error", _sanitize_error_text(row["error"] or "Envío fallido."),
+        error_at=fmt_dt(row["created_at"]), monitor_link="/admin/alerts",
+    )
+
+
+def _wordpress_health(settings: Settings, app_cfg: dict[str, str]) -> dict[str, Any]:
+    if not settings.wordpress_sync_enabled:
+        return _health_entry("WordPress Sync", "disabled", "Desactivado (WORDPRESS_SYNC_ENABLED=false).")
+    if not settings.wordpress_api_url or not settings.wordpress_api_token:
+        return _health_entry(
+            "WordPress Sync", "error", "Falta WORDPRESS_API_URL o WORDPRESS_API_TOKEN.",
+            monitor_link="/admin/settings",
+        )
+    raw = app_cfg.get("wordpress_last_sync_summary")
+    if not raw:
+        return _health_entry("WordPress Sync", "nodata", "Configurado; sin sincronizaciones registradas aún.")
+    summary = json.loads(raw)
+    return _health_entry(
+        "WordPress Sync", "active",
+        f"Última sincronización {fmt_dt(summary.get('at'))}: "
+        f"{int(summary.get('created') or 0)} creados, {int(summary.get('updated') or 0)} actualizados.",
+    )
+
+
+def _ai_provider_health(settings: Settings, app_cfg: dict[str, str], ai_usage_status: dict[str, Any]) -> dict[str, Any]:
+    from .summarizer import get_effective_ai_provider, get_effective_settings, is_ai_runtime_enabled, validate_provider_credentials
+
+    name = "Proveedor IA"
+    provider = get_effective_ai_provider(settings, app_cfg)
+    if not is_ai_runtime_enabled(settings, app_cfg) or provider == "disabled" or not provider:
+        return _health_entry(name, "disabled", "IA desactivada.")
+
+    effective_settings = get_effective_settings(settings, app_cfg)
+    problems = validate_provider_credentials(provider, effective_settings)
+    if problems:
+        return _health_entry(
+            name, "error", _sanitize_error_text(" ".join(problems)),
+            monitor_link="/admin/settings",
+        )
+
+    last_error = ai_usage_status.get("last_error")
+    if last_error:
+        if ai_usage_status.get("last_error_resolved"):
+            return _health_entry(
+                name, "active",
+                f"Resuelto: hubo un intento exitoso después del error ({fmt_dt(last_error.get('created_at'))}).",
+            )
+        return _health_entry(
+            name, "error", _sanitize_error_text(last_error.get("error") or "Error de IA."),
+            error_at=fmt_dt(last_error.get("created_at")), monitor_link="/admin/settings",
+        )
+
+    last_usage = ai_usage_status.get("last_usage")
+    if last_usage:
+        return _health_entry(
+            name, "active", f"Proveedor {provider}: último uso exitoso ({fmt_dt(last_usage.get('created_at'))}).",
+        )
+    return _health_entry(name, "nodata", f"Proveedor {provider} configurado; sin uso registrado aún.")
+
+
+def _job_matches_source(job_type: str, kind: str) -> bool:
+    return job_type == "check-normative" or job_type == f"check-normative:{kind}"
+
+
+def _monitor_health_for_source(jobs: list[dict[str, Any]], kind: str) -> dict[str, Any]:
+    name = f"Monitoreo {kind.upper()}"
+    relevant = [j for j in jobs if _job_matches_source(j.get("job_type") or "", kind)]
+    if not relevant:
+        return _health_entry(name, "nodata", "Aún no se ha ejecutado el monitoreo.")
+    last = relevant[0]  # `jobs` ya viene ordenado started_at DESC
+    status = last.get("status") or ""
+    when = fmt_dt(last.get("started_at"))
+    if status == "running":
+        return _health_entry(name, "warning", f"Ejecución en curso desde {when}.")
+    if status == "success":
+        return _health_entry(name, "active", f"Último resultado exitoso ({when}).")
+    if status == "partial":
+        prefix = "DT" if kind == "dt" else "SII"
+        if prefix in (last.get("error") or ""):
+            return _health_entry(
+                name, "warning", _sanitize_error_text(last.get("error") or "Resultado parcial."),
+                error_at=when, monitor_link="/admin/jobs",
+            )
+        return _health_entry(name, "active", f"Último resultado exitoso ({when}).")
+    # status == "failed"
+    return _health_entry(
+        name, "error", _sanitize_error_text(last.get("error") or "Fallo no especificado."),
+        error_at=when, monitor_link="/admin/jobs",
+    )
+
+
+def _admin_auth_health(settings: Settings) -> dict[str, Any]:
+    _label, key = auth_mode(settings)
+    if key == "active":
+        return _health_entry("Acceso administrativo", "active", "Login por token activo.")
+    return _health_entry(
+        "Acceso administrativo", "warning",
+        "Modo desarrollo: autenticación desactivada (DISABLE_ADMIN_AUTH=true).",
+    )
+
+
+def _dashboard_health_rows(
+    conn: Any, settings: Settings, app_cfg: dict[str, str], jobs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    ai_usage_status = db.get_ai_usage_status(
+        conn, daily_limit=settings.ai_daily_token_limit, monthly_limit=settings.ai_monthly_token_limit,
+    )
+    return [
+        _sendgrid_health(conn, settings),
+        _wordpress_health(settings, app_cfg),
+        _ai_provider_health(settings, app_cfg, ai_usage_status),
+        _monitor_health_for_source(jobs, "dt"),
+        _monitor_health_for_source(jobs, "sii"),
+        _admin_auth_health(settings),
+    ]
+
+
+def _dashboard_conclusion(rows: list[dict[str, Any]], settings: Settings, app_cfg: dict[str, str]) -> tuple[str, str]:
+    """Devuelve (texto_conclusion, estado_para_color)."""
+    from .summarizer import get_effective_ai_provider
+
+    error_count = sum(1 for r in rows if r["state"] == "error")
+    warning_count = sum(1 for r in rows if r["state"] == "warning")
+    if error_count:
+        label = "integración requiere" if error_count == 1 else "integraciones requieren"
+        return f"{error_count} {label} atención", "error"
+    if warning_count:
+        return "Monitoreo parcial", "warning"
+    provider = get_effective_ai_provider(settings, app_cfg)
+    if provider == "disabled":
+        return "Sistema en modo seguro", "disabled"
+    return "Todo operativo", "active"
+
+
+def render_dashboard_health(rows: list[dict[str, Any]], conclusion: str, conclusion_state: str) -> str:
+    """Tarjeta compacta 'Salud del sistema': reemplaza el bloque técnico extenso anterior."""
+    items_html = []
+    for entry in rows:
+        state = entry["state"]
+        state_label = _HEALTH_STATE_LABELS.get(state, state)
+        link_html = ""
+        if entry.get("monitor_link"):
+            link_html = f' <a href="{h(entry["monitor_link"])}" style="font-size:12px;color:var(--eg-accent);">Ver en Monitoreo →</a>'
+        error_at_html = ""
+        if state == "error" and entry.get("error_at"):
+            error_at_html = (
+                f'<div class="eg-muted" style="font-size:11px;margin-top:1px;">'
+                f'Último fallo: {h(entry["error_at"])}</div>'
+            )
+        items_html.append(f"""
+<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:9px 0;border-bottom:1px solid var(--eg-border);">
+  <div style="min-width:0;flex:1;">
+    <div style="font-size:13.5px;font-weight:600;color:var(--eg-text);">{h(entry["name"])}</div>
+    <div class="eg-muted" style="font-size:12px;margin-top:2px;">{h(entry.get("detail") or "")}{link_html}</div>
+    {error_at_html}
+  </div>
+  <div style="flex-shrink:0;">{pill(state, state_label)}</div>
+</div>""")
+    return f"""
+<section class="eg-card eg-panel">
+  <div class="eg-card-head eg-card-head--wrap">
+    <h2>Salud del sistema</h2>
+    {pill(conclusion_state, conclusion)}
+  </div>
+  <div>{"".join(items_html)}</div>
+</section>
+"""
+
+
+def render_dashboard_monitor_summary(last_job: dict[str, Any] | None) -> str:
+    """Bloque compacto 'Último monitoreo', con enlace al historial completo en /admin/jobs."""
+    if not last_job:
+        return (
+            '<section class="eg-card eg-panel">'
+            '<h3 style="margin:0 0 8px;font-size:13px;color:var(--eg-subtle);">Último monitoreo</h3>'
+            '<p class="eg-muted" style="margin:0 0 12px;">Aún no se ha ejecutado el monitoreo.</p>'
+            '<a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/jobs">Ver historial de monitoreo</a>'
+            '</section>'
+        )
+    job_type = last_job.get("job_type") or "check-normative"
+    if job_type.endswith(":dt"):
+        total_sources = len(DT_SOURCES)
+    elif job_type.endswith(":sii"):
+        total_sources = len(SII_SOURCES)
+    else:
+        total_sources = len(DT_SOURCES) + len(SII_SOURCES)
+    error_text = (last_job.get("error") or "").strip()
+    failed_sources = len([seg for seg in error_text.split(" | ") if seg.strip()]) if error_text else 0
+    successful_sources = max(0, total_sources - failed_sources)
+    status = last_job.get("status") or ""
+    result_label = {
+        "success": "Completo", "partial": "Parcial", "failed": "Error", "running": "En curso",
+    }.get(status, status_label(status))
+    return f"""
+<section class="eg-card eg-panel">
+  <h3 style="margin:0 0 10px;font-size:13px;color:var(--eg-subtle);">Último monitoreo</h3>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Fecha y hora</dt><dd class="mono">{h(fmt_dt(last_job.get("started_at")))}</dd>
+    <dt>Resultado</dt><dd>{pill(status, result_label)}</dd>
+    <dt>Fuentes exitosas</dt><dd class="mono">{successful_sources} de {total_sources}</dd>
+  </dl>
+  <a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/jobs">Ver historial de monitoreo</a>
 </section>
 """
 
@@ -1333,70 +1654,32 @@ def render_admin(
         )
     else:  # /admin -> Resumen
         cards = (
-            metric_card("users", active_count, "Suscriptores activos", f"{paused_count} pausados", "accent")
-            + metric_card("document", len(documents_all), "Documentos detectados", "desde fuentes DT + SII", "info")
-            + metric_card("bell", pending_count, "Pendientes de revisión", "requieren validación", "warning")
-            + metric_card("check", ready_count, "Listas para enviar", "revisadas y aprobadas", "info")
-            + metric_card("send", sent_count, "Alertas enviadas", "a suscriptores activos", "success")
+            metric_card("users", active_count, "Suscriptores activos", f"{paused_count} pausados", "accent",
+                        href="/admin/subscribers")
+            + metric_card("document", len(documents_all), "Documentos detectados", "desde fuentes DT + SII", "info",
+                          href="/admin/documents")
+            + metric_card("bell", pending_count, "Pendientes de revisión", "requieren validación", "warning",
+                          href="/admin/alerts?status=pending_review")
+            + metric_card("check", ready_count, "Listas para enviar", "revisadas y aprobadas", "info",
+                          href="/admin/alerts?status=ready")
+            + metric_card("send", sent_count, "Alertas enviadas", "a suscriptores activos", "success",
+                          href="/admin/alerts?status=sent")
             + metric_card("mail", sent_deliveries, "Envíos registrados", "incluye simulados", "muted")
         )
-        # --- Bloque "Siguiente acción recomendada" ---
-        activity_lines: list[str] = []
-        if pending_count:
-            activity_lines.append(
-                f'<span>Tienes <strong>{pending_count}</strong> alerta{"s" if pending_count != 1 else ""} pendiente{"s" if pending_count != 1 else ""} de revisión.</span>'
-            )
-        if ready_count:
-            activity_lines.append(
-                f'<span>Listas para enviar: <strong>{ready_count}</strong>.</span>'
-            )
-        activity_lines.append(
-            f'<span>Suscriptores activos: <strong>{active_count}</strong>.</span>'
-        )
-        if last_job:
-            job_status_label = status_label(last_job.get("status") or "")
-            job_new = last_job.get("discovered_count") or 0
-            activity_lines.append(
-                f'<span>Último monitoreo: {fmt_dt(last_job.get("started_at"))} · {h(job_status_label)}'
-                f'{f" · {job_new} nuevos" if job_new else ""}.</span>'
-            )
-        if pending_count:
-            cta_label = "Revisar alerta pendiente"
-            cta_href = "/admin/alerts"
-            cta_icon = "bell"
-        elif ready_count:
-            cta_label = "Ver alertas listas para enviar"
-            cta_href = "/admin/alerts"
-            cta_icon = "send"
-        else:
-            cta_label = "Ejecutar monitoreo"
-            cta_href = "#run-monitor"
-            cta_icon = "activity"
-        activity_html = (
-            '<section class="eg-card eg-panel" style="margin-bottom:16px;">'
-            '<p class="eg-eyebrow">Actividad</p>'
-            '<h2>Siguiente acción recomendada</h2>'
-            '<div style="display:flex;flex-direction:column;gap:5px;margin:10px 0 14px;font-size:13.5px;color:var(--eg-muted);">'
-            + "".join(f'<div>{line}</div>' for line in activity_lines)
-            + '</div>'
-            f'<a class="eg-btn eg-btn--primary eg-btn--sm" href="{cta_href}">'
-            f'{icon(cta_icon, 15)}<span>{cta_label}</span></a>'
-            '</section>'
-        )
-        _pending_statuses = {"pending_review", "pending", "ready_to_send", "ready", "fallback"}
-        pending_alerts = [a for a in alerts if a.get("status") in _pending_statuses]
+        # --- Dashboard operativo v2: atención + salud del sistema + monitoreo ---
+        attention_alerts = _dashboard_attention_alerts(alerts)
+        with db.connect(settings.database_path) as health_conn:
+            app_cfg = db.get_all_settings(health_conn)
+            health_rows = _dashboard_health_rows(health_conn, settings, app_cfg, jobs)
+        conclusion_text, conclusion_state = _dashboard_conclusion(health_rows, settings, app_cfg)
+
         section = (
             f'<div class="eg-metric-grid">{cards}</div>'
-            + activity_html
-            + render_system_status(settings, last_job)
-            + render_jobs(jobs[:5])
-            + render_alerts(
-                pending_alerts[:6],
-                title="Alertas pendientes de acción",
-                empty_msg="✓ No hay alertas pendientes de revisión.",
-                empty_hint="Todas las alertas han sido enviadas o no hay nuevas.",
-                history_link="/admin/alerts",
-            )
+            '<div class="eg-dashboard-grid" style="margin-top:16px;">'
+            f'<div>{render_dashboard_attention(attention_alerts)}</div>'
+            f'<div>{render_dashboard_health(health_rows, conclusion_text, conclusion_state)}</div>'
+            '</div>'
+            f'<div style="margin-top:16px;">{render_dashboard_monitor_summary(last_job)}</div>'
         )
 
     title, subtitle = SECTION_META.get(path, SECTION_META["/admin"])
@@ -3684,6 +3967,9 @@ body.eg--admin {
 .eg-metric-num  { font-size: 1.7rem; font-weight: 700; color: var(--eg-text); line-height: 1; }
 .eg-metric-label { font-size: 13px; font-weight: 600; color: var(--eg-text); }
 .eg-metric-sub   { font-size: 12px; color: var(--eg-subtle); }
+.eg-metric--link { text-decoration: none; color: inherit; cursor: pointer; transition: border-color .15s, transform .15s; }
+.eg-metric--link:hover { border-color: color-mix(in srgb, var(--eg-green) 40%, transparent); transform: translateY(-1px); }
+.eg-metric--link:focus-visible { outline: 2px solid var(--eg-green); outline-offset: 2px; }
 
 /* ----- Badges -------------------------------------------------------- */
 .eg-badge {
@@ -3755,12 +4041,16 @@ body.eg--admin {
 .eg-pill[data-status="paused"], .eg-pill[data-status="pending_review"],
 .eg-pill[data-status="partial"], .eg-pill[data-status="baseline"],
 .eg-pill[data-status="discovered"], .eg-pill[data-status="medio"],
-.eg-pill[data-status="running"], .eg-pill[data-status="skipped"] {
+.eg-pill[data-status="running"], .eg-pill[data-status="skipped"],
+.eg-pill[data-status="warning"] {
   background: color-mix(in srgb,#B45309 16%,transparent); color: #92400E;
 }
 .eg-pill[data-status="error"], .eg-pill[data-status="failed"],
 .eg-pill[data-status="ignored"], .eg-pill[data-status="bajo"] {
   background: color-mix(in srgb,#B42318 14%,transparent); color: #B42318;
+}
+.eg-pill[data-status="disabled"], .eg-pill[data-status="nodata"] {
+  background: color-mix(in srgb,#8EA1AA 16%,transparent); color: #5F6E76;
 }
 
 /* ----- Section heads ------------------------------------------------- */
@@ -4073,6 +4363,9 @@ a.eg-btn--ghost:hover { color: #fff !important; }
 
 /* ----- Grids --------------------------------------------------------- */
 .eg-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+/* Dashboard operativo v2: Alertas que requieren atencion (~65%) + Salud del sistema (~35%). */
+.eg-dashboard-grid { display: grid; grid-template-columns: 65% 1fr; gap: 16px; align-items: start; min-width: 0; }
+.eg-dashboard-grid > div { min-width: 0; }
 
 /* ----- Misc admin components ---------------------------------------- */
 .eg-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -4238,6 +4531,7 @@ textarea.eg-input { resize: vertical; min-height: 56px; }
 @media (max-width: 1024px) {
   .eg-metric-grid { grid-template-columns: repeat(2, 1fr); }
   .eg-grid-2 { grid-template-columns: 1fr; }
+  .eg-dashboard-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 900px) {
   .eg-preview-grid { grid-template-columns: 1fr; }
