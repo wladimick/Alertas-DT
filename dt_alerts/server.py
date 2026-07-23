@@ -11,7 +11,7 @@ from http.server import BaseHTTPRequestHandler, ThreadingHTTPServer
 from typing import Any
 
 from . import codex_client, db, tls
-from .config import Settings, get_settings
+from .config import DT_SOURCES, SII_SOURCES, Settings, get_settings
 from .notifier import (
     dispatch_alert,
     render_alert_email_html,
@@ -1223,16 +1223,17 @@ def render_topbar(title: str, subtitle: str, settings: Settings, *, show_action:
 """
 
 
-def metric_card(ic: str, value: Any, label: str, sub: str, tone: str = "muted") -> str:
+def metric_card(ic: str, value: Any, label: str, sub: str, tone: str = "muted", href: str = "") -> str:
     ico_cls = _TONE_ICO.get(tone, "eg-ico-slate")
-    return (
-        f'<div class="eg-metric">'
+    inner = (
         f'<div class="eg-metric-ico {ico_cls}">{icon(ic, 19)}</div>'
         f'<div class="eg-metric-num">{h(value)}</div>'
         f'<div class="eg-metric-label">{h(label)}</div>'
         f'<div class="eg-metric-sub">{h(sub)}</div>'
-        f'</div>'
     )
+    if href:
+        return f'<a class="eg-metric eg-metric--link" href="{h(href)}">{inner}</a>'
+    return f'<div class="eg-metric">{inner}</div>'
 
 
 def render_system_status(settings: Settings, last_job: dict[str, Any] | None) -> str:
@@ -1262,6 +1263,326 @@ def render_system_status(settings: Settings, last_job: dict[str, Any] | None) ->
 """
 
 
+# --------------------------------------------------------------------------
+# Dashboard operativo v2 (feat/alerts-ui-v2): alertas que requieren atención,
+# salud del sistema compacta y resumen de monitoreo. Reutiliza badges, pills,
+# colores y botones ya usados en /admin/alerts para mantener un solo lenguaje
+# visual (ver docs/ui-alertas-admin-v2.md).
+# --------------------------------------------------------------------------
+
+_ATTENTION_STATUSES = {"error", "fallback", "pending_review", "ready_to_send", "ready"}
+_ATTENTION_PRIORITY = {"error": 0, "fallback": 1, "pending_review": 2, "ready_to_send": 3, "ready": 3}
+
+
+def _dashboard_attention_alerts(alerts: list[dict[str, Any]]) -> list[dict[str, Any]]:
+    """
+    Alertas que requieren acción administrativa, en orden de prioridad:
+    error > fallback > pendiente de revisión > lista para enviar.
+    Nunca incluye alertas ya enviadas (status='sent').
+    """
+    candidates = [a for a in alerts if a.get("status") in _ATTENTION_STATUSES]
+    candidates.sort(key=lambda a: _ATTENTION_PRIORITY.get(a.get("status"), 9))
+    return candidates
+
+
+def _dashboard_attention_row(item: dict[str, Any]) -> str:
+    title_raw = item.get("title") or ""
+    title_trunc = (title_raw[:50] + "…") if len(title_raw) > 50 else title_raw
+    return (
+        f'<tr>'
+        f'<td style="padding:10px 8px;font-size:13px;" title="{h(title_raw)}">{h(title_trunc)}</td>'
+        f'<td style="padding:10px 8px;">{source_badge(item)}</td>'
+        f'<td class="eg-cell-cat" style="padding:10px 8px;">{h(item.get("category") or "—")}</td>'
+        f'<td style="padding:10px 8px;">{_alert_status_badge(item.get("status") or "")}</td>'
+        f'<td style="padding:10px 8px;font-size:12px;color:var(--eg-subtle);white-space:nowrap;">'
+        f'{_fmt_short_date(item.get("created_at"))}</td>'
+        f'<td style="padding:10px 8px;">'
+        f'<a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/alerts/{item["id"]}/preview-email">Ver</a>'
+        f'</td>'
+        f'</tr>'
+    )
+
+
+def render_dashboard_attention(attention_alerts: list[dict[str, Any]]) -> str:
+    """Tarjeta 'Alertas que requieren atención': máximo 5, con enlace a la vista completa."""
+    if not attention_alerts:
+        return (
+            '<section class="eg-card eg-panel">'
+            '<div class="eg-card-head"><h2>Alertas que requieren atención</h2></div>'
+            '<div class="eg-empty"><strong>No hay alertas que requieren atención.</strong></div>'
+            '</section>'
+        )
+    statuses_present = {a.get("status") for a in attention_alerts}
+    ver_todas_href = (
+        f"/admin/alerts?status={next(iter(statuses_present))}"
+        if len(statuses_present) == 1 else "/admin/alerts"
+    )
+    rows = "".join(_dashboard_attention_row(item) for item in attention_alerts[:5])
+    return f"""
+<section class="eg-card eg-panel">
+  <div class="eg-card-head eg-card-head--wrap">
+    <h2>Alertas que requieren atención</h2>
+    <a class="eg-btn eg-btn--secondary eg-btn--sm" href="{ver_todas_href}">Ver todas las alertas</a>
+  </div>
+  <div class="eg-table-wrap">
+    <table class="eg-table">
+      <thead><tr>
+        <th>Documento</th><th style="width:70px;">Fuente</th><th style="width:140px;">Categoría</th>
+        <th style="width:150px;">Estado</th><th style="width:70px;">Fecha</th><th style="width:70px;"></th>
+      </tr></thead>
+      <tbody>{rows}</tbody>
+    </table>
+  </div>
+</section>
+"""
+
+
+_HEALTH_STATE_LABELS = {
+    "active": "Operativo",
+    "warning": "Advertencia",
+    "error": "Error activo",
+    "disabled": "Desactivado",
+    "nodata": "Sin datos",
+}
+
+
+def _sanitize_error_text(text: str, limit: int = 140) -> str:
+    """Resumen sanitizado y acotado (~140 caracteres) de un error técnico."""
+    clean = re.sub(r"\s+", " ", str(text or "")).strip()
+    if len(clean) <= limit:
+        return clean
+    return clean[: limit - 1].rstrip() + "…"
+
+
+def _health_entry(
+    name: str, state: str, detail: str, *, error_at: str = "", monitor_link: str = "",
+) -> dict[str, Any]:
+    return {"name": name, "state": state, "detail": detail, "error_at": error_at, "monitor_link": monitor_link}
+
+
+def _sendgrid_health(conn: Any, settings: Settings) -> dict[str, Any]:
+    _label, key = email_mode(settings)
+    if key == "simulated":
+        return _health_entry("SendGrid", "disabled", "Modo simulado (EMAIL_PROVIDER=console).")
+    if key == "pending_review":
+        return _health_entry(
+            "SendGrid", "error", "Sin credenciales: falta SENDGRID_API_KEY.",
+            monitor_link="/admin/settings",
+        )
+    row = conn.execute(
+        "SELECT status, error, created_at FROM deliveries WHERE channel='email' ORDER BY id DESC LIMIT 1"
+    ).fetchone()
+    if not row:
+        return _health_entry("SendGrid", "nodata", "Configurado; sin envíos registrados aún.")
+    if row["status"] in ("sent", "simulated"):
+        return _health_entry("SendGrid", "active", f"Último envío exitoso ({fmt_dt(row['created_at'])}).")
+    return _health_entry(
+        "SendGrid", "error", _sanitize_error_text(row["error"] or "Envío fallido."),
+        error_at=fmt_dt(row["created_at"]), monitor_link="/admin/alerts",
+    )
+
+
+def _wordpress_health(settings: Settings, app_cfg: dict[str, str]) -> dict[str, Any]:
+    if not settings.wordpress_sync_enabled:
+        return _health_entry("WordPress Sync", "disabled", "Desactivado (WORDPRESS_SYNC_ENABLED=false).")
+    if not settings.wordpress_api_url or not settings.wordpress_api_token:
+        return _health_entry(
+            "WordPress Sync", "error", "Falta WORDPRESS_API_URL o WORDPRESS_API_TOKEN.",
+            monitor_link="/admin/settings",
+        )
+    raw = app_cfg.get("wordpress_last_sync_summary")
+    if not raw:
+        return _health_entry("WordPress Sync", "nodata", "Configurado; sin sincronizaciones registradas aún.")
+    summary = json.loads(raw)
+    return _health_entry(
+        "WordPress Sync", "active",
+        f"Última sincronización {fmt_dt(summary.get('at'))}: "
+        f"{int(summary.get('created') or 0)} creados, {int(summary.get('updated') or 0)} actualizados.",
+    )
+
+
+def _ai_provider_health(settings: Settings, app_cfg: dict[str, str], ai_usage_status: dict[str, Any]) -> dict[str, Any]:
+    from .summarizer import get_effective_ai_provider, get_effective_settings, is_ai_runtime_enabled, validate_provider_credentials
+
+    name = "Proveedor IA"
+    provider = get_effective_ai_provider(settings, app_cfg)
+    if not is_ai_runtime_enabled(settings, app_cfg) or provider == "disabled" or not provider:
+        return _health_entry(name, "disabled", "IA desactivada.")
+
+    effective_settings = get_effective_settings(settings, app_cfg)
+    problems = validate_provider_credentials(provider, effective_settings)
+    if problems:
+        return _health_entry(
+            name, "error", _sanitize_error_text(" ".join(problems)),
+            monitor_link="/admin/settings",
+        )
+
+    last_error = ai_usage_status.get("last_error")
+    if last_error:
+        if ai_usage_status.get("last_error_resolved"):
+            return _health_entry(
+                name, "active",
+                f"Resuelto: hubo un intento exitoso después del error ({fmt_dt(last_error.get('created_at'))}).",
+            )
+        return _health_entry(
+            name, "error", _sanitize_error_text(last_error.get("error") or "Error de IA."),
+            error_at=fmt_dt(last_error.get("created_at")), monitor_link="/admin/settings",
+        )
+
+    last_usage = ai_usage_status.get("last_usage")
+    if last_usage:
+        return _health_entry(
+            name, "active", f"Proveedor {provider}: último uso exitoso ({fmt_dt(last_usage.get('created_at'))}).",
+        )
+    return _health_entry(name, "nodata", f"Proveedor {provider} configurado; sin uso registrado aún.")
+
+
+def _job_matches_source(job_type: str, kind: str) -> bool:
+    return job_type == "check-normative" or job_type == f"check-normative:{kind}"
+
+
+def _monitor_health_for_source(jobs: list[dict[str, Any]], kind: str) -> dict[str, Any]:
+    name = f"Monitoreo {kind.upper()}"
+    relevant = [j for j in jobs if _job_matches_source(j.get("job_type") or "", kind)]
+    if not relevant:
+        return _health_entry(name, "nodata", "Aún no se ha ejecutado el monitoreo.")
+    last = relevant[0]  # `jobs` ya viene ordenado started_at DESC
+    status = last.get("status") or ""
+    when = fmt_dt(last.get("started_at"))
+    if status == "running":
+        return _health_entry(name, "warning", f"Ejecución en curso desde {when}.")
+    if status == "success":
+        return _health_entry(name, "active", f"Último resultado exitoso ({when}).")
+    if status == "partial":
+        prefix = "DT" if kind == "dt" else "SII"
+        if prefix in (last.get("error") or ""):
+            return _health_entry(
+                name, "warning", _sanitize_error_text(last.get("error") or "Resultado parcial."),
+                error_at=when, monitor_link="/admin/jobs",
+            )
+        return _health_entry(name, "active", f"Último resultado exitoso ({when}).")
+    # status == "failed"
+    return _health_entry(
+        name, "error", _sanitize_error_text(last.get("error") or "Fallo no especificado."),
+        error_at=when, monitor_link="/admin/jobs",
+    )
+
+
+def _admin_auth_health(settings: Settings) -> dict[str, Any]:
+    _label, key = auth_mode(settings)
+    if key == "active":
+        return _health_entry("Acceso administrativo", "active", "Login por token activo.")
+    return _health_entry(
+        "Acceso administrativo", "warning",
+        "Modo desarrollo: autenticación desactivada (DISABLE_ADMIN_AUTH=true).",
+    )
+
+
+def _dashboard_health_rows(
+    conn: Any, settings: Settings, app_cfg: dict[str, str], jobs: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    ai_usage_status = db.get_ai_usage_status(
+        conn, daily_limit=settings.ai_daily_token_limit, monthly_limit=settings.ai_monthly_token_limit,
+    )
+    return [
+        _sendgrid_health(conn, settings),
+        _wordpress_health(settings, app_cfg),
+        _ai_provider_health(settings, app_cfg, ai_usage_status),
+        _monitor_health_for_source(jobs, "dt"),
+        _monitor_health_for_source(jobs, "sii"),
+        _admin_auth_health(settings),
+    ]
+
+
+def _dashboard_conclusion(rows: list[dict[str, Any]], settings: Settings, app_cfg: dict[str, str]) -> tuple[str, str]:
+    """Devuelve (texto_conclusion, estado_para_color)."""
+    from .summarizer import get_effective_ai_provider
+
+    error_count = sum(1 for r in rows if r["state"] == "error")
+    warning_count = sum(1 for r in rows if r["state"] == "warning")
+    if error_count:
+        label = "integración requiere" if error_count == 1 else "integraciones requieren"
+        return f"{error_count} {label} atención", "error"
+    if warning_count:
+        return "Monitoreo parcial", "warning"
+    provider = get_effective_ai_provider(settings, app_cfg)
+    if provider == "disabled":
+        return "Sistema en modo seguro", "disabled"
+    return "Todo operativo", "active"
+
+
+def render_dashboard_health(rows: list[dict[str, Any]], conclusion: str, conclusion_state: str) -> str:
+    """Tarjeta compacta 'Salud del sistema': reemplaza el bloque técnico extenso anterior."""
+    items_html = []
+    for entry in rows:
+        state = entry["state"]
+        state_label = _HEALTH_STATE_LABELS.get(state, state)
+        link_html = ""
+        if entry.get("monitor_link"):
+            link_html = f' <a href="{h(entry["monitor_link"])}" style="font-size:12px;color:var(--eg-accent);">Ver en Monitoreo →</a>'
+        error_at_html = ""
+        if state == "error" and entry.get("error_at"):
+            error_at_html = (
+                f'<div class="eg-muted" style="font-size:11px;margin-top:1px;">'
+                f'Último fallo: {h(entry["error_at"])}</div>'
+            )
+        items_html.append(f"""
+<div style="display:flex;justify-content:space-between;align-items:flex-start;gap:10px;padding:9px 0;border-bottom:1px solid var(--eg-border);">
+  <div style="min-width:0;flex:1;">
+    <div style="font-size:13.5px;font-weight:600;color:var(--eg-text);">{h(entry["name"])}</div>
+    <div class="eg-muted" style="font-size:12px;margin-top:2px;">{h(entry.get("detail") or "")}{link_html}</div>
+    {error_at_html}
+  </div>
+  <div style="flex-shrink:0;">{pill(state, state_label)}</div>
+</div>""")
+    return f"""
+<section class="eg-card eg-panel">
+  <div class="eg-card-head eg-card-head--wrap">
+    <h2>Salud del sistema</h2>
+    {pill(conclusion_state, conclusion)}
+  </div>
+  <div>{"".join(items_html)}</div>
+</section>
+"""
+
+
+def render_dashboard_monitor_summary(last_job: dict[str, Any] | None) -> str:
+    """Bloque compacto 'Último monitoreo', con enlace al historial completo en /admin/jobs."""
+    if not last_job:
+        return (
+            '<section class="eg-card eg-panel">'
+            '<h3 style="margin:0 0 8px;font-size:13px;color:var(--eg-subtle);">Último monitoreo</h3>'
+            '<p class="eg-muted" style="margin:0 0 12px;">Aún no se ha ejecutado el monitoreo.</p>'
+            '<a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/jobs">Ver historial de monitoreo</a>'
+            '</section>'
+        )
+    job_type = last_job.get("job_type") or "check-normative"
+    if job_type.endswith(":dt"):
+        total_sources = len(DT_SOURCES)
+    elif job_type.endswith(":sii"):
+        total_sources = len(SII_SOURCES)
+    else:
+        total_sources = len(DT_SOURCES) + len(SII_SOURCES)
+    error_text = (last_job.get("error") or "").strip()
+    failed_sources = len([seg for seg in error_text.split(" | ") if seg.strip()]) if error_text else 0
+    successful_sources = max(0, total_sources - failed_sources)
+    status = last_job.get("status") or ""
+    result_label = {
+        "success": "Completo", "partial": "Parcial", "failed": "Error", "running": "En curso",
+    }.get(status, status_label(status))
+    return f"""
+<section class="eg-card eg-panel">
+  <h3 style="margin:0 0 10px;font-size:13px;color:var(--eg-subtle);">Último monitoreo</h3>
+  <dl class="eg-kv eg-kv--2col">
+    <dt>Fecha y hora</dt><dd class="mono">{h(fmt_dt(last_job.get("started_at")))}</dd>
+    <dt>Resultado</dt><dd>{pill(status, result_label)}</dd>
+    <dt>Fuentes exitosas</dt><dd class="mono">{successful_sources} de {total_sources}</dd>
+  </dl>
+  <a class="eg-btn eg-btn--secondary eg-btn--sm" href="/admin/jobs">Ver historial de monitoreo</a>
+</section>
+"""
+
+
 def render_admin(
     path: str,
     settings: Settings,
@@ -1273,6 +1594,7 @@ def render_admin(
     status_filter = query.get("status", [""])[0]
     raw_page = query.get("page", ["1"])[0]
     page = max(1, int(raw_page) if raw_page.isdigit() else 1)
+    search_query = query.get("q", [""])[0].strip()
     document_source_filter = normalize_source_filter(query.get("source", ["all"])[0])
     with db.connect(settings.database_path) as conn:
         subscribers = db.list_subscribers(conn)
@@ -1324,7 +1646,7 @@ def render_admin(
             counts=document_counts,
         )
     elif path == "/admin/alerts":
-        section = render_alerts_table(alerts, status_filter=status_filter, page=page)
+        section = render_alerts_table(alerts, status_filter=status_filter, page=page, search_query=search_query)
     elif path == "/admin/jobs":
         section = (
             '<p class="eg-section-note">El monitoreo revisa las fuentes configuradas de la '
@@ -1333,70 +1655,32 @@ def render_admin(
         )
     else:  # /admin -> Resumen
         cards = (
-            metric_card("users", active_count, "Suscriptores activos", f"{paused_count} pausados", "accent")
-            + metric_card("document", len(documents_all), "Documentos detectados", "desde fuentes DT + SII", "info")
-            + metric_card("bell", pending_count, "Pendientes de revisión", "requieren validación", "warning")
-            + metric_card("check", ready_count, "Listas para enviar", "revisadas y aprobadas", "info")
-            + metric_card("send", sent_count, "Alertas enviadas", "a suscriptores activos", "success")
+            metric_card("users", active_count, "Suscriptores activos", f"{paused_count} pausados", "accent",
+                        href="/admin/subscribers")
+            + metric_card("document", len(documents_all), "Documentos detectados", "desde fuentes DT + SII", "info",
+                          href="/admin/documents")
+            + metric_card("bell", pending_count, "Pendientes de revisión", "requieren validación", "warning",
+                          href="/admin/alerts?status=pending_review")
+            + metric_card("check", ready_count, "Listas para enviar", "revisadas y aprobadas", "info",
+                          href="/admin/alerts?status=ready")
+            + metric_card("send", sent_count, "Alertas enviadas", "a suscriptores activos", "success",
+                          href="/admin/alerts?status=sent")
             + metric_card("mail", sent_deliveries, "Envíos registrados", "incluye simulados", "muted")
         )
-        # --- Bloque "Siguiente acción recomendada" ---
-        activity_lines: list[str] = []
-        if pending_count:
-            activity_lines.append(
-                f'<span>Tienes <strong>{pending_count}</strong> alerta{"s" if pending_count != 1 else ""} pendiente{"s" if pending_count != 1 else ""} de revisión.</span>'
-            )
-        if ready_count:
-            activity_lines.append(
-                f'<span>Listas para enviar: <strong>{ready_count}</strong>.</span>'
-            )
-        activity_lines.append(
-            f'<span>Suscriptores activos: <strong>{active_count}</strong>.</span>'
-        )
-        if last_job:
-            job_status_label = status_label(last_job.get("status") or "")
-            job_new = last_job.get("discovered_count") or 0
-            activity_lines.append(
-                f'<span>Último monitoreo: {fmt_dt(last_job.get("started_at"))} · {h(job_status_label)}'
-                f'{f" · {job_new} nuevos" if job_new else ""}.</span>'
-            )
-        if pending_count:
-            cta_label = "Revisar alerta pendiente"
-            cta_href = "/admin/alerts"
-            cta_icon = "bell"
-        elif ready_count:
-            cta_label = "Ver alertas listas para enviar"
-            cta_href = "/admin/alerts"
-            cta_icon = "send"
-        else:
-            cta_label = "Ejecutar monitoreo"
-            cta_href = "#run-monitor"
-            cta_icon = "activity"
-        activity_html = (
-            '<section class="eg-card eg-panel" style="margin-bottom:16px;">'
-            '<p class="eg-eyebrow">Actividad</p>'
-            '<h2>Siguiente acción recomendada</h2>'
-            '<div style="display:flex;flex-direction:column;gap:5px;margin:10px 0 14px;font-size:13.5px;color:var(--eg-muted);">'
-            + "".join(f'<div>{line}</div>' for line in activity_lines)
-            + '</div>'
-            f'<a class="eg-btn eg-btn--primary eg-btn--sm" href="{cta_href}">'
-            f'{icon(cta_icon, 15)}<span>{cta_label}</span></a>'
-            '</section>'
-        )
-        _pending_statuses = {"pending_review", "pending", "ready_to_send", "ready", "fallback"}
-        pending_alerts = [a for a in alerts if a.get("status") in _pending_statuses]
+        # --- Dashboard operativo v2: atención + salud del sistema + monitoreo ---
+        attention_alerts = _dashboard_attention_alerts(alerts)
+        with db.connect(settings.database_path) as health_conn:
+            app_cfg = db.get_all_settings(health_conn)
+            health_rows = _dashboard_health_rows(health_conn, settings, app_cfg, jobs)
+        conclusion_text, conclusion_state = _dashboard_conclusion(health_rows, settings, app_cfg)
+
         section = (
             f'<div class="eg-metric-grid">{cards}</div>'
-            + activity_html
-            + render_system_status(settings, last_job)
-            + render_jobs(jobs[:5])
-            + render_alerts(
-                pending_alerts[:6],
-                title="Alertas pendientes de acción",
-                empty_msg="✓ No hay alertas pendientes de revisión.",
-                empty_hint="Todas las alertas han sido enviadas o no hay nuevas.",
-                history_link="/admin/alerts",
-            )
+            '<div class="eg-dashboard-grid" style="margin-top:16px;">'
+            f'<div>{render_dashboard_attention(attention_alerts)}</div>'
+            f'<div>{render_dashboard_health(health_rows, conclusion_text, conclusion_state)}</div>'
+            '</div>'
+            f'<div style="margin-top:16px;">{render_dashboard_monitor_summary(last_job)}</div>'
         )
 
     title, subtitle = SECTION_META.get(path, SECTION_META["/admin"])
@@ -2563,13 +2847,13 @@ def ai_status_badge(item: dict[str, Any]) -> str:
     return f'<span class="eg-badge {cls} eg-badge--no-dot">{h(label)}</span>'
 
 
-_ALERT_STATUS_LABELS: dict[str, tuple[str, str]] = {
-    "pending_review": ("Pendiente revisión", "#FEF3C7;color:#92400E"),
-    "ready_to_send":  ("Lista p/enviar",     "#D1FAE5;color:#065F46"),
-    "ready":          ("Lista p/enviar",     "#D1FAE5;color:#065F46"),
-    "sent":           ("Enviada",            "#29B78D;color:#fff"),
-    "fallback":       ("Fallback",           "#F3F4F6;color:#6B7280"),
-    "error":          ("Error",              "#FEE2E2;color:#991B1B"),
+_ALERT_STATUS_LABELS: dict[str, str] = {
+    "pending_review": "Pendiente revisión",
+    "ready_to_send":  "Lista p/enviar",
+    "ready":          "Lista p/enviar",
+    "sent":           "Enviada",
+    "fallback":       "Fallback",
+    "error":          "Error",
 }
 
 _ALERT_FILTER_TABS: list[tuple[str, str]] = [
@@ -2583,27 +2867,34 @@ _ALERT_FILTER_TABS: list[tuple[str, str]] = [
 
 _PAGE_SIZE = 20
 
+_ALERTS_EMPTY_TEXT = "No se encontraron alertas con los filtros seleccionados."
+
+_AI_PROVIDER_TOOLTIP_LABELS: dict[str, str] = {
+    "azure": "Azure AI",
+    "codex": "Codex (cuenta ChatGPT)",
+    "openai": "OpenAI",
+}
+
+_SEARCH_ICON_SVG = (
+    '<svg width="16" height="16" viewBox="0 0 24 24" fill="none" stroke="currentColor" '
+    'stroke-width="2" stroke-linecap="round" stroke-linejoin="round" aria-hidden="true">'
+    '<circle cx="11" cy="11" r="8"/><line x1="21" y1="21" x2="16.65" y2="16.65"/></svg>'
+)
+
 
 def _alert_status_badge(status: str) -> str:
-    label, style = _ALERT_STATUS_LABELS.get(status, (h(status), "#F3F4F6;color:#6B7280"))
-    return (
-        f'<span style="display:inline-block;padding:2px 8px;border-radius:10px;'
-        f'font-size:11px;font-weight:600;background:{style};">{label}</span>'
-    )
+    label = _ALERT_STATUS_LABELS.get(status, h(status) or "—")
+    cls = _STATUS_BADGE_CLASS.get(status, "eg-badge--baseline")
+    return f'<span class="eg-badge {cls} eg-badge--no-dot">{label}</span>'
 
 
 def _alert_ia_badge(item: dict[str, Any]) -> str:
     if (item.get("ai_status") or "") == "success":
-        return (
-            '<span style="display:inline-block;padding:2px 7px;border-radius:10px;'
-            'font-size:11px;font-weight:600;background:#D1FAE5;color:#065F46;" '
-            'title="Resumen IA generado — clic para ver preview">✓ IA</span>'
-        )
-    return (
-        '<span style="display:inline-block;padding:2px 7px;border-radius:10px;'
-        'font-size:11px;font-weight:600;background:#F3F4F6;color:#6B7280;" '
-        'title="Sin resumen IA — usar Generar con IA en el preview">− Sin IA</span>'
-    )
+        provider = (item.get("ai_provider") or "").strip()
+        provider_label = _AI_PROVIDER_TOOLTIP_LABELS.get(provider, provider)
+        title_attr = f' title="{h(provider_label)}"' if provider_label else ""
+        return f'<span class="eg-badge eg-badge--active eg-badge--no-dot"{title_attr}>✓ IA</span>'
+    return '<span class="eg-badge eg-badge--baseline eg-badge--no-dot">Sin IA</span>'
 
 
 def _fmt_short_date(val: str | None) -> str:
@@ -2618,77 +2909,164 @@ def _fmt_short_date(val: str | None) -> str:
         return val[:10] if val else "—"
 
 
-def _alert_table_row(item: dict[str, Any]) -> str:
+def _alert_subtitle(item: dict[str, Any]) -> str:
+    """Subtítulo real (asunto de correo generado por IA), solo cuando existe y difiere del título."""
+    subject = (item.get("ai_email_subject") or "").strip()
+    title = (item.get("title") or "").strip()
+    if subject and subject.casefold() != title.casefold():
+        return subject
+    return ""
+
+
+def _alert_search_haystack(item: dict[str, Any]) -> str:
+    status = item.get("status") or ""
+    parts = [
+        str(item.get("id") or ""),
+        item.get("title") or "",
+        item.get("category") or "",
+        source_context(item)["short"],
+        status,
+        _ALERT_STATUS_LABELS.get(status, status),
+    ]
+    return " ".join(parts).lower()
+
+
+def _alert_menu_actions_html(item: dict[str, Any], title_js: str) -> str:
     alert_id = item["id"]
-    status = item["status"]
-    title_raw = item.get("title") or ""
-    title_trunc = (title_raw[:45] + "…") if len(title_raw) > 45 else title_raw
-    cat_raw = item.get("category") or ""
-    cat_trunc = (cat_raw[:20] + "…") if len(cat_raw) > 20 else cat_raw
+    status = item.get("status") or ""
+    ai_status = item.get("ai_status") or ""
+    items: list[str] = []
 
-    title_js = h(title_raw).replace("'", "\\'")
+    if status == "pending_review":
+        items.append(
+            f'<form method="post" action="/admin/alerts/{alert_id}/ready" class="eg-menu-form" role="none">'
+            f'<button type="submit" class="eg-btn eg-ghost eg-btn--sm eg-btn--block" role="menuitem">'
+            f'{icon("check", 14)}<span>Marcar lista para enviar</span></button></form>'
+        )
 
-    # Botón Ver
-    ver_btn = (
-        f'<a href="/admin/alerts/{alert_id}/preview-email" '
-        f'style="display:inline-block;padding:3px 10px;border-radius:4px;font-size:12px;'
-        f'font-weight:600;background:#29B78D;color:#fff;text-decoration:none;">Ver</a>'
+    send_label = "Reenviar a todos" if status == "sent" else "Enviar a todos"
+    items.append(
+        f'<button type="button" class="eg-btn eg-ghost eg-btn--sm eg-btn--block" role="menuitem" '
+        f'onclick="closeAlertMenu();confirmSend({alert_id},\'{title_js}\')">'
+        f'{icon("send", 14)}<span>{send_label}</span></button>'
     )
 
-    # Botón Prueba ▾ (inline form colapsable)
-    prueba_btn = (
-        f'<span style="display:inline-block;">'
-        f'<button onclick="this.parentNode.querySelector(\'form\').style.display=\'block\';this.style.display=\'none\';" '
-        f'style="padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;'
-        f'background:#F3F4F6;color:#374151;border:1px solid #D1D5DB;cursor:pointer;">Prueba ▾</button>'
-        f'<form method="post" action="/admin/alerts/{alert_id}/test" '
-        f'style="display:none;margin-top:4px;">'
-        f'<input type="email" name="to" placeholder="correo@ejemplo.com" '
-        f'style="font-size:11px;padding:2px 6px;border:1px solid #D1D5DB;border-radius:3px;width:130px;">'
-        f'<button type="submit" '
-        f'style="margin-left:4px;padding:2px 8px;border-radius:3px;font-size:11px;'
-        f'background:#29B78D;color:#fff;border:none;cursor:pointer;">OK</button>'
-        f'</form></span>'
-    )
-
-    # Botón Enviar a todos / badge Enviada
-    if status == "sent":
-        send_all_btn = (
-            f'<span id="send-status-{alert_id}" '
-            f'style="font-size:12px;color:#29B78D;font-weight:600;">✓ Enviada</span>'
+    if ai_status == "success":
+        items.append(
+            f'<form method="post" action="/admin/alerts/{alert_id}/regenerate-ai" class="eg-menu-form" role="none">'
+            f'<button type="submit" class="eg-btn eg-ghost eg-btn--sm eg-btn--block" role="menuitem">'
+            f'{icon("refresh", 14)}<span>Regenerar resumen IA</span></button></form>'
         )
     else:
-        send_all_btn = (
-            f'<span id="send-status-{alert_id}">'
-            f'<button onclick="confirmSend({alert_id},\'{title_js}\')" '
-            f'style="padding:3px 10px;border-radius:4px;font-size:12px;font-weight:600;'
-            f'background:#EFF6FF;color:#1D4ED8;border:1px solid #BFDBFE;cursor:pointer;">'
-            f'✉ Enviar a todos</button>'
-            f'</span>'
+        items.append(
+            f'<form method="post" action="/admin/alerts/{alert_id}/generate-ai" class="eg-menu-form" role="none">'
+            f'<button type="submit" class="eg-btn eg-ghost eg-btn--sm eg-btn--block" role="menuitem">'
+            f'{icon("cpu", 14)}<span>Generar resumen IA</span></button></form>'
         )
 
-    # Botón Eliminar
-    delete_btn = (
-        f'<button onclick="deleteAlert({alert_id})" '
-        f'style="padding:3px 8px;border-radius:4px;font-size:12px;font-weight:600;'
-        f'background:#FEE2E2;color:#991B1B;border:1px solid #FECACA;cursor:pointer;" '
-        f'title="Eliminar alerta">🗑</button>'
+    items.append(
+        f'<form method="post" action="/admin/alerts/{alert_id}/test" class="eg-menu-form eg-menu-form--test" role="none">'
+        f'<input type="email" name="to" class="eg-input eg-input--sm eg-menu-input" '
+        f'placeholder="correo@ejemplo.com" aria-label="Correo de prueba">'
+        f'<button type="submit" class="eg-btn eg-ghost eg-btn--sm eg-btn--block" role="menuitem">'
+        f'{icon("mail", 14)}<span>Enviar prueba</span></button></form>'
     )
 
+    items.append(
+        f'<button type="button" class="eg-btn eg-ghost eg-btn--sm eg-btn--block eg-menu-danger" role="menuitem" '
+        f'onclick="closeAlertMenu();deleteAlert({alert_id})">'
+        f'{icon("x-circle", 14)}<span>Eliminar</span></button>'
+    )
+
+    return "".join(items)
+
+
+def _alert_menu_html(item: dict[str, Any], view: str, title_js: str) -> str:
+    alert_id = item["id"]
+    scope = f"{view}-{alert_id}"
+    actions_html = _alert_menu_actions_html(item, title_js)
     return (
-        f'<tr id="alert-row-{alert_id}">'
-        f'<td style="font-family:monospace;font-size:12px;color:#6B7280;width:50px;padding:10px 8px;">{alert_id}</td>'
-        f'<td style="padding:10px 8px;font-size:13px;" title="{h(title_raw)}">{h(title_trunc)}</td>'
-        f'<td style="padding:10px 8px;font-size:12px;color:#6B7280;" title="{h(cat_raw)}">{h(cat_trunc)}</td>'
-        f'<td style="padding:10px 8px;" id="status-cell-{alert_id}">{_alert_status_badge(status)}</td>'
-        f'<td style="padding:10px 8px;">{_alert_ia_badge(item)}</td>'
-        f'<td style="padding:10px 8px;font-size:12px;color:#6B7280;white-space:nowrap;">{_fmt_short_date(item.get("created_at"))}</td>'
-        f'<td style="padding:10px 8px;">'
-        f'<div style="display:flex;gap:6px;align-items:center;flex-wrap:wrap;">'
-        f'{ver_btn}{prueba_btn}{send_all_btn}{delete_btn}'
-        f'</div></td>'
+        f'<div class="eg-menu">'
+        f'<button type="button" class="eg-menu-btn" id="menu-btn-{scope}" '
+        f'aria-haspopup="true" aria-expanded="false" aria-controls="menu-pop-{scope}" '
+        f'title="Más acciones" onclick="toggleAlertMenu(event,\'{scope}\')">⋯</button>'
+        f'<div class="eg-menu-popover" id="menu-pop-{scope}" role="menu" '
+        f'aria-labelledby="menu-btn-{scope}" hidden>{actions_html}</div>'
+        f'</div>'
+    )
+
+
+def _alert_table_row(item: dict[str, Any]) -> str:
+    alert_id = item["id"]
+    status = item.get("status") or ""
+    title_raw = item.get("title") or ""
+    title_js = h(title_raw).replace("'", "\\'")
+    cat_raw = item.get("category") or ""
+    subtitle = _alert_subtitle(item)
+    subtitle_html = (
+        f'<div class="eg-alert-row-subtitle" title="{h(subtitle)}">{h(subtitle)}</div>' if subtitle else ""
+    )
+
+    ver_btn = f'<a class="eg-btn eg-btn--primary eg-btn--sm" href="/admin/alerts/{alert_id}/preview-email">Ver</a>'
+    menu_html = _alert_menu_html(item, "t", title_js)
+
+    return (
+        f'<tr id="alert-row-t-{alert_id}">'
+        f'<td class="mono">{alert_id}</td>'
+        f'<td class="eg-cell-doc">'
+        f'<div class="eg-alert-row-title" title="{h(title_raw)}">{h(title_raw)}</div>'
+        f'{subtitle_html}'
+        f'</td>'
+        f'<td class="eg-cell-cat" title="{h(cat_raw)}">{h(cat_raw)}</td>'
+        f'<td id="status-cell-t-{alert_id}">{_alert_status_badge(status)}</td>'
+        f'<td>{_alert_ia_badge(item)}</td>'
+        f'<td class="mono">{_fmt_short_date(item.get("created_at"))}</td>'
+        f'<td class="eg-cell-actions">'
+        f'<div class="eg-alerts-row-actions">{ver_btn}{menu_html}</div>'
+        f'</td>'
         f'</tr>'
     )
+
+
+def _alert_card(item: dict[str, Any]) -> str:
+    alert_id = item["id"]
+    status = item.get("status") or ""
+    title_raw = item.get("title") or ""
+    title_js = h(title_raw).replace("'", "\\'")
+    cat_raw = item.get("category") or ""
+    subtitle = _alert_subtitle(item)
+    subtitle_html = (
+        f'<p class="eg-alert-card-subtitle" title="{h(subtitle)}">{h(subtitle)}</p>' if subtitle else ""
+    )
+
+    ver_btn = (
+        f'<a class="eg-btn eg-btn--primary eg-btn--sm eg-btn--block" '
+        f'href="/admin/alerts/{alert_id}/preview-email">Ver alerta</a>'
+    )
+    menu_html = _alert_menu_html(item, "c", title_js)
+
+    return f"""
+<article class="eg-alert-card" id="alert-row-c-{alert_id}">
+  <div class="accent"></div>
+  <div class="eg-alert-body">
+    <div class="eg-alert-meta-top">
+      <span class="mono" style="font-size:12px;color:var(--eg-subtle);">#{alert_id}</span>
+      <div class="eg-alert-chips">{source_badge(item)}<span id="status-cell-c-{alert_id}">{_alert_status_badge(status)}</span></div>
+    </div>
+    <p class="eg-alert-cat">{h(cat_raw)}</p>
+    <h3 class="eg-alert-card-title" title="{h(title_raw)}">{h(title_raw)}</h3>
+    {subtitle_html}
+    <div class="eg-alert-card-meta">
+      <div><span class="eg-alert-card-meta-label">Procesamiento</span>{_alert_ia_badge(item)}</div>
+      <div><span class="eg-alert-card-meta-label">Fecha</span><span class="mono">{_fmt_short_date(item.get("created_at"))}</span></div>
+    </div>
+  </div>
+  <div class="eg-alert-actions">
+    {ver_btn}
+    {menu_html}
+  </div>
+</article>
+"""
 
 
 _ALERTS_TABLE_JS = """
@@ -2726,6 +3104,12 @@ async function confirmSend(id, title) {
   document.getElementById('modal-confirm').onclick = function() { sendToSubscribers(id, count); };
   document.getElementById('send-modal').style.display = 'flex';
 }
+function _setAlertStatusBadge(id, html) {
+  var t = document.getElementById('status-cell-t-' + id);
+  var c = document.getElementById('status-cell-c-' + id);
+  if (t) t.innerHTML = html;
+  if (c) c.innerHTML = html;
+}
 async function sendToSubscribers(id, count) {
   closeModal();
   const r = await fetch('/admin/alerts/' + id + '/send', {
@@ -2734,10 +3118,7 @@ async function sendToSubscribers(id, count) {
   });
   const data = await r.json();
   if (data.success) {
-    const sc = document.getElementById('status-cell-' + id);
-    if (sc) sc.innerHTML = '<span style="display:inline-block;padding:2px 8px;border-radius:10px;font-size:11px;font-weight:600;background:#29B78D;color:#fff;">Enviada</span>';
-    const ss = document.getElementById('send-status-' + id);
-    if (ss) ss.innerHTML = '<span style="font-size:12px;color:#29B78D;font-weight:600;">✓ Enviada a ' + data.sent_count + ' suscriptores</span>';
+    _setAlertStatusBadge(id, '<span class="eg-badge eg-badge--sent eg-badge--no-dot">Enviada</span>');
   } else {
     alert('Error: ' + (data.error || 'Error desconocido'));
   }
@@ -2745,12 +3126,95 @@ async function sendToSubscribers(id, count) {
 async function deleteAlert(id) {
   if (!confirm('\\u00BFEliminar alerta #' + id + '? No se puede deshacer.')) return;
   const r = await fetch('/admin/alerts/' + id + '/delete', {method:'POST'});
-  if (r.ok) { const row = document.getElementById('alert-row-' + id); if (row) row.remove(); }
-  else alert('Error al eliminar');
+  if (r.ok) {
+    ['alert-row-t-' + id, 'alert-row-c-' + id].forEach(function(rid) {
+      var el = document.getElementById(rid);
+      if (el) el.remove();
+    });
+  } else {
+    alert('Error al eliminar');
+  }
 }
 document.getElementById('send-modal').addEventListener('click', function(e) {
   if (e.target === this) closeModal();
 });
+
+/* ----- Menu de acciones (tres puntos) ----- */
+var _openMenuEl = null;
+var _openMenuOriginalParent = null;
+var _openMenuBtn = null;
+
+function closeAlertMenu() {
+  if (_openMenuEl) {
+    _openMenuEl.hidden = true;
+    _openMenuEl.style.position = '';
+    _openMenuEl.style.top = '';
+    _openMenuEl.style.left = '';
+    _openMenuEl.style.right = '';
+    _openMenuEl.style.zIndex = '';
+    if (_openMenuOriginalParent) { _openMenuOriginalParent.appendChild(_openMenuEl); }
+  }
+  if (_openMenuBtn) { _openMenuBtn.setAttribute('aria-expanded', 'false'); }
+  _openMenuEl = null;
+  _openMenuOriginalParent = null;
+  _openMenuBtn = null;
+}
+
+function toggleAlertMenu(evt, scope) {
+  evt.stopPropagation();
+  var btn = evt.currentTarget;
+  var pop = document.getElementById('menu-pop-' + scope);
+  if (!pop) return;
+  if (_openMenuEl === pop) { closeAlertMenu(); return; }
+  closeAlertMenu();
+  _openMenuOriginalParent = pop.parentElement;
+  _openMenuBtn = btn;
+  var rect = btn.getBoundingClientRect();
+  document.body.appendChild(pop);
+  pop.hidden = false;
+  pop.style.position = 'fixed';
+  pop.style.zIndex = '2000';
+  pop.style.top = (rect.bottom + 4) + 'px';
+  pop.style.left = 'auto';
+  pop.style.right = (window.innerWidth - rect.right) + 'px';
+  var popRect = pop.getBoundingClientRect();
+  if (popRect.bottom > window.innerHeight) {
+    pop.style.top = Math.max(8, rect.top - popRect.height - 4) + 'px';
+  }
+  btn.setAttribute('aria-expanded', 'true');
+  _openMenuEl = pop;
+}
+
+document.addEventListener('click', function(e) {
+  if (_openMenuEl && !_openMenuEl.contains(e.target) && !(_openMenuBtn && _openMenuBtn.contains(e.target))) {
+    closeAlertMenu();
+  }
+});
+document.addEventListener('keydown', function(e) {
+  if (e.key === 'Escape') closeAlertMenu();
+});
+
+/* ----- Selector de vista Tabla / Cards ----- */
+function setAlertsView(view) {
+  var root = document.getElementById('alerts-views');
+  if (!root) return;
+  root.setAttribute('data-view', view);
+  try { localStorage.setItem('alerts-view', view); } catch (e) {}
+  document.querySelectorAll('.eg-view-btn').forEach(function(btn) {
+    var active = btn.getAttribute('data-view') === view;
+    btn.classList.toggle('is-active', active);
+    btn.setAttribute('aria-pressed', active ? 'true' : 'false');
+  });
+}
+(function() {
+  if (!document.getElementById('alerts-views')) return;
+  var saved = null;
+  try { saved = localStorage.getItem('alerts-view'); } catch (e) {}
+  setAlertsView(saved === 'cards' ? 'cards' : 'table');
+  document.querySelectorAll('.eg-view-btn').forEach(function(btn) {
+    btn.addEventListener('click', function() { setAlertsView(btn.getAttribute('data-view')); });
+  });
+})();
 </script>
 """
 
@@ -2809,98 +3273,138 @@ def render_alerts_table(
     *,
     status_filter: str = "",
     page: int = 1,
+    search_query: str = "",
 ) -> str:
-    """Vista completa /admin/alerts con filtros, tabla y paginación."""
-    # Filtrar
+    """Vista completa /admin/alerts: filtros, búsqueda, tabla, cards y paginación."""
     valid_statuses = {"pending_review", "ready_to_send", "ready", "sent", "fallback", "error"}
-    if status_filter and status_filter in valid_statuses:
-        filtered = [a for a in alerts if a.get("status") == status_filter]
-    else:
+    if status_filter not in valid_statuses:
         status_filter = ""
-        filtered = list(alerts)
 
+    filtered = (
+        [a for a in alerts if a.get("status") == status_filter] if status_filter else list(alerts)
+    )
+
+    search_query = (search_query or "").strip()
+    if search_query:
+        needle = search_query.lower()
+        filtered = [a for a in filtered if needle in _alert_search_haystack(a)]
+
+    has_active_filter = bool(status_filter or search_query)
     total = len(filtered)
     total_pages = max(1, (total + _PAGE_SIZE - 1) // _PAGE_SIZE)
     page = max(1, min(page, total_pages))
     page_slice = filtered[(page - 1) * _PAGE_SIZE : page * _PAGE_SIZE]
 
-    # Barra de filtros
+    counter_text = (
+        f"{total} alerta{'s' if total != 1 else ''} "
+        + ("encontradas" if has_active_filter else "disponibles")
+    )
+
+    def _qs(extra_page: int = 1) -> str:
+        params: list[tuple[str, str]] = []
+        if status_filter:
+            params.append(("status", status_filter))
+        if search_query:
+            params.append(("q", search_query))
+        if extra_page and extra_page != 1:
+            params.append(("page", str(extra_page)))
+        return ("?" + urllib.parse.urlencode(params)) if params else ""
+
+    # Barra de filtros de estado (conserva la búsqueda activa)
     filter_tabs = ""
     for tab_val, tab_label in _ALERT_FILTER_TABS:
-        is_active = (tab_val == status_filter)
-        href = f"/admin/alerts{'?status=' + tab_val if tab_val else ''}"
-        active_style = "background:#29B78D;color:#fff;border-color:#29B78D;" if is_active else "background:#fff;color:#374151;border-color:#D1D5DB;"
+        is_active = tab_val == status_filter
+        params: list[tuple[str, str]] = []
+        if tab_val:
+            params.append(("status", tab_val))
+        if search_query:
+            params.append(("q", search_query))
+        href = "/admin/alerts" + (("?" + urllib.parse.urlencode(params)) if params else "")
         filter_tabs += (
-            f'<a href="{href}" style="display:inline-block;padding:5px 14px;border-radius:20px;'
-            f'font-size:12px;font-weight:600;text-decoration:none;border:1px solid;margin-right:6px;margin-bottom:6px;'
-            f'{active_style}">{tab_label}</a>'
+            f'<a class="eg-status-tab{" is-active" if is_active else ""}" href="{href}">{h(tab_label)}</a>'
         )
 
-    # Tabla
+    # Buscador (servidor, vía GET ?q=)
+    hidden_status = f'<input type="hidden" name="status" value="{h(status_filter)}">' if status_filter else ""
+    search_box = (
+        f'<form class="eg-search-box" method="get" action="/admin/alerts" role="search">'
+        f'{hidden_status}'
+        f'<span class="eg-search-icon">{_SEARCH_ICON_SVG}</span>'
+        f'<input type="search" name="q" class="eg-input eg-search-input" value="{h(search_query)}" '
+        f'placeholder="Buscar por título, ID, fuente, categoría o estado…" aria-label="Buscar alertas">'
+        f'<button type="submit" class="eg-btn eg-btn--secondary eg-btn--sm">Buscar</button>'
+        f'</form>'
+    )
+
+    # Selector de vista Tabla / Cards (oculto en móvil vía CSS)
+    view_switcher = (
+        '<div class="eg-view-switcher" role="group" aria-label="Cambiar vista">'
+        '<button type="button" class="eg-view-btn" data-view="table" aria-pressed="false">Tabla</button>'
+        '<button type="button" class="eg-view-btn" data-view="cards" aria-pressed="false">Cards</button>'
+        '</div>'
+    )
+
+    # Tabla y cards comparten exactamente el mismo page_slice (mismos datos, permisos y estados)
     if page_slice:
-        rows = "".join(_alert_table_row(item) for item in page_slice)
-        table_body = rows
+        table_body = "".join(_alert_table_row(item) for item in page_slice)
+        cards_body = "".join(_alert_card(item) for item in page_slice)
     else:
-        status_label_str = dict(_ALERT_FILTER_TABS).get(status_filter, status_filter)
-        empty_text = f"No hay alertas con estado {h(status_label_str)}" if status_filter else "No hay alertas generadas."
-        table_body = (
-            f'<tr><td colspan="7" style="text-align:center;padding:32px;color:#6B7280;">'
-            f'{empty_text}'
-            f'{"<br><a href=/admin/alerts style=color:#29B78D;font-size:13px;>Ver todas las alertas →</a>" if status_filter else ""}'
-            f'</td></tr>'
-        )
+        table_body = f'<tr><td colspan="7" class="eg-alerts-empty-cell">{h(_ALERTS_EMPTY_TEXT)}</td></tr>'
+        cards_body = f'<div class="eg-empty eg-alerts-empty-cards"><strong>{h(_ALERTS_EMPTY_TEXT)}</strong></div>'
 
     table_html = (
-        '<div class="eg-table-wrap">'
-        '<table class="eg-table" style="table-layout:fixed;width:100%;">'
+        '<div class="eg-table-view">'
+        '<table class="eg-table eg-table--alerts" style="table-layout:fixed;width:100%;">'
         '<thead><tr>'
         '<th style="width:50px;">ID</th>'
         '<th>Documento</th>'
-        '<th style="width:120px;">Categoría</th>'
+        '<th style="width:130px;">Categoría</th>'
         '<th style="width:130px;">Estado</th>'
-        '<th style="width:80px;">IA</th>'
+        '<th style="width:70px;">IA</th>'
         '<th style="width:70px;">Fecha</th>'
-        '<th style="width:220px;">Acciones</th>'
+        '<th style="width:110px;">Acciones</th>'
         '</tr></thead>'
         f'<tbody>{table_body}</tbody>'
         '</table></div>'
     )
+    cards_html = f'<div class="eg-cards-view"><div class="eg-alert-grid">{cards_body}</div></div>'
 
-    # Paginación
+    # Paginación (conserva status y q)
     pagination = ""
     if total_pages > 1:
-        base = f"/admin/alerts{'?status=' + status_filter if status_filter else '?'}"
-        sep = "&" if status_filter else ""
         prev_link = (
-            f'<a href="{base}{sep}page={page - 1}" style="padding:5px 14px;border-radius:4px;'
-            f'border:1px solid #D1D5DB;text-decoration:none;font-size:13px;color:#374151;">← Anterior</a>'
+            f'<a href="/admin/alerts{_qs(page - 1)}" class="eg-btn eg-ghost eg-btn--sm">← Anterior</a>'
             if page > 1 else
-            '<span style="padding:5px 14px;border-radius:4px;border:1px solid #E5E7EB;'
-            'font-size:13px;color:#D1D5DB;">← Anterior</span>'
+            '<span class="eg-btn eg-ghost eg-btn--sm" style="opacity:.4;pointer-events:none;">← Anterior</span>'
         )
         next_link = (
-            f'<a href="{base}{sep}page={page + 1}" style="padding:5px 14px;border-radius:4px;'
-            f'border:1px solid #D1D5DB;text-decoration:none;font-size:13px;color:#374151;">Siguiente →</a>'
+            f'<a href="/admin/alerts{_qs(page + 1)}" class="eg-btn eg-ghost eg-btn--sm">Siguiente →</a>'
             if page < total_pages else
-            '<span style="padding:5px 14px;border-radius:4px;border:1px solid #E5E7EB;'
-            'font-size:13px;color:#D1D5DB;">Siguiente →</span>'
+            '<span class="eg-btn eg-ghost eg-btn--sm" style="opacity:.4;pointer-events:none;">Siguiente →</span>'
         )
         pagination = (
-            f'<div style="display:flex;align-items:center;gap:16px;justify-content:center;padding:16px 0;">'
+            '<div class="eg-alerts-pagination">'
             f'{prev_link}'
-            f'<span style="font-size:13px;color:#6B7280;">Página {page} de {total_pages}</span>'
+            f'<span class="eg-alerts-pagination-info">Página {page} de {total_pages}</span>'
             f'{next_link}'
-            f'</div>'
+            '</div>'
         )
 
     return (
         f'<div class="eg-section-head">'
         f'<span class="ghost">01</span><h2>Alertas generadas</h2>'
-        f'<p>{total} alerta{"s" if total != 1 else ""}</p>'
+        f'<p>{h(counter_text)}</p>'
         f'</div>'
-        f'<section class="eg-card eg-panel">'
-        f'<div style="margin-bottom:16px;">{filter_tabs}</div>'
+        f'<section class="eg-card eg-panel eg-alerts-panel">'
+        f'<div class="eg-alerts-toolbar">'
+        f'<div class="eg-status-tabs">{filter_tabs}</div>'
+        f'{search_box}'
+        f'{view_switcher}'
+        f'</div>'
+        f'<div id="alerts-views" data-view="table">'
         f'{table_html}'
+        f'{cards_html}'
+        f'</div>'
         f'{pagination}'
         f'</section>'
         f'{_ALERTS_TABLE_JS}'
@@ -3684,6 +4188,9 @@ body.eg--admin {
 .eg-metric-num  { font-size: 1.7rem; font-weight: 700; color: var(--eg-text); line-height: 1; }
 .eg-metric-label { font-size: 13px; font-weight: 600; color: var(--eg-text); }
 .eg-metric-sub   { font-size: 12px; color: var(--eg-subtle); }
+.eg-metric--link { text-decoration: none; color: inherit; cursor: pointer; transition: border-color .15s, transform .15s; }
+.eg-metric--link:hover { border-color: color-mix(in srgb, var(--eg-green) 40%, transparent); transform: translateY(-1px); }
+.eg-metric--link:focus-visible { outline: 2px solid var(--eg-green); outline-offset: 2px; }
 
 /* ----- Badges -------------------------------------------------------- */
 .eg-badge {
@@ -3755,12 +4262,16 @@ body.eg--admin {
 .eg-pill[data-status="paused"], .eg-pill[data-status="pending_review"],
 .eg-pill[data-status="partial"], .eg-pill[data-status="baseline"],
 .eg-pill[data-status="discovered"], .eg-pill[data-status="medio"],
-.eg-pill[data-status="running"], .eg-pill[data-status="skipped"] {
+.eg-pill[data-status="running"], .eg-pill[data-status="skipped"],
+.eg-pill[data-status="warning"] {
   background: color-mix(in srgb,#B45309 16%,transparent); color: #92400E;
 }
 .eg-pill[data-status="error"], .eg-pill[data-status="failed"],
 .eg-pill[data-status="ignored"], .eg-pill[data-status="bajo"] {
   background: color-mix(in srgb,#B42318 14%,transparent); color: #B42318;
+}
+.eg-pill[data-status="disabled"], .eg-pill[data-status="nodata"] {
+  background: color-mix(in srgb,#8EA1AA 16%,transparent); color: #5F6E76;
 }
 
 /* ----- Section heads ------------------------------------------------- */
@@ -3985,6 +4496,141 @@ a.eg-btn--ghost:hover { color: #fff !important; }
 .eg-cell-actions { display: flex; gap: 6px; flex-wrap: wrap; align-items: center; }
 .eg-cell-actions form { margin: 0; }
 
+/* ----- /admin/alerts: toolbar (filtros, buscador, selector de vista) --- */
+.eg-alerts-panel { padding-top: 18px; }
+.eg-alerts-toolbar {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: 12px;
+  margin-bottom: 16px;
+}
+.eg-status-tabs { display: flex; flex-wrap: wrap; gap: 6px; margin-right: auto; }
+.eg-status-tab {
+  display: inline-flex;
+  align-items: center;
+  padding: 6px 14px;
+  border-radius: 999px;
+  border: 1px solid var(--eg-border);
+  background: var(--eg-surface);
+  color: var(--eg-muted);
+  font-size: 12.5px;
+  font-weight: 700;
+  text-decoration: none;
+}
+.eg-status-tab:hover { color: var(--eg-text); border-color: var(--eg-text); }
+.eg-status-tab.is-active {
+  background: var(--eg-green);
+  border-color: var(--eg-green);
+  color: #fff;
+}
+.eg-search-box {
+  display: flex;
+  align-items: center;
+  gap: 8px;
+  position: relative;
+  min-width: 220px;
+  flex: 1 1 260px;
+  max-width: 420px;
+}
+.eg-search-icon {
+  position: absolute;
+  left: 12px;
+  top: 50%;
+  transform: translateY(-50%);
+  color: var(--eg-subtle);
+  display: flex;
+  pointer-events: none;
+}
+.eg-search-input { padding-left: 36px; min-height: 36px; }
+.eg-view-switcher {
+  display: inline-flex;
+  border: 1px solid var(--eg-border);
+  border-radius: var(--radius-sm);
+  overflow: hidden;
+  flex-shrink: 0;
+}
+.eg-view-btn {
+  padding: 7px 16px;
+  font-size: 13px;
+  font-weight: 700;
+  background: var(--eg-surface);
+  color: var(--eg-muted);
+  border: none;
+  cursor: pointer;
+}
+.eg-view-btn + .eg-view-btn { border-left: 1px solid var(--eg-border); }
+.eg-view-btn.is-active { background: var(--eg-green); color: #fff; }
+.eg-cell-doc { min-width: 0; }
+.eg-alert-row-title {
+  color: var(--eg-text);
+  font-weight: 600;
+  font-size: 13.5px;
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.eg-alert-row-subtitle {
+  margin-top: 2px;
+  font-size: 12px;
+  color: var(--eg-subtle);
+  white-space: nowrap;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  max-width: 100%;
+}
+.eg-alerts-row-actions { display: flex; gap: 6px; align-items: center; }
+.eg-alerts-empty-cell { text-align: center; padding: 32px; color: var(--eg-subtle); }
+.eg-alerts-pagination {
+  display: flex;
+  align-items: center;
+  gap: 16px;
+  justify-content: center;
+  padding: 16px 0 4px;
+}
+.eg-alerts-pagination-info { font-size: 13px; color: var(--eg-subtle); }
+
+/* ----- Menu de acciones (tres puntos) ---------------------------------- */
+.eg-menu { position: relative; display: inline-flex; }
+.eg-menu-btn {
+  min-width: 32px;
+  height: 32px;
+  display: inline-flex;
+  align-items: center;
+  justify-content: center;
+  border-radius: var(--radius-sm);
+  border: 1px solid var(--eg-border);
+  background: var(--eg-surface);
+  color: var(--eg-muted);
+  font-size: 16px;
+  font-weight: 700;
+  cursor: pointer;
+  line-height: 1;
+}
+.eg-menu-btn:hover, .eg-menu-btn[aria-expanded="true"] {
+  color: var(--eg-text);
+  border-color: var(--eg-text);
+}
+.eg-menu-popover {
+  display: flex;
+  flex-direction: column;
+  gap: 2px;
+  min-width: 220px;
+  padding: 6px;
+  background: var(--eg-surface);
+  border: 1px solid var(--eg-border);
+  border-radius: var(--radius-sm);
+  box-shadow: 0 8px 24px rgba(10,34,49,.16);
+}
+.eg-menu-popover[hidden] { display: none; }
+.eg-menu-popover .eg-btn { justify-content: flex-start; font-weight: 600; }
+.eg-menu-form { margin: 0; display: flex; flex-direction: column; gap: 4px; }
+.eg-menu-form--test { padding: 4px 2px; border-top: 1px solid var(--eg-border); margin-top: 2px; padding-top: 6px; }
+.eg-menu-input { min-height: 32px; padding: 6px 10px; font-size: 12.5px; }
+.eg-menu-danger { color: var(--eg-danger, #B23B3B); }
+.eg-menu-danger:hover { border-color: var(--eg-danger, #B23B3B); color: var(--eg-danger, #B23B3B); }
+
 /* ----- Alert grid ---------------------------------------------------- */
 .eg-alert-grid {
   display: grid;
@@ -4046,9 +4692,54 @@ a.eg-btn--ghost:hover { color: #fff !important; }
   background: var(--eg-surface-soft);
 }
 .eg-alert-actions form { margin: 0; }
+.eg-alert-actions > a.eg-btn { flex: 1; }
 .eg-action-row { display: flex; flex-wrap: wrap; gap: 7px; align-items: center; }
 .eg-test-row { display: flex; gap: 6px; align-items: center; flex-wrap: wrap; width: 100%; margin-top: 3px; }
 .eg-test-row input { flex: 1; min-width: 160px; }
+
+/* ----- /admin/alerts: card title/subtitle/meta (vista Cards) ---------- */
+.eg-alert-card-title {
+  font-size: .95rem;
+  font-weight: 700;
+  color: var(--eg-text);
+  margin: 0;
+  line-height: 1.3;
+  display: -webkit-box;
+  -webkit-line-clamp: 2;
+  -webkit-box-orient: vertical;
+  overflow: hidden;
+}
+.eg-alert-card-subtitle {
+  font-size: 12px;
+  color: var(--eg-subtle);
+  margin: 0;
+  overflow: hidden;
+  text-overflow: ellipsis;
+  white-space: nowrap;
+}
+.eg-alert-card-meta {
+  display: grid;
+  grid-template-columns: 1fr 1fr;
+  gap: 8px;
+  margin-top: 4px;
+  padding-top: 8px;
+  border-top: 1px solid var(--eg-border);
+}
+.eg-alert-card-meta-label {
+  display: block;
+  font-size: 10.5px;
+  font-weight: 700;
+  letter-spacing: .05em;
+  text-transform: uppercase;
+  color: var(--eg-subtle);
+  margin-bottom: 3px;
+}
+.eg-alerts-empty-cards { grid-column: 1 / -1; }
+
+/* ----- /admin/alerts: alternancia Tabla / Cards ------------------------ */
+.eg-table-view { overflow-x: auto; border-radius: var(--radius); }
+#alerts-views[data-view="table"] .eg-cards-view { display: none; }
+#alerts-views[data-view="cards"] .eg-table-view { display: none; }
 
 /* ----- KV (key-value) lists ----------------------------------------- */
 .eg-kv { display: grid; gap: 6px; margin: 0 0 16px; }
@@ -4073,6 +4764,9 @@ a.eg-btn--ghost:hover { color: #fff !important; }
 
 /* ----- Grids --------------------------------------------------------- */
 .eg-grid-2 { display: grid; grid-template-columns: 1fr 1fr; gap: 16px; }
+/* Dashboard operativo v2: Alertas que requieren atencion (~65%) + Salud del sistema (~35%). */
+.eg-dashboard-grid { display: grid; grid-template-columns: 65% 1fr; gap: 16px; align-items: start; min-width: 0; }
+.eg-dashboard-grid > div { min-width: 0; }
 
 /* ----- Misc admin components ---------------------------------------- */
 .eg-actions { display: flex; flex-wrap: wrap; gap: 8px; align-items: center; }
@@ -4238,6 +4932,7 @@ textarea.eg-input { resize: vertical; min-height: 56px; }
 @media (max-width: 1024px) {
   .eg-metric-grid { grid-template-columns: repeat(2, 1fr); }
   .eg-grid-2 { grid-template-columns: 1fr; }
+  .eg-dashboard-grid { grid-template-columns: 1fr; }
 }
 @media (max-width: 900px) {
   .eg-preview-grid { grid-template-columns: 1fr; }
@@ -4258,6 +4953,15 @@ textarea.eg-input { resize: vertical; min-height: 56px; }
   .eg-content { padding: 16px; }
   .eg-hero__grid { grid-template-columns: 1fr; }
   .eg-topbar-meta { flex-wrap: wrap; }
+}
+@media (max-width: 760px) {
+  /* /admin/alerts: en móvil se fuerza la vista Cards y se oculta el selector. */
+  .eg-view-switcher { display: none; }
+  #alerts-views .eg-table-view { display: none !important; }
+  #alerts-views .eg-cards-view { display: block !important; }
+  .eg-alerts-toolbar { flex-direction: column; align-items: stretch; }
+  .eg-status-tabs { margin-right: 0; }
+  .eg-search-box { max-width: none; }
 }
 @media (max-width: 430px) {
   .eg-metric-grid { grid-template-columns: 1fr; }
